@@ -1,0 +1,21 @@
+[package]
+name = "moli-paint"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+krilla = { git = "https://github.com/lexmount/krilla", rev = "c1f42beeb7fcefd958c27e3a72c5f120eba071b7", default-features = false, features = ["raster-images"] }
+skrifa = "0.44.0"
+anyrender = { git = "https://github.com/ldm0/anyrender", rev = "916ef982d2175081dafc1ba0f7489396124d9496" }
+anyrender_svg = { git = "https://github.com/ldm0/anyrender", rev = "916ef982d2175081dafc1ba0f7489396124d9496", default-features = false, features = ["text"] }
+anyrender_vello_cpu = { git = "https://github.com/ldm0/anyrender", rev = "916ef982d2175081dafc1ba0f7489396124d9496", default-features = false, features = ["bitmap-glyphs", "filters"] }
+moli-image = { path = "../moli-image" }
+moli-layout = { path = "../moli-layout" }
+peniko = "0.6.0"
+
+[dev-dependencies]
+lopdf = { version = "0.45.0", default-features = false }
+
+[lints]
+workspace = true

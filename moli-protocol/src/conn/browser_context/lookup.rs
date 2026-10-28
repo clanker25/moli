@@ -1,0 +1,177 @@
+use super::*;
+
+impl CdpConnection {
+    pub fn browser_contexts(&self) -> impl Iterator<Item = &BrowserContext> {
+        self.browser_context
+            .iter()
+            .chain(self.inactive_browser_contexts.iter())
+    }
+
+    pub fn browser_context_by_id(&self, browser_context_id: &str) -> Option<&BrowserContext> {
+        self.browser_context
+            .as_ref()
+            .filter(|bc| bc.id == browser_context_id)
+            .or_else(|| {
+                self.inactive_browser_contexts
+                    .iter()
+                    .find(|bc| bc.id == browser_context_id)
+            })
+    }
+
+    pub fn browser_context_by_id_mut(
+        &mut self,
+        browser_context_id: &str,
+    ) -> Option<&mut BrowserContext> {
+        if self
+            .browser_context
+            .as_ref()
+            .is_some_and(|bc| bc.id == browser_context_id)
+        {
+            return self.browser_context.as_mut();
+        }
+        self.inactive_browser_contexts
+            .iter_mut()
+            .find(|bc| bc.id == browser_context_id)
+    }
+
+    pub(crate) fn browser_context_for_command_session_mut(
+        &mut self,
+        session_id: Option<&str>,
+    ) -> Result<&mut BrowserContext, (i32, &'static str)> {
+        let route = match session_id {
+            Some(session_id) => self
+                .session_route(Some(session_id))
+                .ok_or((-32001, "Unknown sessionId"))?,
+            None => CdpSessionRoute::Browser,
+        };
+        match route {
+            CdpSessionRoute::Browser => self
+                .browser_context
+                .as_mut()
+                .ok_or((-31998, "BrowserContextNotLoaded")),
+            CdpSessionRoute::BrowserContext { browser_context_id } => self
+                .browser_context_by_id_mut(&browser_context_id)
+                .ok_or((-31998, "UnknownBrowserContextId")),
+            CdpSessionRoute::TabTarget { .. } => Err((-31998, "DirectSessionRouteRequired")),
+            CdpSessionRoute::PageTarget {
+                browser_context_id, ..
+            }
+            | CdpSessionRoute::SharedWorkerTarget {
+                browser_context_id, ..
+            }
+            | CdpSessionRoute::DedicatedWorkerTarget {
+                browser_context_id, ..
+            }
+            | CdpSessionRoute::ServiceWorkerTarget {
+                browser_context_id, ..
+            } => self
+                .browser_context_by_id_mut(&browser_context_id)
+                .ok_or((-31998, "UnknownBrowserContextId")),
+        }
+    }
+
+    pub fn has_browser_context_id(&self, browser_context_id: &str) -> bool {
+        self.browser_contexts()
+            .any(|bc| bc.id == browser_context_id)
+    }
+
+    pub(crate) fn browser_context_id_for_target(&self, target_id: &str) -> Option<&str> {
+        self.browser_contexts()
+            .find(|bc| bc.page_target(target_id).is_some())
+            .map(|bc| bc.id.as_str())
+    }
+
+    pub(crate) fn browser_context_id_for_browsing_context(&self, context_id: &str) -> Option<&str> {
+        self.browser_context_id_for_target(context_id).or_else(|| {
+            let route = self.target_session_route_for_child_frame_id(context_id)?;
+            self.browser_context_by_id(route.browser_context_id()?)
+                .map(|context| context.id.as_str())
+        })
+    }
+
+    pub(crate) async fn apply_background_target_surface_overrides_async(
+        &mut self,
+        target_id: &str,
+    ) -> anyhow::Result<bool> {
+        let browser_context_id = self
+            .browser_context_id_for_target(target_id)
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow::anyhow!("UnknownTargetId"))?;
+        self.browser_context_by_id_mut(&browser_context_id)
+            .ok_or_else(|| anyhow::anyhow!("UnknownBrowserContextId"))?
+            .apply_background_target_surface_overrides_async(target_id)
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browsing_context_owner_lookup_resolves_attached_frames_without_selecting_their_page() {
+        let mut conn = CdpConnection::new();
+        let mut active = BrowserContext::new_with_page_for_test("BID-active", "TID-active");
+        active
+            .active_page_target_mut()
+            .owner_state
+            .insert_attached_child_frame_id("FRAME-active".into());
+        let background = BrowserContext::new_with_page_for_test("BID-background", "TID-background");
+        conn.browser_context = Some(active);
+        conn.inactive_browser_contexts.push(background);
+        let owner =
+            crate::conn::CommandOwnerScope::for_route(crate::conn::CdpSessionRoute::PageTarget {
+                browser_context_id: "BID-background".into(),
+                target_id: "TID-background".into(),
+                session_key: moli_page_types::DevToolsSessionKey::Primary,
+            });
+        let mut events = Vec::new();
+        crate::domains::page::emit_prepared_child_frame_tree_background_events(
+            &mut conn,
+            &mut events,
+            &owner,
+            vec![
+                crate::domains::page::PagePreparedChildFrameTreeEvent::Attached {
+                    frame_id: "FRAME-background".into(),
+                    parent_frame_id: "TID-background".into(),
+                },
+            ],
+        );
+
+        for (context, owner) in [
+            ("TID-active", "BID-active"),
+            ("FRAME-active", "BID-active"),
+            ("TID-background", "BID-background"),
+            ("FRAME-background", "BID-background"),
+        ] {
+            assert_eq!(
+                conn.browser_context_id_for_browsing_context(context),
+                Some(owner)
+            );
+        }
+        assert_eq!(
+            conn.browser_context_id_for_browsing_context("FRAME-missing"),
+            None
+        );
+        crate::domains::page::emit_prepared_child_frame_tree_background_events(
+            &mut conn,
+            &mut events,
+            &owner,
+            vec![
+                crate::domains::page::PagePreparedChildFrameTreeEvent::Detached {
+                    frame_id: "FRAME-background".into(),
+                },
+            ],
+        );
+        assert_eq!(
+            conn.browser_context_id_for_browsing_context("FRAME-background"),
+            None
+        );
+        assert_eq!(
+            conn.browser_context
+                .as_ref()
+                .map(|context| context.id.as_str()),
+            Some("BID-active")
+        );
+    }
+}

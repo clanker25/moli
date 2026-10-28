@@ -1,0 +1,97 @@
+use super::*;
+use crate::context_bootstrap::{
+    SIMPLE_EVENT_TARGET_LISTENERS_SLOT, simple_event_target_handler_getter_callback,
+    simple_event_target_handler_setter_callback,
+};
+use crate::web_api_interfaces;
+use moli_webapi_declare::WebApiObject;
+
+#[derive(WebApiObject)]
+#[webapi(
+    interface = web_api_interfaces::IDBDatabase,
+    require_prototype,
+    scope_lifetime = 'scope,
+    data_properties,
+    enumerable
+)]
+struct IdbDatabaseObjectDeclaration<'scope, 'value> {
+    #[webapi(slot = SIMPLE_EVENT_TARGET_LISTENERS_SLOT, init = "null_object")]
+    event_listeners: (),
+
+    name: &'value str,
+    version: f64,
+    object_store_names: v8::Local<'scope, v8::Object>,
+    #[webapi(
+        accessor_property = "onabort",
+        getter = simple_event_target_handler_getter_callback,
+        setter = simple_event_target_handler_setter_callback,
+        data = v8str(scope, "onabort"),
+        setter_data = v8str(scope, "onabort"),
+        enumerable,
+        receiver = web_api_interfaces::IDBDatabase::is_instance
+    )]
+    onabort: (),
+    #[webapi(
+        accessor_property = "onclose",
+        getter = simple_event_target_handler_getter_callback,
+        setter = simple_event_target_handler_setter_callback,
+        data = v8str(scope, "onclose"),
+        setter_data = v8str(scope, "onclose"),
+        enumerable,
+        receiver = web_api_interfaces::IDBDatabase::is_instance
+    )]
+    onclose: (),
+    #[webapi(
+        accessor_property = "onerror",
+        getter = simple_event_target_handler_getter_callback,
+        setter = simple_event_target_handler_setter_callback,
+        data = v8str(scope, "onerror"),
+        setter_data = v8str(scope, "onerror"),
+        enumerable,
+        receiver = web_api_interfaces::IDBDatabase::is_instance
+    )]
+    onerror: (),
+    #[webapi(
+        accessor_property = "onversionchange",
+        getter = simple_event_target_handler_getter_callback,
+        setter = simple_event_target_handler_setter_callback,
+        data = v8str(scope, "onversionchange"),
+        setter_data = v8str(scope, "onversionchange"),
+        enumerable,
+        receiver = web_api_interfaces::IDBDatabase::is_instance
+    )]
+    onversionchange: (),
+}
+
+pub(in crate::context_bootstrap::indexed_db) fn create_database_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    storage_scope: IndexedDbStorageScope,
+    owner: IndexedDbExecutionOwner,
+    handle: DatabaseHandle,
+    info: &DatabaseInfo,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let storage_key = storage_scope.storage_key().to_owned();
+    let database_key = database_registry_key(&storage_key, &info.name);
+    let object_store_names = new_idb_name_list(scope, &info.object_store_names);
+    let database =
+        IdbDatabaseObjectDeclaration::new(&info.name, info.version as f64, object_store_names)
+            .bind(scope)
+            .ok()?;
+    register_indexed_db_wrapper_with_owner(
+        scope,
+        database,
+        IndexedDbWrapperKind::Database,
+        owner,
+        Some(storage_scope.clone()),
+    );
+    register_indexed_db_database_lifecycle(
+        scope,
+        database,
+        handle,
+        database_key.clone(),
+        storage_scope,
+    );
+    let _ = refresh_database_metadata(scope, database, info);
+    register_open_database_connection(scope, owner, handle, database_key, info.version, database);
+    Some(database)
+}

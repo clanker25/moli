@@ -1,0 +1,234 @@
+use tracing_subscriber::{
+    filter::{LevelFilter, Targets},
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
+};
+
+const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::INFO;
+const FIRST_PARTY_TARGET_PREFIX: &str = "moli";
+
+fn first_party_filter(log_level: &str) -> Targets {
+    let level = log_level
+        .parse::<LevelFilter>()
+        .unwrap_or(DEFAULT_LOG_LEVEL);
+    Targets::new()
+        .with_default(LevelFilter::OFF)
+        .with_target(FIRST_PARTY_TARGET_PREFIX, level)
+}
+
+pub fn init(log_filter: &str) {
+    // Rust crate targets use underscores, and Targets matches prefixes, so
+    // this includes every moli workspace crate but no dependency.
+    let filter = first_party_filter(log_filter);
+
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_writer(std::io::stderr)
+                .log_internal_errors(false),
+        )
+        .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{self, Write},
+        sync::Arc,
+    };
+
+    use parking_lot::Mutex;
+    use tracing_subscriber::{fmt::MakeWriter, layer::SubscriberExt};
+
+    use super::first_party_filter;
+
+    #[derive(Clone, Default)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    struct SharedWriterGuard(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriterGuard {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0.lock().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> MakeWriter<'writer> for SharedWriter {
+        type Writer = SharedWriterGuard;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            SharedWriterGuard(Arc::clone(&self.0))
+        }
+    }
+
+    impl SharedWriter {
+        fn output(&self) -> String {
+            String::from_utf8(self.0.lock().clone()).unwrap()
+        }
+    }
+
+    #[test]
+    fn first_party_filter_excludes_dependency_and_lower_level_logs() {
+        let writer = SharedWriter::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(first_party_filter("info"))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .without_time()
+                    .with_ansi(false)
+                    .with_target(true)
+                    .with_writer(writer.clone()),
+            );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "moli_parser", "first-party-info");
+            tracing::debug!(target: "moli_parser", "first-party-debug");
+            tracing::warn!(target: "html5ever::tree_builder", "dependency-warning");
+        });
+
+        let output = writer.output();
+        assert!(output.contains("first-party-info"));
+        assert!(!output.contains("first-party-debug"));
+        assert!(!output.contains("dependency-warning"));
+    }
+
+    #[test]
+    fn non_level_filter_falls_back_to_first_party_info() {
+        let writer = SharedWriter::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(first_party_filter("info,dependency=trace"))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .without_time()
+                    .with_ansi(false)
+                    .with_target(true)
+                    .with_writer(writer.clone()),
+            );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "moli", "fallback-info");
+            tracing::warn!(target: "dependency", "dependency-warning");
+        });
+
+        let output = writer.output();
+        assert!(output.contains("fallback-info"));
+        assert!(!output.contains("dependency-warning"));
+    }
+
+    fn render_filter<F>(filter: F) -> String
+    where
+        F: tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync + 'static,
+    {
+        use tracing_subscriber::fmt::format::FmtSpan;
+
+        let writer = SharedWriter::default();
+        let subscriber = tracing_subscriber::registry().with(filter).with(
+            tracing_subscriber::fmt::layer()
+                .without_time()
+                .with_ansi(false)
+                .with_target(true)
+                .with_span_events(FmtSpan::NEW | FmtSpan::ENTER | FmtSpan::EXIT)
+                .with_writer(writer.clone()),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            macro_rules! emit_for_target {
+                ($target:literal) => {{
+                    let parent = tracing::info_span!(target: $target, "filter_parent", value = 1);
+                    let _entered = parent.enter();
+                    parent.record("value", 2);
+                    tracing::error!(target: $target, "error-probe");
+                    tracing::warn!(target: $target, "warn-probe");
+                    tracing::info!(target: $target, "info-probe");
+                    tracing::debug!(target: $target, "debug-probe");
+                    tracing::trace!(target: $target, "trace-probe");
+                    tracing::info!(target: "dependency", "dependency-inside-parent");
+                }};
+            }
+
+            emit_for_target!("moli");
+            emit_for_target!("moli_parser");
+            emit_for_target!("moli::nested");
+            emit_for_target!("molibogus");
+            emit_for_target!("dependency");
+            emit_for_target!("dependency::moli");
+            let parent = tracing::info_span!(target: "dependency", "dependency_parent");
+            let _entered = parent.enter();
+            tracing::info!(target: "moli", "first-party-inside-dependency");
+        });
+        writer.output()
+    }
+
+    #[test]
+    fn targets_match_env_filter_for_levels_prefixes_and_spans() {
+        use tracing_subscriber::{EnvFilter, filter::LevelFilter};
+
+        use super::{DEFAULT_LOG_LEVEL, FIRST_PARTY_TARGET_PREFIX};
+
+        for log_level in [
+            "off",
+            "error",
+            "warn",
+            "info",
+            "debug",
+            "trace",
+            "INFO",
+            "0",
+            "1",
+            "2",
+            "3",
+            "4",
+            "5",
+            "",
+            "invalid",
+            "info,dependency=trace",
+        ] {
+            let level = log_level
+                .parse::<LevelFilter>()
+                .unwrap_or(DEFAULT_LOG_LEVEL);
+            let previous = EnvFilter::new(format!("off,{FIRST_PARTY_TARGET_PREFIX}={level}"));
+            let expected = render_filter(previous);
+            let actual = render_filter(first_party_filter(log_level));
+            assert_eq!(actual, expected, "log level {log_level:?}");
+            if level == LevelFilter::OFF {
+                assert!(actual.is_empty());
+            } else {
+                assert!(actual.contains("error-probe"));
+            }
+            assert!(!actual.contains("dependency-inside-parent"));
+        }
+    }
+
+    #[test]
+    fn broken_diagnostic_writer_does_not_panic() {
+        const CHILD: &str = "MOLI_TEST_BROKEN_DIAGNOSTIC_SINK";
+        if std::env::var_os(CHILD).is_some() {
+            super::init("error");
+            tracing::error!("the diagnostic receiver has already exited");
+            return;
+        }
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "telemetry::tests::broken_diagnostic_writer_does_not_panic",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(writer)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "logging to a closed diagnostic pipe terminated the process: {status}"
+        );
+    }
+}

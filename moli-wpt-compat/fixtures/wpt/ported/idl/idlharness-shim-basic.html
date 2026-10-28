@@ -1,0 +1,95 @@
+<!doctype html>
+<meta charset="utf-8">
+<script src="/wpt/resources/testharness.js"></script>
+<script src="/wpt/resources/testharnessreport.js"></script>
+<script src="/wpt/resources/moli-wpt-adapter.js"></script>
+<script src="/wpt/resources/WebIDLParser.js"></script>
+<script src="/wpt/resources/idlharness.js"></script>
+<script>
+test(function () {
+  const [iface] = WebIDLParser.parse(`
+    interface ArgumentLengths {
+      constructor(DOMString... values);
+      undefined add(DOMString... tokens);
+      undefined remove([LegacyNullToEmptyString] DOMString... tokens);
+      undefined fixedAndVariadic(DOMString name, DOMString... values);
+      undefined fixedAndOptional(DOMString name, optional DOMString value);
+      undefined twoFixed(DOMString first, DOMString second);
+      static undefined staticVariadic(DOMString... values);
+    };
+  `);
+  assert_equals(iface.constructors[0].length, 0);
+  assert_array_equals(iface.operations.map(operation => operation.length), [0, 0, 1, 1, 2]);
+  assert_equals(iface.staticOperations[0].length, 0);
+}, "IDL function lengths count fixed required arguments, excluding variadic arguments");
+
+test(function () {
+  const [iface] = WebIDLParser.parse(`
+    interface OverloadedLengths {
+      undefined longFirst(long x, long y);
+      undefined longFirst(long x);
+      undefined shortFirst(long x);
+      undefined shortFirst(long x, long y);
+      undefined optionalTail(long x, optional long y);
+      undefined optionalTail(long x, long y, long z);
+      undefined variadic(long x);
+      undefined variadic(DOMString... values);
+      static undefined from(long x, long y);
+      static undefined from(long x);
+    };
+  `);
+  assert_array_equals(iface.operations.map(operation => operation.name),
+    ["longFirst", "shortFirst", "optionalTail", "variadic"]);
+  assert_array_equals(iface.operations.map(operation => operation.length), [1, 1, 1, 0]);
+  assert_equals(iface.staticOperations.length, 1);
+  assert_equals(iface.staticOperations[0].length, 1);
+}, "IDL operation lengths use the minimum required argument count across all overloads");
+
+const MoliIdlHarnessThingConstructor = function MoliIdlHarnessThing(value) {};
+Object.defineProperty(window, "MoliIdlHarnessThing", {
+  value: MoliIdlHarnessThingConstructor,
+  writable: true,
+  enumerable: false,
+  configurable: true,
+});
+const MoliIdlHarnessThing = window.MoliIdlHarnessThing;
+Object.defineProperty(MoliIdlHarnessThing.prototype, Symbol.toStringTag, {
+  value: "MoliIdlHarnessThing",
+});
+
+Object.defineProperty(MoliIdlHarnessThing.prototype, "value", {
+  get() { return "value"; },
+  set(_value) {},
+  enumerable: true,
+  configurable: true,
+});
+
+Object.defineProperty(MoliIdlHarnessThing.prototype, "readonlyValue", {
+  get() { return 2; },
+  enumerable: true,
+  configurable: true,
+});
+
+Object.defineProperty(MoliIdlHarnessThing.prototype, "toString", {
+  value() { return this.value; },
+  writable: true,
+  enumerable: true,
+  configurable: true,
+});
+
+idl_test([`
+interface MoliIdlHarnessThing {
+  constructor(DOMString value, optional DOMString optionalValue);
+  stringifier attribute DOMString value;
+  readonly attribute DOMString readonlyValue;
+};
+`], [], function (idlArray) {
+  idlArray.enable_function_length_assertions();
+  idlArray.enable_interface_descriptor_assertions();
+  idlArray.enable_attribute_descriptor_assertions();
+  idlArray.enable_object_brand_assertions();
+  idlArray.add_objects({
+    MoliIdlHarnessThing: ["new MoliIdlHarnessThing()"]
+  });
+});
+</script>

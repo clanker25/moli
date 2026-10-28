@@ -1,0 +1,6 @@
+[profile.ci]
+fail-fast = false
+retries = 2
+status-level = "retry"
+final-status-level = "flaky"
+success-output = "never"       

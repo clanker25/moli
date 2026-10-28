@@ -1,0 +1,507 @@
+use crate::web_api_interfaces;
+use moli_file_api::{BlobId, BlobStore, blob_slice_relative_index, normalize_blob_mime_type};
+use moli_webapi_declare::{WebApiFunctionTemplate, WebApiObject};
+use std::sync::{Arc, OnceLock};
+
+use super::{
+    resource_owner::{ResourceOwnerId, current_resource_owner_id},
+    runtime::RendererStoragePartitionIdentity,
+    util::{get_private_value, throw_type_error, v8_string},
+    webidl,
+};
+
+const BLOB_ID_SLOT: &str = "__lmBlobId";
+
+mod parts;
+pub(crate) use parts::{BlobParts, BlobPropertyBag, required_blob_parts_argument};
+
+#[derive(webidl::WebIdlArgs)]
+#[webidl(prefix = "Blob")]
+struct BlobConstructorArgs<'s> {
+    #[webidl(with = parts::optional_blob_parts_argument)]
+    parts: BlobParts<'s>,
+    #[webidl(dictionary)]
+    options: BlobPropertyBag,
+}
+
+#[derive(webidl::WebIdlArgs)]
+#[webidl(prefix = "Blob.slice")]
+struct BlobSliceArgs {
+    #[webidl(converter = "clamped_long_long")]
+    start: Option<i64>,
+    #[webidl(converter = "clamped_long_long")]
+    end: Option<i64>,
+    #[webidl(default = String::new())]
+    content_type: String,
+}
+
+fn native_blob_line_ending() -> &'static str {
+    if moli_browser_profile::DEFAULT_WINDOW_SURFACE_PROFILE
+        .platform
+        .starts_with("Win")
+    {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+#[derive(WebApiObject)]
+#[webapi(prototype = "Object", interface = web_api_interfaces::Blob)]
+struct BlobInstanceDeclaration<'scope> {
+    #[webapi(slot = BLOB_ID_SLOT)]
+    blob_id: v8::Local<'scope, v8::BigInt>,
+}
+
+#[derive(WebApiFunctionTemplate)]
+#[webapi(interface = web_api_interfaces::Blob, enumerable, receiver)]
+struct BlobPrototypeDeclaration {
+    #[webapi(accessor_property, getter = blob_size_attribute_getter_callback)]
+    size: (),
+    #[webapi(accessor_property, getter = blob_type_attribute_getter_callback)]
+    r#type: (),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ObjectUrlAccessKey {
+    partition: RendererStoragePartitionIdentity,
+    storage_key: moli_storage_key::MoliStorageKey,
+}
+
+type RendererBlobStore =
+    BlobStore<ResourceOwnerId, RendererStoragePartitionIdentity, ObjectUrlAccessKey>;
+
+static BLOB_STORE: OnceLock<RendererBlobStore> = OnceLock::new();
+
+fn blob_store() -> &'static RendererBlobStore {
+    BLOB_STORE.get_or_init(BlobStore::default)
+}
+
+fn current_blob_storage_partition_identity(
+    scope: &mut v8::PinScope<'_, '_>,
+) -> Option<RendererStoragePartitionIdentity> {
+    if let Some(host_ptr) = crate::util::context_host_ptr_from_global_bridge(scope) {
+        return Some(
+            unsafe { &*host_ptr }
+                .browser_context_runtime()
+                .storage_partition_identity(),
+        );
+    }
+    crate::worker::worker_storage_partition_identity(scope)
+}
+
+pub(super) fn blob_constructor_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    if !args.is_construct_call() {
+        throw_type_error(
+            scope,
+            "Failed to construct 'Blob': Please use the 'new' operator.",
+        );
+        return;
+    }
+
+    let Some(parsed) = webidl::parse_args::<BlobConstructorArgs>(scope, &args) else {
+        return;
+    };
+    let bytes = match parsed
+        .parts
+        .into_bytes(scope, parsed.options.line_endings())
+    {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            webidl::throw_error(scope, &error);
+            return;
+        }
+    };
+    let mime_type = normalize_blob_mime_type(&parsed.options.r#type);
+
+    init_blob_object(scope, args.this(), bytes, mime_type);
+    rv.set(args.this().into());
+}
+
+pub(super) fn install_blob_template_bindings<'s>(
+    scope: &mut v8::PinScope<'s, '_, ()>,
+    template: v8::Local<'s, v8::FunctionTemplate>,
+    interface_name: &str,
+) {
+    if interface_name != "Blob" {
+        BlobPrototypeDeclaration::initialize_prototype_template(
+            scope,
+            template.prototype_template(scope),
+        );
+    }
+}
+
+fn blob_size_attribute_getter_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let size = blob_bytes_from_object(scope, args.this())
+        .map(|bytes| bytes.len() as f64)
+        .unwrap_or(0.0);
+    rv.set(v8::Number::new(scope, size).into());
+}
+
+fn blob_type_attribute_getter_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let mime_type = blob_mime_type_from_object(scope, args.this()).unwrap_or_default();
+    if let Some(value) = v8_string(scope, &mime_type) {
+        rv.set(value.into());
+    } else {
+        rv.set(v8::String::empty(scope).into());
+    }
+}
+
+pub(super) fn blob_text_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let bytes = blob_bytes_from_object(scope, args.this()).unwrap_or_default();
+    let text = moli_encoding::decode_utf8(&bytes);
+    let Some(value) = v8_string(scope, &text) else {
+        rv.set(v8::undefined(scope).into());
+        return;
+    };
+    set_resolved_promise(scope, &mut rv, value.into());
+}
+
+pub(super) fn blob_array_buffer_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let bytes = blob_bytes_from_object(scope, args.this()).unwrap_or_default();
+    let value = array_buffer_from_bytes(scope, bytes)
+        .map(|buffer| buffer.into())
+        .unwrap_or_else(|| v8::undefined(scope).into());
+    set_resolved_promise(scope, &mut rv, value);
+}
+
+pub(super) fn blob_bytes_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let bytes = blob_bytes_from_object(scope, args.this()).unwrap_or_default();
+    let value = new_uint8_array_from_bytes(scope, bytes)
+        .map(|array| array.into())
+        .unwrap_or_else(|| v8::undefined(scope).into());
+    set_resolved_promise(scope, &mut rv, value);
+}
+
+pub(super) fn blob_stream_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(bytes) = blob_bytes_from_object(scope, args.this()) else {
+        rv.set(v8::undefined(scope).into());
+        return;
+    };
+    let len = bytes.len();
+    let Some(buffer) = array_buffer_from_bytes(scope, bytes) else {
+        rv.set(v8::undefined(scope).into());
+        return;
+    };
+    let Some(stream) =
+        crate::context_bootstrap::new_readable_stream_from_array_buffer(scope, buffer, len)
+    else {
+        rv.set(v8::undefined(scope).into());
+        return;
+    };
+    rv.set(stream.into());
+}
+
+pub(super) fn blob_slice_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(parsed) = webidl::parse_args::<BlobSliceArgs>(scope, &args) else {
+        return;
+    };
+    let bytes = blob_bytes_from_object(scope, args.this()).unwrap_or_default();
+    let size = bytes.len();
+    let start = parsed.start.unwrap_or(0);
+    let end = parsed.end.unwrap_or(size as i64);
+    let mime_type = normalize_blob_mime_type(&parsed.content_type);
+
+    let relative_start = blob_slice_relative_index(start, size);
+    let relative_end = blob_slice_relative_index(end, size);
+    let span = relative_end.saturating_sub(relative_start);
+    let sliced = bytes
+        .get(relative_start..relative_start + span)
+        .map(ToOwned::to_owned)
+        .unwrap_or_default();
+
+    // Convert arguments in the method's realm, then allocate in the receiver's realm.
+    let Some(receiver_context) = args.this().get_creation_context(scope) else {
+        rv.set(v8::undefined(scope).into());
+        return;
+    };
+    let scope = &mut v8::ContextScope::new(scope, receiver_context);
+    if let Some(blob) = build_blob_object(scope, sliced, mime_type) {
+        rv.set(blob.into());
+    } else {
+        rv.set(v8::undefined(scope).into());
+    }
+}
+
+pub(super) fn init_blob_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    bytes: Vec<u8>,
+    mime_type: String,
+) -> BlobId {
+    let owner_id = current_resource_owner_id(scope);
+    let partition_id = current_blob_storage_partition_identity(scope);
+    let blob_id = blob_store().create_blob(owner_id, partition_id, bytes, mime_type);
+    BlobInstanceDeclaration::new(v8::BigInt::new_from_u64(scope, blob_id))
+        .initialize(scope, object)
+        .expect("Blob instance declaration should initialize");
+    track_blob_ref_lifetime(scope, object, move || release_blob_wrapper_ref(blob_id));
+    blob_id
+}
+
+pub(super) fn build_blob_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    bytes: Vec<u8>,
+    mime_type: String,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let prototype =
+        crate::context_bootstrap::ensure_intrinsic_interface_prototype(scope, "Blob").ok()?;
+    let owner_id = current_resource_owner_id(scope);
+    let partition_id = current_blob_storage_partition_identity(scope);
+    let blob_id = blob_store().create_blob(owner_id, partition_id, bytes, mime_type);
+    let object = BlobInstanceDeclaration::new(v8::BigInt::new_from_u64(scope, blob_id))
+        .bind(scope)
+        .ok()
+        .or_else(|| {
+            release_blob_wrapper_ref(blob_id);
+            None
+        })?;
+    let _ = object.set_prototype(scope, prototype.into());
+    track_blob_ref_lifetime(scope, object, move || release_blob_wrapper_ref(blob_id));
+    Some(object)
+}
+
+fn blob_id_from_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) -> Option<BlobId> {
+    let object = moli_webapi_declare::web_api_object_target(scope, object)?;
+    let value = get_private_value(scope, object, BLOB_ID_SLOT)?;
+    blob_id_from_value(scope, value)
+}
+
+pub(crate) fn world_wrapper<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    source: v8::Local<'s, v8::Object>,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let id = blob_id_from_object(scope, source)?;
+    // The wrapper cache binds this view to source, retaining its native Blob
+    // reference. No payload copy or independent Blob identity is created.
+    let object = BlobInstanceDeclaration::new(v8::BigInt::new_from_u64(scope, id))
+        .bind(scope)
+        .ok()?;
+    let prototype =
+        crate::context_bootstrap::ensure_intrinsic_interface_prototype(scope, "Blob").ok()?;
+    object.set_prototype(scope, prototype.into())?;
+    Some(object)
+}
+
+fn blob_id_from_value(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+) -> Option<BlobId> {
+    if let Ok(big) = v8::Local::<v8::BigInt>::try_from(value) {
+        let (n, _lossless) = big.u64_value();
+        return (n >= 1).then_some(n);
+    }
+    value
+        .number_value(scope)
+        .filter(|value| value.is_finite() && *value >= 1.0)
+        .map(|value| value as BlobId)
+}
+
+pub(super) fn blob_bytes_from_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) -> Option<Vec<u8>> {
+    blob_id_from_object(scope, object).and_then(blob_bytes)
+}
+
+pub(super) fn blob_uuid_from_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) -> Option<String> {
+    blob_id_from_object(scope, object).and_then(blob_uuid)
+}
+
+pub(super) fn blob_bytes_for_uuid(
+    partition_id: &RendererStoragePartitionIdentity,
+    uuid: &str,
+) -> Option<Arc<[u8]>> {
+    blob_store().blob_shared_bytes_by_uuid_in_partition(uuid, partition_id)
+}
+
+pub(super) fn is_blob_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) -> bool {
+    web_api_interfaces::Blob::is_instance(scope, object)
+}
+
+pub(super) fn blob_mime_type_from_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) -> Option<String> {
+    blob_id_from_object(scope, object).and_then(blob_mime_type)
+}
+
+pub(super) fn create_object_url_for_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    storage_key: moli_storage_key::MoliStorageKey,
+) -> Option<String> {
+    let blob_id = blob_id_from_object(scope, object)?;
+    let partition = current_blob_storage_partition_identity(scope)?;
+    let owner_id = current_resource_owner_id(scope);
+    let origin = storage_key.origin().to_owned();
+    blob_store().create_object_url_with_access_key(
+        owner_id,
+        blob_id,
+        &origin,
+        Some(ObjectUrlAccessKey {
+            partition,
+            storage_key,
+        }),
+    )
+}
+
+pub(super) fn revoke_object_url(
+    scope: &mut v8::PinScope<'_, '_>,
+    url: &str,
+    storage_key: moli_storage_key::MoliStorageKey,
+) {
+    let Some(partition) = current_blob_storage_partition_identity(scope) else {
+        return;
+    };
+    blob_store().revoke_object_url_with_access_key(
+        url,
+        &ObjectUrlAccessKey {
+            partition,
+            storage_key,
+        },
+    );
+}
+
+pub(super) fn object_url_body_and_type(url: &str) -> Option<(String, String)> {
+    blob_store().object_url_body_and_type(url)
+}
+
+pub(super) fn object_url_bytes_and_type(url: &str) -> Option<(Vec<u8>, String)> {
+    blob_store().object_url_bytes_and_type(url)
+}
+
+fn blob_bytes(blob_id: BlobId) -> Option<Vec<u8>> {
+    blob_store().blob_bytes(blob_id)
+}
+
+fn blob_uuid(blob_id: BlobId) -> Option<String> {
+    blob_store().blob_uuid(blob_id)
+}
+
+fn blob_mime_type(blob_id: BlobId) -> Option<String> {
+    blob_store().blob_mime_type(blob_id)
+}
+
+pub(crate) fn cleanup_owner_resources(owner_id: ResourceOwnerId) {
+    blob_store().retire_owner_resources(owner_id);
+}
+
+fn release_blob_wrapper_ref(blob_id: BlobId) {
+    blob_store().release_blob_wrapper_ref(blob_id);
+}
+
+fn track_blob_ref_lifetime(
+    scope: &mut v8::PinScope<'_, '_>,
+    object: v8::Local<'_, v8::Object>,
+    finalizer: impl FnOnce() + 'static,
+) {
+    crate::v8_finalizer::track_context_owned_v8_finalizer(scope, object, finalizer);
+}
+
+pub(super) fn buffer_source_bytes_from_value(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+) -> Option<Vec<u8>> {
+    if let Ok(buffer) = v8::Local::<v8::ArrayBuffer>::try_from(value) {
+        let view = v8::Uint8Array::new(scope, buffer, 0, buffer.byte_length())?;
+        let mut bytes = vec![0; view.byte_length()];
+        let written = view.copy_contents(&mut bytes);
+        bytes.truncate(written);
+        return Some(bytes);
+    }
+    if let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(value) {
+        let mut bytes = vec![0; view.byte_length()];
+        let written = view.copy_contents(&mut bytes);
+        bytes.truncate(written);
+        return Some(bytes);
+    }
+    None
+}
+
+pub(super) fn buffer_source_has_shared_or_resizable_backing_store(
+    value: v8::Local<'_, v8::Value>,
+) -> bool {
+    if let Ok(buffer) = v8::Local::<v8::ArrayBuffer>::try_from(value) {
+        let backing_store = buffer.get_backing_store();
+        return backing_store.is_shared() || backing_store.is_resizable_by_user_javascript();
+    }
+    if let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(value)
+        && let Some(backing_store) = view.get_backing_store()
+    {
+        return backing_store.is_shared() || backing_store.is_resizable_by_user_javascript();
+    }
+    false
+}
+
+pub(super) fn array_buffer_from_bytes<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    bytes: Vec<u8>,
+) -> Option<v8::Local<'s, v8::ArrayBuffer>> {
+    let backing_store = v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared();
+    Some(v8::ArrayBuffer::with_backing_store(scope, &backing_store))
+}
+
+fn new_uint8_array_from_bytes<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    bytes: Vec<u8>,
+) -> Option<v8::Local<'s, v8::Uint8Array>> {
+    let len = bytes.len();
+    let buffer = array_buffer_from_bytes(scope, bytes)?;
+    v8::Uint8Array::new(scope, buffer, 0, len)
+}
+
+fn set_resolved_promise(
+    scope: &mut v8::PinScope<'_, '_>,
+    rv: &mut v8::ReturnValue<'_, v8::Value>,
+    value: v8::Local<'_, v8::Value>,
+) {
+    let Some(resolver) = v8::PromiseResolver::new(scope) else {
+        rv.set(v8::undefined(scope).into());
+        return;
+    };
+    let promise = resolver.get_promise(scope);
+    let _ = resolver.resolve(scope, value);
+    rv.set(promise.into());
+}

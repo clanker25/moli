@@ -1,0 +1,972 @@
+use super::*;
+use crate::native_bridge::LayoutPublicationRequest;
+#[cfg(feature = "devtools")]
+use crate::native_bridge::element::InputHitTestPolicy;
+
+impl moli_dom::accessibility::AccessibilityStyleSource
+    for crate::native_bridge::element::StyleObservation<'_>
+{
+    fn element_style(
+        &mut self,
+        node_id: DomHandle,
+    ) -> Option<moli_dom::accessibility::AccessibilityStyle> {
+        self.read(node_id).accessibility_style()
+    }
+}
+
+impl ScriptVm {
+    #[cfg(feature = "devtools")]
+    pub(crate) fn accessibility_payloads(
+        &self,
+        handle: DomHandle,
+        request: moli_dom::accessibility::AccessibilityRequest,
+        backend_node_id_for_node: &mut dyn FnMut(DomHandle) -> Option<u32>,
+    ) -> Option<Vec<serde_json::Value>> {
+        self.with_accessibility_input(handle, |document, input| {
+            moli_dom::accessibility::accessibility_payloads_for_document(
+                document,
+                input,
+                handle,
+                request,
+                backend_node_id_for_node,
+            )
+        })
+    }
+
+    pub(crate) fn accessibility_nodes(
+        &self,
+        handle: DomHandle,
+        request: moli_dom::accessibility::AccessibilityRequest,
+        backend_node_id_for_node: &mut dyn FnMut(DomHandle) -> Option<u32>,
+    ) -> Option<Vec<moli_dom::accessibility::AccessibilityNode>> {
+        self.with_accessibility_input(handle, |document, input| {
+            moli_dom::accessibility::accessibility_nodes_for_document(
+                document,
+                input,
+                handle,
+                request,
+                backend_node_id_for_node,
+            )
+        })
+    }
+
+    fn with_accessibility_input<T>(
+        &self,
+        handle: DomHandle,
+        read: impl FnOnce(
+            &crate::dom::native::DomHost,
+            &mut moli_dom::accessibility::AccessibilityInput<'_>,
+        ) -> Option<T>,
+    ) -> Option<T> {
+        let host = self._context_host.borrow();
+        let mut document = host.dom_host().owner_document_handle(handle)?;
+        let mut frame_state = moli_dom::accessibility::AccessibilityFrameState::Active;
+        while let Some(owner) = host.child_browsing_context_host_for_document_handle(document) {
+            if host.dom_host().is_inert_in_document(owner) {
+                frame_state = moli_dom::accessibility::AccessibilityFrameState::Inert;
+                break;
+            }
+            document = host.dom_host().owner_document_handle(owner)?;
+        }
+        let mut observation = crate::native_bridge::element::StyleObservation::new(&host);
+        let mut input =
+            moli_dom::accessibility::AccessibilityInput::new(&mut observation, frame_state);
+        read(host.dom_host(), &mut input)
+    }
+
+    pub(crate) fn sync_live_document_style_sources(&mut self) {
+        let document = self.document_runtime.document_handle();
+        self._context_host
+            .borrow_mut()
+            .install_prepared_style_sheets_for_document(document);
+    }
+
+    #[cfg(feature = "devtools")]
+    pub(crate) fn computed_style_property_values_for_document_snapshot(
+        &self,
+        handles: impl IntoIterator<Item = DomHandle>,
+        properties: &[String],
+    ) -> Result<Vec<Vec<String>>> {
+        Ok(
+            crate::native_bridge::element::computed_style_property_values_for_document_snapshot(
+                &self._context_host.borrow(),
+                handles,
+                properties,
+            )?,
+        )
+    }
+
+    pub(crate) fn computed_style_export_values_for_document_snapshot(
+        &self,
+        handles: impl IntoIterator<Item = DomHandle>,
+        properties: &[String],
+    ) -> Vec<crate::native_bridge::element::ComputedStyleExportValues> {
+        crate::native_bridge::element::computed_style_export_values_for_document_snapshot(
+            &self._context_host.borrow(),
+            handles,
+            properties,
+        )
+    }
+
+    pub(crate) fn publish_layout(&mut self) -> anyhow::Result<()> {
+        let viewport = {
+            let host = self._context_host.borrow();
+            if !host.layout_policy().uses_real_layout() {
+                return Ok(());
+            }
+            host.layout_viewport_for_document(host.document_handle())
+        };
+        self.with_fresh_layout_pass(
+            moli_layout::LayoutPassRequest::new(viewport, moli_layout::LayoutFlushReason::Explicit),
+            LayoutPublicationRequest::Screen,
+            |_| Ok(()),
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn screenshot_layout_snapshot(
+        &mut self,
+        viewport: moli_layout::PaintViewport,
+    ) -> anyhow::Result<Option<moli_layout::PaintSnapshot>> {
+        self.paint_layout_snapshot(
+            viewport,
+            moli_layout::LayoutFlushReason::Screenshot,
+            LayoutPublicationRequest::Screen,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_layout_for_test(&mut self) -> anyhow::Result<()> {
+        let viewport = {
+            let host = self._context_host.borrow();
+            host.layout_viewport_for_document(host.document_handle())
+        };
+        self.screenshot_layout_snapshot(viewport)?
+            .ok_or_else(|| anyhow::anyhow!("fixture screenshot requires a document"))?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn refresh_layout_snapshot_for_test(
+        &mut self,
+        viewport: moli_layout::LayoutViewport,
+    ) -> Result<bool, moli_layout::LayoutError> {
+        self.with_fresh_layout_pass(
+            moli_layout::LayoutPassRequest::new(viewport, moli_layout::LayoutFlushReason::Test),
+            LayoutPublicationRequest::Screen,
+            |_| Ok(()),
+        )
+        .map(|result| result.is_some())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn paint_layout_snapshot(
+        &mut self,
+        viewport: moli_layout::PaintViewport,
+        reason: moli_layout::LayoutFlushReason,
+        publication: LayoutPublicationRequest,
+    ) -> anyhow::Result<Option<moli_layout::PaintSnapshot>> {
+        self.paint_layout_snapshot_with_capture(
+            viewport,
+            reason,
+            moli_layout::PaintCaptureRequest::viewport(),
+            publication,
+            None,
+        )
+    }
+
+    pub(crate) fn paint_layout_snapshot_with_capture(
+        &mut self,
+        viewport: moli_layout::PaintViewport,
+        reason: moli_layout::LayoutFlushReason,
+        capture: moli_layout::PaintCaptureRequest,
+        publication: LayoutPublicationRequest,
+        environment_override: Option<crate::style_engine::StyloStyleEnvironment>,
+    ) -> anyhow::Result<Option<moli_layout::PaintSnapshot>> {
+        self.with_fresh_layout_pass_in_environment(
+            moli_layout::LayoutPassRequest::with_capture(viewport, reason, capture),
+            publication,
+            environment_override,
+            moli_layout::LayoutPassResult::take_paint_snapshot,
+        )
+        .map_err(anyhow::Error::new)
+    }
+
+    #[cfg(all(test, feature = "devtools"))]
+    pub(crate) fn has_screencast_paint_for_test(&self) -> bool {
+        self._context_host.borrow().has_screencast_paint_for_test()
+    }
+
+    #[cfg(feature = "devtools")]
+    pub(crate) fn paint_current_screencast_layout(
+        &mut self,
+        session: &crate::runtime::RendererScreencastPaintSession,
+        viewport: moli_layout::PaintViewport,
+        capture: moli_layout::PaintCaptureRequest,
+    ) -> Result<Option<moli_layout::PaintSnapshot>> {
+        let painted = self
+            ._context_host
+            .borrow()
+            .paint_current_screencast_layout(session, viewport, capture)?;
+        let Some((snapshot, css_images)) = painted else {
+            return Ok(None);
+        };
+        self.start_css_images_discovered_by_layout(css_images);
+        Ok(Some(snapshot))
+    }
+
+    #[cfg(feature = "devtools")]
+    pub(crate) fn visual_state_token(
+        &self,
+        document: crate::runtime::RendererDocumentLifecycleIdentity,
+        viewport: moli_layout::PaintViewport,
+        base_background_color: [u8; 4],
+    ) -> crate::runtime::RendererVisualStateToken {
+        self._context_host
+            .borrow()
+            .visual_state_token(document, viewport, base_background_color)
+    }
+
+    #[cfg(feature = "molio")]
+    pub(crate) fn set_viewport_display_clock(
+        &self,
+        clock: Option<(u64, tokio::sync::watch::Sender<Option<u64>>)>,
+    ) {
+        self._context_host
+            .borrow()
+            .set_viewport_display_clock(clock);
+    }
+
+    #[cfg(feature = "molio")]
+    pub(crate) fn accept_viewport_display_tick(&self, time: std::time::Instant) -> bool {
+        self._context_host
+            .borrow()
+            .accept_viewport_display_tick(time)
+    }
+
+    #[cfg(feature = "molio")]
+    pub(crate) fn request_viewport_frame(&self) {
+        self._context_host
+            .borrow()
+            .request_realtime_rendering_opportunity();
+    }
+
+    #[cfg(feature = "molio")]
+    pub(crate) fn viewport_navigation(&self) -> crate::runtime::RendererViewportNavigation {
+        let position = self
+            ._context_host
+            .borrow()
+            .session_histories
+            .main_position();
+        crate::runtime::RendererViewportNavigation {
+            url: self.document_runtime.document_url().clone(),
+            title: self.document_runtime.dom_host().document_title(),
+            favicon_urls: self.viewport_favicon_urls(),
+            can_go_back: position.index() > 0,
+            can_go_forward: position.index() + 1 < position.length(),
+        }
+    }
+
+    #[cfg(feature = "molio")]
+    fn viewport_favicon_urls(&self) -> std::sync::Arc<[url::Url]> {
+        use crate::document_runtime::DocumentSubresourceCspKind;
+
+        let runtime = &self.document_runtime;
+        let dom = runtime.dom_host();
+        let document_url = runtime.document_url();
+        let base_url = dom.document_base_url();
+        let base_url = base_url.as_ref().unwrap_or(document_url);
+        let mut urls = Vec::new();
+        if let Some(head) = dom.document_head_handle() {
+            for node in dom.child_handles(head) {
+                let Some(link) = dom.node(node).and_then(|node| node.as_element()) else {
+                    continue;
+                };
+                if !link.is_html_element("link")
+                    || !link.attribute_ns("", "rel").is_some_and(|rel| {
+                        rel.split_ascii_whitespace()
+                            .any(|token| token.eq_ignore_ascii_case("icon"))
+                    })
+                {
+                    continue;
+                }
+                let Some(href) = link.attribute_ns("", "href").map(str::trim_ascii) else {
+                    continue;
+                };
+                if !href.is_empty()
+                    && let Ok(url) = base_url.join(href)
+                    && matches!(url.scheme(), "http" | "https" | "data")
+                {
+                    urls.push(url);
+                }
+            }
+        }
+        if urls.is_empty()
+            && matches!(document_url.scheme(), "http" | "https")
+            && let Ok(url) = document_url.join("/favicon.ico")
+        {
+            urls.push(url);
+        }
+        // Prefer the later declaration when candidates are otherwise equivalent.
+        urls.reverse();
+        urls.retain(|url| {
+            runtime
+                .document_subresource_csp_check(url, DocumentSubresourceCspKind::Image)
+                .into_violations()
+                .1
+                .is_none()
+        });
+        urls.into()
+    }
+
+    #[cfg(feature = "molio")]
+    pub(crate) fn set_viewport_resource_wake(&self, wake: &std::sync::Arc<tokio::sync::Notify>) {
+        self._context_host.borrow().set_viewport_resource_wake(wake);
+    }
+
+    #[cfg(all(test, feature = "devtools"))]
+    pub(crate) fn visual_resource_generation_handle_for_test(
+        &self,
+    ) -> crate::native_bridge::visual_resource_generation::VisualResourceGeneration {
+        self._context_host
+            .borrow()
+            .visual_resource_generation_handle_for_test()
+    }
+
+    pub(super) fn with_fresh_layout_pass<T>(
+        &mut self,
+        request: moli_layout::LayoutPassRequest,
+        publication: LayoutPublicationRequest,
+        consume: impl FnOnce(
+            &mut moli_layout::LayoutPassResult<DomHandle>,
+        ) -> Result<T, moli_layout::LayoutError>,
+    ) -> Result<Option<T>, moli_layout::LayoutError> {
+        self.with_fresh_layout_pass_in_environment(request, publication, None, consume)
+    }
+
+    pub(super) fn with_fresh_layout_pass_in_environment<T>(
+        &mut self,
+        request: moli_layout::LayoutPassRequest,
+        publication: LayoutPublicationRequest,
+        environment_override: Option<crate::style_engine::StyloStyleEnvironment>,
+        consume: impl FnOnce(
+            &mut moli_layout::LayoutPassResult<DomHandle>,
+        ) -> Result<T, moli_layout::LayoutError>,
+    ) -> Result<Option<T>, moli_layout::LayoutError> {
+        if environment_override.is_some() && publication != LayoutPublicationRequest::Transient {
+            return Err(moli_layout::LayoutError::source_contract(
+                "capture environment",
+                "temporary style environments require transient layout publication",
+            ));
+        }
+        // Font resources are reconciled by the document resource lifecycle.
+        // Layout consumes registered data and performs no font loading work.
+        let paused = self.is_debugger_paused();
+        let discovers_css_images = request.requests_paint() && !paused;
+        let (document, publishes_layout, result) = {
+            let context_host = self._context_host.borrow();
+            let document = context_host.document_handle();
+            let publication =
+                context_host.prepare_layout_publication(document, request.viewport, publication)?;
+            let publishes_layout = publication.publishes_screen();
+            // Screen publication needs geometry from zero-sized frames too.
+            // Transient captures use the coverage requested by their output path.
+            let request = publication.layout_request(request);
+            let result = context_host
+                .build_layout_pass_for_document_in_environment(
+                    document,
+                    request,
+                    environment_override,
+                    publication.publishes_current_screen(),
+                )
+                .and_then(|pass| {
+                    let Some((mut pass, feedback)) = pass else {
+                        return Ok(None);
+                    };
+                    let css_images = match (discovers_css_images, request.includes_backgrounds()) {
+                        (false, _) => Vec::new(),
+                        (true, true) => pass.css_image_references().to_vec(),
+                        (true, false) => pass
+                            .css_image_references()
+                            .iter()
+                            .filter(|image| {
+                                image.purpose != moli_layout::LayoutCssImagePurpose::Background
+                            })
+                            .cloned()
+                            .collect(),
+                    };
+                    let value = consume(&mut pass)?;
+                    context_host.finish_layout_publication(publication, pass, feedback)?;
+                    Ok(Some((value, css_images)))
+                });
+            (document, publishes_layout, result)
+        };
+        let (result, css_images) = match result {
+            Ok(Some((value, css_images))) => (Ok(Some(value)), css_images),
+            Ok(None) => (Ok(None), Vec::new()),
+            Err(error) => (Err(error), Vec::new()),
+        };
+        // Nested Page-agent reads can paint while the owner is suspended in
+        // V8. Resource admission and observer delivery belong to regular turns.
+        if paused {
+            return result;
+        }
+        self.start_css_images_discovered_by_layout(css_images);
+        if publishes_layout
+            && matches!(&result, Ok(Some(_)))
+            && let Err(error) = self.with_current_main_world_scope(|scope, runtime_ptr| {
+                crate::observer_runtime::queue_intersection_checks(scope, runtime_ptr);
+                crate::native_bridge::element::queue_revealed_lazy_image_loads(
+                    scope,
+                    runtime_ptr,
+                    document,
+                );
+                Ok(())
+            })
+        {
+            // Observers require an existing realm, and image resource admission
+            // initializes its realm before layout. Painting a native document
+            // alone must not create one. Keep a failed admission non-fatal to
+            // the completed frame; the next refresh retries from its newer
+            // sampled geometry.
+            tracing::warn!(?error, "failed to queue post-layout observable work");
+        }
+        result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn layout_pass_observability_for_test(
+        &self,
+    ) -> (
+        bool,
+        u64,
+        std::time::Duration,
+        Option<moli_layout::LayoutPassMetrics>,
+    ) {
+        self._context_host
+            .borrow()
+            .layout_pass_observability_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn css_image_resource_is_ready_for_test(&self, resolved_url: &str) -> bool {
+        let host = self._context_host.borrow();
+        host.ready_css_image_for_layout(host.document_handle(), resolved_url)
+            .is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn css_image_resource_observability_for_test(
+        &self,
+    ) -> (usize, usize, usize, usize, Vec<String>) {
+        self._context_host
+            .borrow()
+            .css_image_resource_observability_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn css_image_completion_notify_for_test(
+        &self,
+    ) -> std::sync::Arc<tokio::sync::Notify> {
+        self._context_host
+            .borrow()
+            .css_image_completion_notify_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn layout_snapshot_cache_observability_for_test(
+        &self,
+    ) -> (
+        u64,
+        u64,
+        u64,
+        Option<(DomHandle, moli_layout::LayoutTreeRetentionMetrics)>,
+    ) {
+        let observability = self
+            ._context_host
+            .borrow()
+            .layout_snapshot_cache_observability_for_test();
+        (
+            observability.hits,
+            observability.misses,
+            observability.publishes,
+            observability.cached,
+        )
+    }
+
+    pub(super) fn start_css_images_discovered_by_layout(
+        &mut self,
+        references: Vec<moli_layout::LayoutCssImageReference<DomHandle>>,
+    ) {
+        if references.is_empty() {
+            return;
+        }
+        let image_fetch_enabled = self
+            .document_runtime
+            .current_document_resource_loader()
+            .is_some_and(|loader| {
+                loader
+                    .request_client()
+                    .optional_resource_fetch_enabled(crate::types::SubresourceResourceType::Image)
+            });
+        if !image_fetch_enabled {
+            return;
+        }
+        let mut seen = std::collections::HashSet::new();
+        let bound = {
+            let mut host = self._context_host.borrow_mut();
+            references
+                .into_iter()
+                .filter_map(|reference| {
+                    let document = host.layout_document_for_source(reference.source)?;
+                    if !seen.insert((document, reference.resolved_url.clone())) {
+                        return None;
+                    }
+                    if host.stylesheet_css_image_is_current(document, &reference.resolved_url) {
+                        return None;
+                    }
+                    let request_url = url::Url::parse(&reference.resolved_url).ok()?;
+                    let binding = host
+                        .accept_current_stylesheet_subresource_load_delay_for_document(document)?;
+                    Some((
+                        binding,
+                        crate::css_resource_urls::StylesheetLoadBlockingResource::image(
+                            request_url,
+                        ),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+        self.start_stylesheet_subresource_fetches(bound);
+    }
+
+    /// Initializes the first layout on demand, then keeps its content extent
+    /// until an explicit refresh. Viewport and scroll remain live browser state.
+    pub(crate) fn document_metrics_for_current_document(
+        &self,
+    ) -> Result<moli_layout::LayoutDocumentMetrics, moli_layout::LayoutError> {
+        let host = self._context_host.borrow();
+        let document = host.document_handle();
+        let metrics = crate::native_bridge::element::observable_document_metrics(&host, document)?;
+        let viewport = host.layout_viewport_for_document(document);
+        let viewport_scroll = host
+            .dom_host()
+            .dom()
+            .document_element_handle_for_document(document)
+            .and_then(|root| host.dom_host().node(root))
+            .and_then(|node| node.as_element())
+            .map(|element| {
+                moli_layout::LayoutPoint::new(
+                    element.scroll_left() as f32,
+                    element.scroll_top() as f32,
+                )
+            })
+            .unwrap_or(moli_layout::LayoutPoint::ZERO);
+        Ok(moli_layout::LayoutDocumentMetrics {
+            viewport,
+            viewport_scroll,
+            content_size: metrics.content_size,
+        })
+    }
+
+    #[cfg(feature = "devtools")]
+    pub(crate) fn observable_geometry_query_for_document(
+        &self,
+        document: DomHandle,
+        query: &moli_layout::LayoutQuery<DomHandle>,
+    ) -> Result<moli_layout::LayoutQueryAnswer<DomHandle>, moli_layout::LayoutError> {
+        let host = self._context_host.borrow();
+        crate::native_bridge::element::observable_geometry_query(&host, document, query)
+    }
+
+    #[cfg(feature = "devtools")]
+    pub(crate) fn observable_geometry_batch_for_document(
+        &mut self,
+        document: DomHandle,
+        batch: &moli_layout::LayoutQueryBatch<DomHandle>,
+    ) -> Result<moli_layout::LayoutAnswers<DomHandle>, moli_layout::LayoutError> {
+        let host = self._context_host.borrow();
+        crate::native_bridge::element::observable_geometry_batch(&host, document, batch)
+    }
+
+    #[cfg(feature = "devtools")]
+    pub(crate) fn observable_deep_hit_test_for_current_document(
+        &mut self,
+        point: moli_layout::LayoutPoint,
+        policy: InputHitTestPolicy,
+    ) -> Result<Option<DomHandle>, moli_layout::LayoutError> {
+        let host = self._context_host.borrow();
+        let document = host.document_handle();
+        crate::native_bridge::element::observable_deep_hit_test(&host, document, point, policy)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn normalized_layout_box_tree_for_test(&self) -> anyhow::Result<Option<String>> {
+        let context_host = self._context_host.borrow();
+        let Some(root) = context_host.dom_host().document_element_handle() else {
+            return Ok(None);
+        };
+        crate::layout_renderer::build_normalized_native_box_tree_for_test(&context_host, root)
+            .map(|tree| Some(tree.to_string()))
+            .map_err(anyhow::Error::new)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn build_layout_pass_for_subtree_for_test(
+        &self,
+        root: DomHandle,
+        request: moli_layout::LayoutPassRequest,
+    ) -> Result<moli_layout::LayoutPassResult<DomHandle>, moli_layout::LayoutError> {
+        let context_host = self._context_host.borrow();
+        let mut services = moli_layout::DocumentLayoutServices::new();
+        let mut embedded_document_services = HashMap::new();
+        crate::layout_renderer::build_native_layout_pass(
+            &context_host,
+            root,
+            &mut services,
+            &mut embedded_document_services,
+            request,
+            None,
+            false,
+        )
+        .map(|(pass, _)| pass)
+    }
+
+    #[cfg(feature = "devtools")]
+    pub(crate) fn computed_style_properties_for_inspector_handle(
+        &self,
+        handle: DomHandle,
+    ) -> Result<Option<Vec<(String, String)>>> {
+        Ok(
+            crate::native_bridge::element::computed_style_properties_for_inspector_handle(
+                &self._context_host.borrow(),
+                handle,
+            )?,
+        )
+    }
+
+    #[cfg(feature = "devtools")]
+    pub(crate) fn marker_pseudo_element_is_generated_for_document_snapshot(
+        &self,
+        handle: DomHandle,
+    ) -> bool {
+        self.marker_hosts_for_document_snapshot([handle])
+            .contains(&handle)
+    }
+
+    #[cfg(feature = "devtools")]
+    pub(crate) fn marker_hosts_for_document_snapshot(
+        &self,
+        handles: impl IntoIterator<Item = DomHandle>,
+    ) -> std::collections::HashSet<DomHandle> {
+        crate::native_bridge::element::marker_hosts_for_document_snapshot(
+            &self._context_host.borrow(),
+            handles,
+        )
+    }
+
+    #[cfg(feature = "devtools")]
+    pub(crate) fn owner_style_sheet_text(&self, owner: DomHandle) -> Option<String> {
+        self._context_host.borrow().owner_style_sheet_text(owner)
+    }
+
+    #[cfg(feature = "devtools")]
+    pub(crate) fn linked_stylesheet_source_for_owner(
+        &self,
+        owner: DomHandle,
+    ) -> Option<crate::style_engine::StyloStylesheetSource> {
+        self._context_host
+            .borrow()
+            .linked_stylesheet_source_for_owner(owner)
+    }
+
+    #[cfg(feature = "devtools")]
+    pub(crate) fn stylesheet_owner_is_csp_blocked(&self, owner: DomHandle) -> bool {
+        self._context_host
+            .borrow()
+            .stylesheet_owner_is_csp_blocked(owner)
+    }
+
+    pub(crate) fn drain_parser_defined_autonomous_custom_elements(&mut self) -> Vec<String> {
+        self._context_host
+            .borrow_mut()
+            .drain_parser_defined_autonomous_custom_elements()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn document_handle_for_test(&self) -> DomHandle {
+        self.document_runtime.document_handle()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_style_invalidation_work_item_count_for_current_document_for_test(
+        &self,
+    ) -> usize {
+        let document = self.document_runtime.document_handle();
+        self._context_host
+            .borrow()
+            .pending_style_invalidation_work_item_count_for_document_for_test(document)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn element_handle_by_id_for_test(&self, id: &str) -> Option<DomHandle> {
+        self._context_host
+            .borrow()
+            .dom_host()
+            .element_handle_by_id(id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inline_style_base_url_count_for_document_for_test(
+        &self,
+        document: DomHandle,
+    ) -> usize {
+        self._context_host
+            .borrow()
+            .inline_style_base_url_count_for_document_for_test(document)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn computed_style_cache_entry_count_for_document_for_test(
+        &self,
+        document: DomHandle,
+    ) -> usize {
+        self._context_host
+            .borrow()
+            .computed_style_cache_entry_count_for_document_for_test(document)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_document_style_world_count_for_test(&self) -> usize {
+        self._context_host
+            .borrow()
+            .active_document_style_world_count_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn document_style_world_is_active_for_test(&self, document: DomHandle) -> bool {
+        self._context_host
+            .borrow()
+            .document_style_world_is_active_for_test(document)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn computed_style_cache_generation_for_document_for_test(
+        &self,
+        document: DomHandle,
+    ) -> u64 {
+        self._context_host
+            .borrow()
+            .computed_style_cache_generation_for_document_for_test(document)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_style_system_rebuild_count_for_document_for_test(
+        &self,
+        document: DomHandle,
+    ) -> u64 {
+        self._context_host
+            .borrow()
+            .retained_style_system_rebuild_count_for_document_for_test(document)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_style_system_update_count_for_document_for_test(
+        &self,
+        document: DomHandle,
+    ) -> u64 {
+        self._context_host
+            .borrow()
+            .retained_style_system_update_count_for_document_for_test(document)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_stylist_identity_for_document_for_test(
+        &self,
+        document: DomHandle,
+    ) -> u64 {
+        self._context_host
+            .borrow()
+            .retained_stylist_identity_for_document_for_test(document)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_shadow_scope_flush_count_for_document_for_test(
+        &self,
+        document: DomHandle,
+        root: DomHandle,
+    ) -> Option<u64> {
+        self._context_host
+            .borrow()
+            .retained_shadow_scope_flush_count_for_document_for_test(document, root)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shared_worker_client_count_for_test(&self) -> usize {
+        self._context_host
+            .borrow()
+            .shared_worker_client_count_for_test()
+    }
+
+    pub(crate) fn service_worker_client_id(
+        &self,
+    ) -> crate::service_worker_runtime::ServiceWorkerClientId {
+        self._context_host.borrow().service_worker_client_id()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn custom_element_registry_association_count_for_test(&self) -> usize {
+        self._context_host
+            .borrow()
+            .custom_element_registry_association_count_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn storage_bucket_keys_for_test(&self, storage_key: &str) -> Vec<String> {
+        self.storage_bucket_store.lock().keys(storage_key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn context_host_weak_for_test(&self) -> std::rc::Weak<RefCell<PageScriptHost>> {
+        Rc::downgrade(&self._context_host)
+    }
+
+    #[cfg(feature = "devtools")]
+    pub(crate) fn scroll_live_node_handle_into_view_if_needed(
+        &mut self,
+        handle: DomHandle,
+        rect: Option<moli_page_types::DomScrollIntoViewRect>,
+    ) -> Result<RendererScrollIntoViewResult> {
+        if !self._context_host.borrow().dom_host().is_connected(handle) {
+            return Ok(RendererScrollIntoViewResult::NodeDetached);
+        }
+        {
+            let host = self._context_host.borrow();
+            if host.layout_policy().uses_real_layout() {
+                host.ensure_observable_layout()?;
+                let document = host
+                    .layout_document_for_source(handle)
+                    .ok_or(moli_layout::LayoutError::NoLayoutSnapshot)?;
+                host.with_latest_layout_tree_for_document(document, |_| ())
+                    .ok_or(moli_layout::LayoutError::NoLayoutSnapshot)?;
+            }
+        }
+        self.with_default_context_scope(|scope, runtime_ptr| {
+            Ok(
+                match crate::native_bridge::element::scroll_node_into_view_if_needed(
+                    scope,
+                    runtime_ptr,
+                    handle,
+                    rect,
+                )? {
+                    Some(_) => RendererScrollIntoViewResult::ScrolledOrAlreadyVisible,
+                    None => RendererScrollIntoViewResult::NodeDoesNotHaveLayoutObject,
+                },
+            )
+        })
+    }
+
+    #[cfg(feature = "devtools")]
+    pub(crate) fn client_rect_for_live_node_handle(
+        &mut self,
+        handle: DomHandle,
+    ) -> Result<Option<ClientRect>, moli_layout::LayoutError> {
+        let Some(document) = self
+            ._context_host
+            .borrow()
+            .dom_host()
+            .owner_document_handle(handle)
+        else {
+            return Ok(None);
+        };
+        let answer = self.observable_geometry_query_for_document(
+            document,
+            &moli_layout::LayoutQuery::ClientRects { source: handle },
+        )?;
+        let moli_layout::LayoutQueryAnswer::ClientRects(mut quads) = answer else {
+            return Err(moli_layout::LayoutError::source_contract(
+                "renderer client rect",
+                "provider returned a mismatched client-rects answer",
+            ));
+        };
+        if quads.is_empty() {
+            return Ok(None);
+        }
+        self.compose_layout_quads_to_top(document, &mut quads)?;
+        let Some(rect) = quads
+            .into_iter()
+            .map(moli_layout::LayoutQuad::bounding_rect)
+            .reduce(moli_layout::LayoutRect::union)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(ClientRect {
+            left: f64::from(rect.x),
+            top: f64::from(rect.y),
+            right: f64::from(rect.right()),
+            bottom: f64::from(rect.bottom()),
+            width: f64::from(rect.width),
+            height: f64::from(rect.height),
+        }))
+    }
+
+    #[cfg(feature = "devtools")]
+    pub(crate) fn compose_layout_quads_to_top(
+        &mut self,
+        mut document: DomHandle,
+        quads: &mut [moli_layout::LayoutQuad],
+    ) -> Result<(), moli_layout::LayoutError> {
+        for _ in 0..16 {
+            let frame_context = {
+                let host = self._context_host.borrow();
+                if document == host.document_handle() {
+                    return Ok(());
+                }
+                let Some(frame) = host.child_browsing_context_host_for_document_handle(document)
+                else {
+                    return Err(moli_layout::LayoutError::source_contract(
+                        "frame geometry composition",
+                        "child document has no live frame owner",
+                    ));
+                };
+                let Some(parent_document) = host.dom_host().owner_document_handle(frame) else {
+                    return Err(moli_layout::LayoutError::source_contract(
+                        "frame geometry composition",
+                        "frame owner has no parent document",
+                    ));
+                };
+                (
+                    frame,
+                    parent_document,
+                    host.layout_viewport_for_document(document),
+                )
+            };
+            let (frame, parent_document, child_viewport) = frame_context;
+            let answer = self.observable_geometry_query_for_document(
+                parent_document,
+                &moli_layout::LayoutQuery::BoxModel { source: frame },
+            )?;
+            let moli_layout::LayoutQueryAnswer::BoxModel(Some(frame_model)) = answer else {
+                return Err(moli_layout::LayoutError::source_contract(
+                    "frame geometry composition",
+                    "frame owner has no content-box geometry",
+                ));
+            };
+            for quad in quads.iter_mut() {
+                for point in &mut quad.points {
+                    *point = map_child_viewport_point_to_parent_content(
+                        *point,
+                        child_viewport,
+                        frame_model.content,
+                    );
+                }
+            }
+            document = parent_document;
+        }
+        Err(moli_layout::LayoutError::source_contract(
+            "frame geometry composition",
+            "child-frame nesting exceeds the supported depth",
+        ))
+    }
+}

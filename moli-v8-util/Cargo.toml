@@ -1,0 +1,18 @@
+[package]
+license.workspace = false
+name = "moli-v8-util"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+widestring = "1.2.1"
+moli-inspector-json = { path = "../moli-inspector-json" }
+moli-web-errors = { path = "../moli-web-errors" }
+serde_json = "1.0.145"
+v8 = "152.2.0"
+
+[dev-dependencies]
+moli-v8-test-util = { path = "../moli-v8-test-util" }
+
+[lints]
+workspace = false

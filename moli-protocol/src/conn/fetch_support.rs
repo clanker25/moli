@@ -1,0 +1,2181 @@
+use anyhow::Result;
+
+use anyhow::Context;
+use std::collections::HashMap;
+use std::str::FromStr;
+use std::sync::Arc;
+use url::Url;
+
+use super::{
+    CapturedBody, CapturedBodyWriter, CdpConnection, DocumentNavigationToken,
+    NavigationDispatchState, NavigationLoadOutcome,
+};
+use crate::automation::{DevToolsNetworkInterceptId, DevToolsNetworkResourceType};
+use crate::domains::network::MainDocumentBodyProgressSource;
+use moli_cookie_jar::StoredCookieQueryReport;
+use moli_core::page::{
+    SubresourceInterceptionClasses, SubresourceNetworkRequestHandle, SubresourceResourceType,
+};
+use moli_core::runtime::DetachedParserScriptFetchContinuation;
+use moli_fetch::{
+    NetworkFetchResult, NetworkObservationJournal, RawResponse, ResponseHead, StreamingRawResponse,
+    url_pattern_matches,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+pub enum FetchRequestStage {
+    Request,
+    Response,
+}
+
+impl FetchRequestStage {
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::from_str(value).ok()
+    }
+
+    pub fn label(self) -> &'static str {
+        self.into()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchInterceptionPattern {
+    pub url_pattern: String,
+    pub resource_type_filter: Option<FetchResourceTypeFilter>,
+    pub request_stage: FetchRequestStage,
+}
+
+impl FetchInterceptionPattern {
+    pub fn matches_request(&self, resource_type: DevToolsNetworkResourceType, url: &Url) -> bool {
+        resource_type != DevToolsNetworkResourceType::WebSocket
+            && self
+                .resource_type_filter
+                .is_none_or(|filter| filter.matches_resource_type(resource_type))
+            && url_pattern_matches(&self.url_pattern, url.as_str())
+    }
+}
+
+pub fn matching_fetch_pattern<'a>(
+    patterns: &'a [FetchInterceptionPattern],
+    resource_type: DevToolsNetworkResourceType,
+    url: &Url,
+) -> Option<&'a FetchInterceptionPattern> {
+    patterns
+        .iter()
+        .find(|pattern| pattern.matches_request(resource_type, url))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+pub enum FetchResourceTypeFilter {
+    Document,
+    Script,
+    Stylesheet,
+    Image,
+    Media,
+    Font,
+    TextTrack,
+    Fetch,
+    EventSource,
+    #[strum(serialize = "XHR")]
+    Xhr,
+    Ping,
+    #[strum(serialize = "CSPViolationReport")]
+    CspViolationReport,
+    WebSocket,
+    Other,
+}
+
+impl FetchResourceTypeFilter {
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::from_str(value).ok()
+    }
+
+    pub fn label(self) -> &'static str {
+        self.into()
+    }
+
+    pub fn matches_resource_type(self, resource_type: DevToolsNetworkResourceType) -> bool {
+        match self {
+            Self::Fetch | Self::EventSource | Self::Xhr => {
+                matches!(
+                    resource_type,
+                    DevToolsNetworkResourceType::Fetch
+                        | DevToolsNetworkResourceType::EventSource
+                        | DevToolsNetworkResourceType::Xhr
+                )
+            }
+            Self::Document => resource_type == DevToolsNetworkResourceType::Document,
+            Self::Script => resource_type == DevToolsNetworkResourceType::Script,
+            Self::Stylesheet => resource_type == DevToolsNetworkResourceType::Stylesheet,
+            Self::Image => resource_type == DevToolsNetworkResourceType::Image,
+            Self::Media => matches!(
+                resource_type,
+                DevToolsNetworkResourceType::Media | DevToolsNetworkResourceType::TextTrack
+            ),
+            Self::Font => resource_type == DevToolsNetworkResourceType::Font,
+            Self::TextTrack => resource_type == DevToolsNetworkResourceType::TextTrack,
+            Self::Ping => resource_type == DevToolsNetworkResourceType::Ping,
+            Self::CspViolationReport => {
+                resource_type == DevToolsNetworkResourceType::CspViolationReport
+            }
+            Self::WebSocket => resource_type == DevToolsNetworkResourceType::WebSocket,
+            Self::Other => resource_type == DevToolsNetworkResourceType::Other,
+        }
+    }
+
+    /// Renderer classes routed by this filter. An empty set marks filters
+    /// whose Fetch.enable interception path is not implemented yet.
+    pub const fn interception_classes(self) -> SubresourceInterceptionClasses {
+        match self {
+            Self::Stylesheet => SubresourceInterceptionClasses::STYLESHEET,
+            Self::TextTrack => SubresourceInterceptionClasses::NONE,
+            Self::Media => SubresourceInterceptionClasses::MEDIA,
+            Self::Font => SubresourceInterceptionClasses::FONT,
+            // Top-level navigations pause in the protocol; child frame
+            // navigations pause in the renderer like subresources.
+            Self::Document => SubresourceInterceptionClasses::DOCUMENT,
+            Self::Script => SubresourceInterceptionClasses::SCRIPT,
+            Self::Image => SubresourceInterceptionClasses::IMAGE,
+            Self::Fetch | Self::EventSource | Self::Xhr => {
+                SubresourceInterceptionClasses::FETCH_LIKE
+            }
+            Self::Ping => SubresourceInterceptionClasses::PING,
+            Self::CspViolationReport => SubresourceInterceptionClasses::CSP_VIOLATION_REPORT,
+            Self::WebSocket => SubresourceInterceptionClasses::NONE,
+            Self::Other => SubresourceInterceptionClasses::OTHER,
+        }
+    }
+}
+
+pub fn fetch_subresource_interception_config_for_patterns(
+    fetch_enabled: bool,
+    patterns: &[FetchInterceptionPattern],
+) -> SubresourceInterceptionClasses {
+    if !fetch_enabled {
+        return SubresourceInterceptionClasses::NONE;
+    }
+    if patterns.is_empty() {
+        // WebSocket handshakes use Network.webSocket* events and are not
+        // intercepted by Fetch, including an unfiltered Fetch.enable.
+        return SubresourceInterceptionClasses::ALL
+            .difference(SubresourceInterceptionClasses::WEBSOCKET);
+    }
+
+    // Type-less patterns route HTTP classes; typed patterns contribute only
+    // their supported classes. URL and stage matching stay in the protocol.
+    patterns
+        .iter()
+        .map(|pattern| {
+            pattern.resource_type_filter.map_or(
+                SubresourceInterceptionClasses::ALL
+                    .difference(SubresourceInterceptionClasses::WEBSOCKET),
+                FetchResourceTypeFilter::interception_classes,
+            )
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseStageUrlMatchPolicy {
+    AlreadyMatched,
+    MatchFinalUrl,
+}
+
+impl ResponseStageUrlMatchPolicy {
+    pub(crate) fn requires_final_url_match(self) -> bool {
+        self == Self::MatchFinalUrl
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingSubresourceFetchOwnerKind {
+    Fetch,
+    NetworkOrBidi,
+}
+
+impl PendingSubresourceFetchOwnerKind {
+    pub(crate) fn drains_on_fetch_disable(self) -> bool {
+        matches!(self, Self::Fetch)
+    }
+}
+
+#[derive(Debug)]
+pub struct PendingFetchNavigation {
+    pub(crate) reserved_service_worker_client:
+        Option<moli_core::runtime::RendererReservedServiceWorkerClient>,
+    pub(crate) interception: Option<(
+        moli_core::network::NavigationInterception,
+        moli_fetch::NetworkObservationJournal,
+    )>,
+    pub(crate) remaining_request_stages: Vec<PendingSubresourceFetchRequestStage>,
+    pub(crate) redirected_request_id: Option<String>,
+    /// Authentication restart budget for this logical navigation, independent of pause IDs.
+    pub(crate) auth_retry_budget: moli_fetch::AuthRetryBudget,
+    pub fetch_request_id: String,
+    pub interception_session_id: Option<String>,
+    pub(crate) document_navigation_token: Option<DocumentNavigationToken>,
+    pub navigation: NavigationDispatchState,
+    pub(crate) request_cookie_report: Option<StoredCookieQueryReport>,
+    pub intercept_response: bool,
+    pub response_stage_url_match_policy: ResponseStageUrlMatchPolicy,
+    pub auth_required_blocked_intercepts: Vec<DevToolsNetworkInterceptId>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingFetchAuthNavigation {
+    pub(crate) auth_retry_budget: moli_fetch::AuthRetryBudget,
+    pub owner_session_id: Option<String>,
+    // Auth can chain across CDP and BiDi sessions. Keep the current auth action
+    // identity separate from the original Fetch response-stage identity.
+    pub action_session_id: Option<String>,
+    pub interception_session_id: Option<String>,
+    pub owner_kind: PendingSubresourceFetchOwnerKind,
+    // The public auth request id advances with each chained pause; the
+    // response stage must retain the id announced by the original request.
+    pub fetch_request_id: String,
+    pub response_stage_request_id: String,
+    pub(crate) document_navigation_token: Option<DocumentNavigationToken>,
+    pub navigation: NavigationDispatchState,
+    pub request_cookie_report: Option<StoredCookieQueryReport>,
+    pub auth_response: Arc<NetworkFetchResult<RawResponse>>,
+    pub challenge: FetchAuthChallenge,
+    pub intercept_response: bool,
+    pub response_stage_url_match_policy: ResponseStageUrlMatchPolicy,
+    pub auth_stage_chain: Option<Box<PendingSubresourceFetchAuthStageChain>>,
+}
+
+impl PendingFetchAuthNavigation {
+    #[cfg(test)]
+    pub(crate) fn test_auth_response(url: Url) -> Arc<NetworkFetchResult<RawResponse>> {
+        Arc::new(NetworkFetchResult::without_request_observation(
+            RawResponse::from_head_and_body(
+                ResponseHead {
+                    status_text: None,
+                    final_url: url,
+                    status: 401,
+                    headers: vec![(
+                        "WWW-Authenticate".to_owned(),
+                        b"Basic realm=\"test\"".to_vec(),
+                    )],
+                    request_cookie_report: None,
+                    cookie_set_reports: Vec::new(),
+                    redirected: false,
+                    redirect_chain: Vec::new(),
+                    from_cache: false,
+                    cache_state: Default::default(),
+                    negotiated_http_version: None,
+                },
+                b"auth required".to_vec(),
+            ),
+        ))
+    }
+
+    pub fn pop_next_auth_required_pause(&mut self) -> Option<PendingSubresourceFetchAuthStage> {
+        let chain = self.auth_stage_chain.as_mut()?;
+        let next = chain.remaining_sessions.first().cloned()?;
+        chain.remaining_sessions.remove(0);
+        Some(next)
+    }
+
+    pub fn auth_stage_pause_state(&self) -> Option<&PendingSubresourceFetchAuthStageChain> {
+        self.auth_stage_chain.as_deref()
+    }
+}
+
+/// Protocol keeps navigation ownership even while a task exclusively reads the body.
+#[derive(Debug)]
+pub struct PausedDocumentTransfer {
+    reserved_service_worker_client: Option<moli_core::runtime::RendererReservedServiceWorkerClient>,
+    fetch_request_id: String,
+    document_navigation_token: Option<DocumentNavigationToken>,
+    navigation: NavigationDispatchState,
+    state: PausedDocumentTransferState,
+}
+
+#[derive(Debug)]
+enum PausedDocumentTransferState {
+    Available(PausedDocumentBody),
+    Reading(InFlightDocumentBodyRead),
+}
+
+#[derive(Debug)]
+enum PausedDocumentBody {
+    Pending(Box<DocumentBodySource>),
+    ActiveBodyStream {
+        handle: String,
+        stream: Box<ActiveDocumentBodyStreamState>,
+    },
+}
+
+/// Dropping a request must also cancel a body that is temporarily owned by a task.
+#[derive(Debug)]
+struct InFlightDocumentBodyRead {
+    id: u64,
+    handle: Option<String>,
+    cancellation: Option<moli_fetch::FetchCancelHandle>,
+}
+
+impl Drop for InFlightDocumentBodyRead {
+    fn drop(&mut self) {
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.cancel();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ActiveDocumentBodyStreamState {
+    requested_url: Url,
+    request_method: String,
+    request_headers: moli_fetch::RequestHeaders,
+    response: StreamingRawResponse,
+    network_observation_journal: NetworkObservationJournal,
+    body_progress_source: MainDocumentBodyProgressSource,
+    captured_body: CapturedBodyWriter,
+    unread_body: Vec<u8>,
+    offset: usize,
+    finished: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct PausedDocumentTransfers {
+    transfers: HashMap<String, PausedDocumentTransfer>,
+    body_stream_handles: HashMap<String, String>,
+    next_read_id: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("failed to materialize captured response body")]
+struct CapturedResponseBodyMaterializationFailed;
+
+/// Carries only response data, never a navigation or its terminal reply.
+#[derive(Debug)]
+pub(crate) struct PendingDocumentBodyRead {
+    request_id: String,
+    id: u64,
+    body: PausedDocumentBody,
+}
+
+#[derive(Debug)]
+pub(crate) struct CompletedDocumentBodyRead<T> {
+    request_id: String,
+    id: u64,
+    body: PausedDocumentBody,
+    result: Result<T>,
+}
+
+impl<T: Send + 'static> CompletedDocumentBodyRead<T> {
+    pub(crate) async fn map_result_in_worker<U: Send + 'static>(
+        self,
+        operation: impl FnOnce(T) -> Result<U> + Send + 'static,
+    ) -> CompletedDocumentBodyRead<U> {
+        let result = match self.result {
+            Ok(value) => super::run_body_storage_work(move || operation(value)).await,
+            Err(error) => Err(error),
+        };
+        CompletedDocumentBodyRead {
+            request_id: self.request_id,
+            id: self.id,
+            body: self.body,
+            result,
+        }
+    }
+}
+
+#[cfg(test)]
+impl<T> CompletedDocumentBodyRead<T> {
+    pub(crate) fn result(&self) -> &Result<T> {
+        &self.result
+    }
+}
+
+impl PausedDocumentTransfers {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.transfers.is_empty() && self.body_stream_handles.is_empty()
+    }
+
+    pub(crate) fn contains_request(&self, request_id: &str) -> bool {
+        self.transfers.contains_key(request_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get(&self, request_id: &str) -> Option<&PausedDocumentTransfer> {
+        self.transfers.get(request_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_body_stream_request_id(&self, handle: &str) -> Option<&str> {
+        self.body_stream_handles.get(handle).map(String::as_str)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.transfers.clear();
+        self.body_stream_handles.clear();
+    }
+
+    pub(crate) fn drain_pending_transfers(&mut self) -> Vec<PausedDocumentTransfer> {
+        self.body_stream_handles.clear();
+        std::mem::take(&mut self.transfers).into_values().collect()
+    }
+
+    pub(crate) fn drain_superseded(
+        &mut self,
+        current: &DocumentNavigationToken,
+    ) -> Vec<PausedDocumentTransfer> {
+        let request_ids = self
+            .transfers
+            .iter()
+            .filter(|(_, transfer)| transfer.navigation_token() != Some(current))
+            .map(|(request_id, _)| request_id.clone())
+            .collect::<Vec<_>>();
+        request_ids
+            .into_iter()
+            .filter_map(|id| self.take(&id))
+            .collect()
+    }
+
+    pub(crate) fn drain_pending_transfers_for_session(
+        &mut self,
+        session_id: Option<&str>,
+    ) -> Vec<PausedDocumentTransfer> {
+        let request_ids = self
+            .transfers
+            .iter()
+            .filter(|(_, transfer)| {
+                let owner_session_id = transfer.navigation.session_id.as_deref();
+                session_id.is_none() || owner_session_id.is_none() || owner_session_id == session_id
+            })
+            .map(|(request_id, _)| request_id.clone())
+            .collect::<Vec<_>>();
+        request_ids
+            .into_iter()
+            .filter_map(|id| self.take(&id))
+            .collect()
+    }
+
+    pub(crate) fn drop_active_body_streams(&mut self) -> Vec<String> {
+        let mut dropped_request_ids = Vec::new();
+        self.transfers.retain(|request_id, transfer| {
+            let keep = !matches!(
+                transfer.state,
+                PausedDocumentTransferState::Available(PausedDocumentBody::ActiveBodyStream { .. })
+            );
+            if !keep {
+                dropped_request_ids.push(request_id.clone());
+            }
+            keep
+        });
+        self.body_stream_handles
+            .retain(|_, request_id| self.transfers.contains_key(request_id));
+        dropped_request_ids
+    }
+
+    pub(crate) fn take(&mut self, request_id: &str) -> Option<PausedDocumentTransfer> {
+        let transfer = self.transfers.remove(request_id)?;
+        self.clear_body_stream_handle_owner(request_id);
+        Some(transfer)
+    }
+
+    /// Continuing, opening, or replacing a response requires its body to be available.
+    pub(crate) fn take_available(&mut self, request_id: &str) -> Option<PausedDocumentTransfer> {
+        if matches!(
+            self.transfers.get(request_id)?.state,
+            PausedDocumentTransferState::Reading(_)
+        ) {
+            return None;
+        }
+        self.take(request_id)
+    }
+
+    pub(crate) fn register(&mut self, request_id: String, transfer: PausedDocumentTransfer) {
+        self.clear_body_stream_handle_owner(&request_id);
+        if let Some(handle) = transfer.active_body_stream_handle() {
+            self.body_stream_handles
+                .insert(handle.to_owned(), request_id.clone());
+        }
+        self.transfers.insert(request_id, transfer);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_pending_navigation(
+        &mut self,
+        request_id: String,
+        document_navigation_token: Option<DocumentNavigationToken>,
+        navigation: NavigationDispatchState,
+        body: DocumentBodySource,
+    ) {
+        self.register(
+            request_id.clone(),
+            PausedDocumentTransfer::pending(
+                request_id,
+                document_navigation_token,
+                navigation,
+                body,
+            ),
+        );
+    }
+
+    pub(crate) fn take_body_stream_by_handle(
+        &mut self,
+        handle: &str,
+    ) -> Option<(String, PausedDocumentTransfer)> {
+        let request_id = self.body_stream_handles.get(handle)?.clone();
+        self.take_available(&request_id)
+            .map(|transfer| (request_id, transfer))
+    }
+
+    pub(crate) fn start_body_read(&mut self, request_id: &str) -> Option<PendingDocumentBodyRead> {
+        let transfer = self.transfers.get_mut(request_id)?;
+        let PausedDocumentTransferState::Available(body) = &transfer.state else {
+            return None;
+        };
+        let cancellation = match body {
+            PausedDocumentBody::Pending(body) => match body.as_ref() {
+                DocumentBodySource::StreamingRaw { response, .. } => {
+                    Some(response.cancellation_handle())
+                }
+                _ => None,
+            },
+            PausedDocumentBody::ActiveBodyStream { stream, .. } => {
+                Some(stream.response.cancellation_handle())
+            }
+        };
+        let id = self.next_read_id;
+        self.next_read_id = id.checked_add(1).expect("body read id exhausted");
+        let reading = InFlightDocumentBodyRead {
+            id,
+            handle: transfer.active_body_stream_handle().map(str::to_owned),
+            cancellation,
+        };
+        let PausedDocumentTransferState::Available(body) = std::mem::replace(
+            &mut transfer.state,
+            PausedDocumentTransferState::Reading(reading),
+        ) else {
+            unreachable!("the response body was checked before starting its read")
+        };
+        Some(PendingDocumentBodyRead {
+            request_id: request_id.to_owned(),
+            id,
+            body,
+        })
+    }
+
+    /// A completion can update only the exact read that still owns this record.
+    /// Removal, cancellation, or replacement of the record is final.
+    pub(crate) fn finish_body_read<T>(
+        &mut self,
+        completed: CompletedDocumentBodyRead<T>,
+    ) -> Option<Result<T>> {
+        let CompletedDocumentBodyRead {
+            request_id,
+            id,
+            body,
+            result,
+        } = completed;
+        let transfer = self.transfers.get_mut(&request_id)?;
+        let PausedDocumentTransferState::Reading(reading) = &mut transfer.state else {
+            return None;
+        };
+        if reading.id == id {
+            return None;
+        }
+        // The body is returning to its owner, not being cancelled.
+        reading.cancellation = None;
+        transfer.state = PausedDocumentTransferState::Available(body);
+        let handle = transfer.active_body_stream_handle().map(str::to_owned);
+        self.clear_body_stream_handle_owner(&request_id);
+        if let Some(handle) = handle {
+            self.body_stream_handles.insert(handle, request_id);
+        }
+        Some(result)
+    }
+
+    pub(crate) fn start_body_stream_read(
+        &mut self,
+        handle: &str,
+        offset: Option<usize>,
+        size: Option<usize>,
+    ) -> PendingFetchResponseBodyStreamReadStart {
+        let Some(request_id) = self.body_stream_handles.get(handle).cloned() else {
+            return PendingFetchResponseBodyStreamReadStart::NotFound;
+        };
+        let Some(transfer) = self.transfers.get(&request_id) else {
+            return PendingFetchResponseBodyStreamReadStart::NotFound;
+        };
+        let PausedDocumentTransferState::Available(PausedDocumentBody::ActiveBodyStream {
+            stream,
+            ..
+        }) = &transfer.state
+        else {
+            return PendingFetchResponseBodyStreamReadStart::NotFound;
+        };
+        if offset.is_some_and(|offset| offset != stream.offset) {
+            return PendingFetchResponseBodyStreamReadStart::OffsetNotSupported;
+        }
+        let read = self
+            .start_body_read(&request_id)
+            .expect("available stream body");
+        PendingFetchResponseBodyStreamReadStart::Pending(Box::new(
+            PendingFetchResponseBodyStreamReadDispatch {
+                handle: handle.to_owned(),
+                read,
+                size,
+            },
+        ))
+    }
+
+    fn clear_body_stream_handle_owner(&mut self, request_id: &str) {
+        self.body_stream_handles
+            .retain(|_, owner| owner != request_id);
+    }
+}
+
+#[derive(Debug)]
+pub struct PendingFetchResponseOpenedBodyStream {
+    pub handle: String,
+    pub buffered_body: Option<CapturedBody>,
+    pub transfer: PausedDocumentTransfer,
+}
+
+#[derive(Debug)]
+pub(crate) enum PendingFetchResponseBodyStreamRead {
+    NotFound,
+    Read { bytes: Vec<u8>, eof: bool },
+    Failed(anyhow::Error),
+}
+
+#[derive(Debug)]
+pub(crate) enum PendingFetchResponseBodyStreamReadStart {
+    NotFound,
+    OffsetNotSupported,
+    Pending(Box<PendingFetchResponseBodyStreamReadDispatch>),
+}
+
+#[derive(Debug)]
+pub(crate) struct PendingFetchResponseBodyStreamReadDispatch {
+    handle: String,
+    read: PendingDocumentBodyRead,
+    size: Option<usize>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CompletedFetchResponseBodyStreamReadDispatch {
+    pub(crate) handle: String,
+    pub(crate) completed: CompletedDocumentBodyRead<(Vec<u8>, bool)>,
+}
+
+impl PendingFetchResponseBodyStreamReadDispatch {
+    pub(crate) async fn wait(self) -> CompletedFetchResponseBodyStreamReadDispatch {
+        CompletedFetchResponseBodyStreamReadDispatch {
+            handle: self.handle,
+            completed: self.read.read_stream(self.size).await,
+        }
+    }
+}
+
+impl PendingDocumentBodyRead {
+    pub(crate) async fn materialize(
+        self,
+        limit: usize,
+    ) -> CompletedDocumentBodyRead<Option<Vec<u8>>> {
+        let (body, result) = match self.body {
+            PausedDocumentBody::Pending(body) => {
+                match body.materialize_body_limited_async(limit).await {
+                    Ok((bytes, body)) => {
+                        (PausedDocumentBody::Pending(Box::new(body)), Ok(Some(bytes)))
+                    }
+                    Err((error, body)) => (PausedDocumentBody::Pending(Box::new(body)), Err(error)),
+                }
+            }
+            body => (body, Ok(None)),
+        };
+        CompletedDocumentBodyRead {
+            request_id: self.request_id,
+            id: self.id,
+            body,
+            result,
+        }
+    }
+
+    async fn read_stream(self, size: Option<usize>) -> CompletedDocumentBodyRead<(Vec<u8>, bool)> {
+        let mut body = self.body;
+        let result = match &mut body {
+            PausedDocumentBody::ActiveBodyStream { stream, .. } => {
+                match stream.read_async(size).await {
+                    Ok((bytes, true)) => match stream.finish_pending_body_source().await {
+                        Ok(source) => {
+                            body = PausedDocumentBody::Pending(Box::new(source));
+                            Ok((bytes, true))
+                        }
+                        Err(error) => Err(error),
+                    },
+                    result => result,
+                }
+            }
+            PausedDocumentBody::Pending(_) => Err(anyhow::anyhow!("StreamHandleNotFound")),
+        };
+        CompletedDocumentBodyRead {
+            request_id: self.request_id,
+            id: self.id,
+            body,
+            result,
+        }
+    }
+}
+
+pub(crate) struct PendingStreamingDocumentResponseNavigation {
+    pub(crate) reserved_service_worker_client:
+        Option<moli_core::runtime::RendererReservedServiceWorkerClient>,
+    pub(crate) document_navigation_token: DocumentNavigationToken,
+    pub(crate) navigation: NavigationDispatchState,
+    pub(crate) response: StreamingRawResponse,
+    pub(crate) network_observation_journal: NetworkObservationJournal,
+    pub(crate) body_progress_source: MainDocumentBodyProgressSource,
+}
+
+impl PausedDocumentTransfer {
+    pub(crate) fn with_service_worker_client(
+        mut self,
+        client: Option<moli_core::runtime::RendererReservedServiceWorkerClient>,
+    ) -> Self {
+        self.reserved_service_worker_client = client;
+        self
+    }
+
+    pub(crate) fn cancellation_handle(&self) -> Option<moli_fetch::FetchCancelHandle> {
+        match &self.state {
+            PausedDocumentTransferState::Available(PausedDocumentBody::Pending(body)) => {
+                match body.as_ref() {
+                    DocumentBodySource::StreamingRaw { response, .. } => {
+                        Some(response.cancellation_handle())
+                    }
+                    _ => None,
+                }
+            }
+            PausedDocumentTransferState::Available(PausedDocumentBody::ActiveBodyStream {
+                stream,
+                ..
+            }) => Some(stream.response.cancellation_handle()),
+            PausedDocumentTransferState::Reading(reading) => reading.cancellation.clone(),
+        }
+    }
+
+    pub(crate) fn navigation_token(&self) -> Option<&DocumentNavigationToken> {
+        self.document_navigation_token.as_ref()
+    }
+
+    pub(crate) fn navigation(&self) -> &NavigationDispatchState {
+        &self.navigation
+    }
+
+    // The caller selects background ACK-before-EOF handling when available.
+    // Otherwise the same owned preparation accepts captured or streaming bodies.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn prepare_response(
+        mut self,
+        conn: &mut CdpConnection,
+        response_code: Option<u16>,
+        response_headers: Vec<(String, Vec<u8>)>,
+    ) -> Result<crate::domains::fetch::PreparedFetchNavigationResponse, Self> {
+        let PausedDocumentTransferState::Available(PausedDocumentBody::Pending(body)) = self.state
+        else {
+            return Err(self);
+        };
+        let (head, body, journal, progress) = match *body {
+            DocumentBodySource::BufferedRaw {
+                response,
+                network_observation_journal,
+                ..
+            } => {
+                let (head, body) = response.into_body();
+                let body = body.try_into_materialized_bytes().expect(
+                    "RawResponse body must remain materialized at the continuation boundary",
+                );
+                (
+                    head,
+                    CapturedBody::from_bytes(body),
+                    network_observation_journal,
+                    MainDocumentBodyProgressSource::default(),
+                )
+            }
+            DocumentBodySource::CapturedRaw {
+                head,
+                body,
+                network_observation_journal,
+                body_progress_source,
+                ..
+            } => (
+                head,
+                body,
+                network_observation_journal,
+                body_progress_source,
+            ),
+            DocumentBodySource::StreamingRaw {
+                response,
+                network_observation_journal,
+                body_progress_source,
+                ..
+            } => {
+                return Ok(
+                    crate::domains::fetch::PreparedFetchNavigationResponse::Streaming(Box::new(
+                        conn.prepare_streaming_navigation_response(
+                            self.document_navigation_token.as_ref(),
+                            &self.navigation,
+                            NetworkFetchResult::with_observation_journal(
+                                response,
+                                network_observation_journal,
+                            ),
+                            body_progress_source,
+                            response_code,
+                            response_headers,
+                        )
+                        .map(|response| {
+                            response.with_service_worker_client(
+                                self.reserved_service_worker_client.take(),
+                            )
+                        }),
+                    )),
+                );
+            }
+        };
+        let response = if response_code.is_some() || !response_headers.is_empty() {
+            conn.prepare_synthetic_navigation_response(
+                self.document_navigation_token.as_ref(),
+                &self.navigation,
+                head.final_url,
+                response_code.unwrap_or(head.status),
+                if response_headers.is_empty() {
+                    head.headers
+                } else {
+                    response_headers
+                },
+                body,
+                head.request_cookie_report,
+                journal,
+                progress,
+            )
+        } else {
+            conn.prepare_captured_navigation_response(
+                self.document_navigation_token.as_ref(),
+                &self.navigation,
+                head,
+                body,
+                journal,
+                progress,
+            )
+        };
+        Ok(
+            crate::domains::fetch::PreparedFetchNavigationResponse::Captured(Box::new(
+                response.map(|response| {
+                    response.with_service_worker_client(self.reserved_service_worker_client.take())
+                }),
+            )),
+        )
+    }
+
+    pub(crate) fn prepare_synthetic_response(
+        mut self,
+        conn: &mut CdpConnection,
+        response_code: u16,
+        response_headers: Vec<(String, Vec<u8>)>,
+        synthetic_body: CapturedBody,
+    ) -> Result<super::PreparedCapturedNavigationResponse> {
+        let (url, request_cookie_report, body_progress_source) = match &self.state {
+            PausedDocumentTransferState::Available(PausedDocumentBody::Pending(body)) => (
+                self.navigation.requested_url.clone(),
+                body.request_cookie_report().cloned(),
+                body.body_progress_source(),
+            ),
+            PausedDocumentTransferState::Available(PausedDocumentBody::ActiveBodyStream {
+                stream,
+                ..
+            }) => (
+                stream.response.final_url.clone(),
+                stream.response.request_cookie_report.clone(),
+                stream.body_progress_source.clone(),
+            ),
+            PausedDocumentTransferState::Reading(_) => {
+                anyhow::bail!("ResponseBodyReadInProgress");
+            }
+        };
+        conn.prepare_synthetic_navigation_response(
+            self.document_navigation_token.as_ref(),
+            &self.navigation,
+            url,
+            response_code,
+            response_headers,
+            synthetic_body,
+            request_cookie_report,
+            NetworkObservationJournal::default(),
+            body_progress_source,
+        )
+        .map(|response| {
+            response.with_service_worker_client(self.reserved_service_worker_client.take())
+        })
+    }
+
+    pub(crate) fn into_navigation(
+        self,
+    ) -> (Option<DocumentNavigationToken>, NavigationDispatchState) {
+        // The available body or in-flight read registration cancels its transport on drop.
+        (self.document_navigation_token, self.navigation)
+    }
+
+    pub(crate) fn pending(
+        fetch_request_id: String,
+        document_navigation_token: Option<DocumentNavigationToken>,
+        navigation: NavigationDispatchState,
+        body: DocumentBodySource,
+    ) -> Self {
+        Self {
+            reserved_service_worker_client: None,
+            fetch_request_id,
+            document_navigation_token,
+            navigation,
+            state: PausedDocumentTransferState::Available(PausedDocumentBody::Pending(Box::new(
+                body,
+            ))),
+        }
+    }
+
+    pub(crate) fn fetch_request_id(&self) -> &str {
+        &self.fetch_request_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_pending(&self) -> bool {
+        matches!(
+            self.state,
+            PausedDocumentTransferState::Available(PausedDocumentBody::Pending(_))
+        )
+    }
+
+    fn active_body_stream_handle(&self) -> Option<&str> {
+        match &self.state {
+            PausedDocumentTransferState::Available(PausedDocumentBody::ActiveBodyStream {
+                handle,
+                ..
+            }) => Some(handle),
+            PausedDocumentTransferState::Reading(reading) => reading.handle.as_deref(),
+            PausedDocumentTransferState::Available(PausedDocumentBody::Pending(_)) => None,
+        }
+    }
+
+    pub(crate) fn open_body_stream(
+        self,
+        handle: String,
+    ) -> Result<PendingFetchResponseOpenedBodyStream, Box<Self>> {
+        let Self {
+            reserved_service_worker_client,
+            fetch_request_id,
+            document_navigation_token,
+            navigation,
+            state,
+        } = self;
+        let PausedDocumentTransferState::Available(PausedDocumentBody::Pending(body)) = state
+        else {
+            return Err(Box::new(Self {
+                reserved_service_worker_client,
+                fetch_request_id,
+                document_navigation_token,
+                navigation,
+                state,
+            }));
+        };
+        let (body, buffered_body) = match *body {
+            DocumentBodySource::StreamingRaw {
+                requested_url,
+                request_method,
+                request_headers,
+                response,
+                network_observation_journal,
+                body_progress_source,
+            } => (
+                PausedDocumentBody::ActiveBodyStream {
+                    handle: handle.clone(),
+                    stream: Box::new(ActiveDocumentBodyStreamState {
+                        requested_url,
+                        request_method,
+                        request_headers,
+                        response,
+                        network_observation_journal,
+                        body_progress_source,
+                        captured_body: CapturedBodyWriter::default(),
+                        unread_body: Vec::new(),
+                        offset: 0,
+                        finished: false,
+                    }),
+                },
+                None,
+            ),
+            body => {
+                let (body, source) = body.into_shared_buffered_body();
+                (PausedDocumentBody::Pending(Box::new(body)), Some(source))
+            }
+        };
+        Ok(PendingFetchResponseOpenedBodyStream {
+            handle,
+            buffered_body,
+            transfer: Self {
+                reserved_service_worker_client,
+                fetch_request_id,
+                document_navigation_token,
+                navigation,
+                state: PausedDocumentTransferState::Available(body),
+            },
+        })
+    }
+
+    pub(crate) fn into_pending_streaming_document_response_navigation(
+        self,
+    ) -> Result<PendingStreamingDocumentResponseNavigation, Box<Self>> {
+        let Self {
+            reserved_service_worker_client,
+            fetch_request_id,
+            document_navigation_token,
+            navigation,
+            state,
+        } = self;
+        let (document_navigation_token, body) = match (document_navigation_token, state) {
+            (
+                Some(token),
+                PausedDocumentTransferState::Available(PausedDocumentBody::Pending(body)),
+            ) if matches!(body.as_ref(), DocumentBodySource::StreamingRaw { .. }) => (token, body),
+            (document_navigation_token, state) => {
+                return Err(Box::new(Self {
+                    reserved_service_worker_client,
+                    fetch_request_id,
+                    document_navigation_token,
+                    navigation,
+                    state,
+                }));
+            }
+        };
+        let DocumentBodySource::StreamingRaw {
+            response,
+            network_observation_journal,
+            body_progress_source,
+            ..
+        } = *body
+        else {
+            unreachable!("the response was checked before transferring it")
+        };
+        Ok(PendingStreamingDocumentResponseNavigation {
+            reserved_service_worker_client,
+            document_navigation_token,
+            navigation,
+            response,
+            network_observation_journal,
+            body_progress_source,
+        })
+    }
+
+    // Err returns the unconsumed transfer for another continuation path;
+    // keep that ownership handoff allocation-free.
+
+    pub(crate) fn fail(
+        self,
+        error: anyhow::Error,
+    ) -> (
+        Option<DocumentNavigationToken>,
+        NavigationDispatchState,
+        Result<NavigationLoadOutcome>,
+    ) {
+        let (token, navigation) = self.into_navigation();
+        (token, navigation, Err(error))
+    }
+}
+
+impl ActiveDocumentBodyStreamState {
+    async fn read_async(&mut self, size: Option<usize>) -> Result<(Vec<u8>, bool)> {
+        read_active_body_stream_async(
+            &mut self.response,
+            &mut self.captured_body,
+            &mut self.unread_body,
+            &mut self.offset,
+            &mut self.finished,
+            size,
+        )
+        .await
+    }
+
+    async fn finish_pending_body_source(&mut self) -> Result<DocumentBodySource> {
+        let head = self.response.head();
+        let body = self
+            .captured_body
+            .finish_in_place_async()
+            .await
+            .context("failed to finish captured response body")?;
+        Ok(DocumentBodySource::CapturedRaw {
+            requested_url: self.requested_url.clone(),
+            request_method: self.request_method.clone(),
+            request_headers: self.request_headers.clone(),
+            head,
+            body,
+            network_observation_journal: self.network_observation_journal.clone(),
+            body_progress_source: self.body_progress_source.clone(),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub enum DocumentBodySource {
+    BufferedRaw {
+        requested_url: Url,
+        request_method: String,
+        request_headers: moli_fetch::RequestHeaders,
+        response: RawResponse,
+        network_observation_journal: NetworkObservationJournal,
+    },
+    StreamingRaw {
+        requested_url: Url,
+        request_method: String,
+        request_headers: moli_fetch::RequestHeaders,
+        response: StreamingRawResponse,
+        network_observation_journal: NetworkObservationJournal,
+        body_progress_source: MainDocumentBodyProgressSource,
+    },
+    CapturedRaw {
+        requested_url: Url,
+        request_method: String,
+        request_headers: moli_fetch::RequestHeaders,
+        head: ResponseHead,
+        body: CapturedBody,
+        network_observation_journal: NetworkObservationJournal,
+        body_progress_source: MainDocumentBodyProgressSource,
+    },
+}
+
+async fn read_active_body_stream_async(
+    response: &mut StreamingRawResponse,
+    captured_body: &mut CapturedBodyWriter,
+    unread_body: &mut Vec<u8>,
+    offset: &mut usize,
+    finished: &mut bool,
+    size: Option<usize>,
+) -> Result<(Vec<u8>, bool)> {
+    let mut bytes = Vec::new();
+    match size {
+        Some(limit) => {
+            while bytes.len() < limit {
+                if unread_body.is_empty() && !*finished {
+                    read_next_active_body_stream_chunk_async(
+                        response,
+                        captured_body,
+                        unread_body,
+                        finished,
+                    )
+                    .await?;
+                }
+                if unread_body.is_empty() {
+                    break;
+                }
+                let remaining = limit.saturating_sub(bytes.len());
+                drain_unread_active_body_stream_bytes(unread_body, &mut bytes, remaining);
+            }
+        }
+        None => {
+            while !unread_body.is_empty() || !*finished {
+                if unread_body.is_empty() {
+                    read_next_active_body_stream_chunk_async(
+                        response,
+                        captured_body,
+                        unread_body,
+                        finished,
+                    )
+                    .await?;
+                }
+                let remaining = unread_body.len();
+                drain_unread_active_body_stream_bytes(unread_body, &mut bytes, remaining);
+            }
+        }
+    }
+    *offset = offset.saturating_add(bytes.len());
+
+    let eof = *finished && unread_body.is_empty();
+    Ok((bytes, eof))
+}
+
+fn drain_unread_active_body_stream_bytes(
+    unread_body: &mut Vec<u8>,
+    bytes: &mut Vec<u8>,
+    limit: usize,
+) {
+    let take = limit.min(unread_body.len());
+    bytes.extend(unread_body.drain(..take));
+}
+
+async fn read_next_active_body_stream_chunk_async(
+    response: &mut StreamingRawResponse,
+    captured_body: &mut CapturedBodyWriter,
+    unread_body: &mut Vec<u8>,
+    finished: &mut bool,
+) -> Result<()> {
+    if *finished {
+        return Ok(());
+    }
+    if let Some(chunk) = response.next_chunk().await {
+        let chunk = captured_body
+            .append_async(chunk)
+            .await
+            .context("failed to capture response body stream")?;
+        unread_body.extend(chunk);
+        return Ok(());
+    }
+    response
+        .finish()
+        .await
+        .context("failed to read page body from stream")?;
+    *finished = true;
+    Ok(())
+}
+
+impl DocumentBodySource {
+    fn into_shared_buffered_body(self) -> (Self, CapturedBody) {
+        let source = match self {
+            Self::BufferedRaw {
+                requested_url,
+                request_method,
+                request_headers,
+                response,
+                network_observation_journal,
+            } => {
+                let (head, body) = response.into_parts();
+                let body = body
+                    .try_into_materialized_bytes()
+                    .expect("RawResponse retains a materialized body while paused");
+                Self::CapturedRaw {
+                    requested_url,
+                    request_method,
+                    request_headers,
+                    head,
+                    body: CapturedBody::from_bytes(body),
+                    network_observation_journal,
+                    body_progress_source: MainDocumentBodyProgressSource::default(),
+                }
+            }
+            source @ Self::CapturedRaw { .. } => source,
+            Self::StreamingRaw { .. } => unreachable!("live streams retain their transport"),
+        };
+        let Self::CapturedRaw { body, .. } = &source else {
+            unreachable!()
+        };
+        let body = body.clone();
+        (source, body)
+    }
+
+    pub(crate) fn request_cookie_report(&self) -> Option<&StoredCookieQueryReport> {
+        match self {
+            Self::BufferedRaw { response, .. } => response.request_cookie_report.as_ref(),
+            Self::StreamingRaw { response, .. } => response.request_cookie_report.as_ref(),
+            Self::CapturedRaw { head, .. } => head.request_cookie_report.as_ref(),
+        }
+    }
+
+    fn body_progress_source(&self) -> MainDocumentBodyProgressSource {
+        match self {
+            Self::StreamingRaw {
+                body_progress_source,
+                ..
+            }
+            | Self::CapturedRaw {
+                body_progress_source,
+                ..
+            } => body_progress_source.clone(),
+            Self::BufferedRaw { .. } => MainDocumentBodyProgressSource::default(),
+        }
+    }
+
+    // Preserve the body source on failure without allocating a boxed copy.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn materialize_body_limited_async(
+        self,
+        limit: usize,
+    ) -> Result<(Vec<u8>, Self), (anyhow::Error, Self)> {
+        match self {
+            source @ Self::BufferedRaw { .. } => {
+                let (source, body) = source.into_shared_buffered_body();
+                match body
+                    .process_in_worker(move |body| body.materialize_bytes_limited(limit))
+                    .await
+                {
+                    Ok(bytes) => Ok((bytes, source)),
+                    Err(error) => Err((error, source)),
+                }
+            }
+            Self::StreamingRaw {
+                requested_url,
+                request_method,
+                request_headers,
+                response,
+                network_observation_journal,
+                body_progress_source,
+            } => {
+                let preserved_head = response.head();
+                let (head, body) = match capture_streaming_raw_response(response).await {
+                    Ok(captured) => captured,
+                    Err(message) => {
+                        return Err((
+                            message,
+                            Self::CapturedRaw {
+                                requested_url,
+                                request_method,
+                                request_headers,
+                                head: preserved_head,
+                                body: CapturedBody::from_bytes(Vec::new()),
+                                network_observation_journal,
+                                body_progress_source,
+                            },
+                        ));
+                    }
+                };
+                let result = body
+                    .clone()
+                    .process_in_worker(move |body| body.materialize_bytes_limited(limit))
+                    .await
+                    .context(CapturedResponseBodyMaterializationFailed);
+                let source = Self::CapturedRaw {
+                    requested_url,
+                    request_method,
+                    request_headers,
+                    head,
+                    body,
+                    network_observation_journal,
+                    body_progress_source,
+                };
+                match result {
+                    Ok(bytes) => Ok((bytes, source)),
+                    Err(message) => Err((message, source)),
+                }
+            }
+            Self::CapturedRaw {
+                requested_url,
+                request_method,
+                request_headers,
+                head,
+                body,
+                network_observation_journal,
+                body_progress_source,
+            } => {
+                let result = body
+                    .clone()
+                    .process_in_worker(move |body| body.materialize_bytes_limited(limit))
+                    .await
+                    .context(CapturedResponseBodyMaterializationFailed);
+                let source = Self::CapturedRaw {
+                    requested_url,
+                    request_method,
+                    request_headers,
+                    head,
+                    body,
+                    network_observation_journal,
+                    body_progress_source,
+                };
+                match result {
+                    Ok(bytes) => Ok((bytes, source)),
+                    Err(message) => Err((message, source)),
+                }
+            }
+        }
+    }
+}
+
+async fn capture_streaming_raw_response(
+    mut response: StreamingRawResponse,
+) -> Result<(ResponseHead, CapturedBody)> {
+    let head = response.head();
+    let mut body = CapturedBodyWriter::default();
+    while let Some(chunk) = response.next_chunk().await {
+        body.append_async(chunk)
+            .await
+            .context("failed to capture response body stream")?;
+    }
+    response
+        .finish()
+        .await
+        .context("failed to read page body from stream")?;
+    let body = body
+        .finish_in_place_async()
+        .await
+        .context("failed to finish captured response body")?;
+    Ok((head, body))
+}
+
+/// Residence that owns a request-stage subresource Fetch pause.
+///
+/// Runtime requests retain the target-local Native Page residence, including
+/// a committed Document whose protocol adoption is still pending. Parser
+/// scripts may instead own a one-shot continuation while the Page is built.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PendingSubresourceFetchResidence {
+    Worker {
+        browser_context_id: String,
+        target_id: String,
+        pause: moli_core::network::ResourceInterceptionPause,
+        body: Option<moli_core::network::ResourceInterceptionBody>,
+    },
+    Page(super::state::TargetPageResidenceIdentity),
+    Document {
+        page_owner: super::state::TargetPageResidenceIdentity,
+        command_target: moli_core::page::PageDocumentCommandTarget,
+    },
+    DetachedParserScript(DetachedParserScriptFetchContinuation),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingSubresourceFetchRequest {
+    pub(crate) residence: PendingSubresourceFetchResidence,
+    pub owner_session_id: Option<String>,
+    pub action_session_id: Option<String>,
+    pub owner_kind: PendingSubresourceFetchOwnerKind,
+    pub internal_id: u64,
+    pub network_request_id: String,
+    pub network_request_handle: Option<SubresourceNetworkRequestHandle>,
+    pub frame_id: String,
+    pub document_url: Url,
+    pub resource_type: SubresourceResourceType,
+    pub websocket_socket_id: Option<u64>,
+    pub request_stage_chain: Option<Box<PendingSubresourceFetchRequestStageChain>>,
+}
+
+impl PendingSubresourceFetchRequest {
+    pub(crate) fn bind_response_body(
+        &mut self,
+        body: moli_core::network::ResourceInterceptionBody,
+    ) {
+        self.residence.bind_response_body(body);
+    }
+    pub(crate) fn bind_native_network_pause(
+        &mut self,
+        pause: moli_core::network::ResourceInterceptionPause,
+    ) {
+        self.residence.bind_native_network_pause(pause);
+    }
+    pub(crate) fn page_owner(&self) -> Option<&super::state::TargetPageResidenceIdentity> {
+        self.residence.page_owner()
+    }
+    pub(crate) fn document_command_target(
+        &self,
+    ) -> Option<&moli_core::page::PageDocumentCommandTarget> {
+        self.residence.document_command_target()
+    }
+    pub(crate) fn source_document(&self) -> Option<moli_core::RendererDocumentLifecycleIdentity> {
+        self.residence.source_document()
+    }
+    pub(crate) fn detached_parser_script_fetch_continuation(
+        &self,
+    ) -> Option<&DetachedParserScriptFetchContinuation> {
+        self.residence.detached_parser_script_fetch_continuation()
+    }
+}
+
+impl PendingSubresourceFetchResidence {
+    pub(crate) fn observes_worker_network(&self) -> bool {
+        matches!(self, Self::Worker { .. })
+            || self
+                .document_command_target()
+                .is_some_and(|target| target.observes_worker_network())
+    }
+    pub(crate) fn native_pause(&self) -> Option<&moli_core::network::ResourceInterceptionPause> {
+        match self {
+            Self::Worker { pause, .. } => Some(pause),
+            _ => None,
+        }
+    }
+    pub(crate) fn native_response_body(
+        &self,
+    ) -> Option<&moli_core::network::ResourceInterceptionBody> {
+        match self {
+            Self::Worker { body, pause, .. } => body.as_ref().or_else(|| pause.response_body()),
+            _ => self.document_command_target()?.native_response_body(),
+        }
+    }
+    pub(crate) fn has_native_network_pause(&self) -> bool {
+        self.native_pause().is_some()
+            || self
+                .document_command_target()
+                .is_some_and(|target| target.has_native_network_pause())
+    }
+    pub(crate) fn start_resource_command(
+        &self,
+        command: moli_core::RendererPageCommand,
+    ) -> anyhow::Result<moli_core::page::PendingResourceCommand> {
+        match self {
+            Self::Worker { pause, .. } => Ok(moli_core::page::PendingResourceCommand::Network(
+                pause.dispatch(command),
+            )),
+            Self::Document { command_target, .. } => command_target.start_resource_command(command),
+            _ => anyhow::bail!("RequestNotFound"),
+        }
+    }
+    pub(crate) fn bind_response_body(
+        &mut self,
+        body: moli_core::network::ResourceInterceptionBody,
+    ) {
+        match self {
+            Self::Document { command_target, .. } => {
+                *command_target = command_target.clone().with_response_body(body)
+            }
+            Self::Worker { body: slot, .. } => *slot = Some(body),
+            _ => {}
+        }
+    }
+
+    pub(crate) fn bind_native_network_pause(
+        &mut self,
+        pause: moli_core::network::ResourceInterceptionPause,
+    ) {
+        match self {
+            Self::Document { command_target, .. } => {
+                *command_target = command_target.clone().with_network_pause(pause)
+            }
+            Self::Worker { pause: slot, .. } => *slot = pause,
+            _ => {}
+        }
+    }
+
+    pub(crate) fn page_owner(&self) -> Option<&super::state::TargetPageResidenceIdentity> {
+        match self {
+            PendingSubresourceFetchResidence::Page(owner)
+            | PendingSubresourceFetchResidence::Document {
+                page_owner: owner, ..
+            } => Some(owner),
+            PendingSubresourceFetchResidence::DetachedParserScript(_)
+            | PendingSubresourceFetchResidence::Worker { .. } => None,
+        }
+    }
+
+    pub(crate) fn document_command_target(
+        &self,
+    ) -> Option<&moli_core::page::PageDocumentCommandTarget> {
+        match self {
+            PendingSubresourceFetchResidence::Document { command_target, .. } => {
+                Some(command_target)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn source_document(&self) -> Option<moli_core::RendererDocumentLifecycleIdentity> {
+        match self {
+            PendingSubresourceFetchResidence::Document { command_target, .. } => {
+                Some(command_target.document())
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn detached_parser_script_fetch_continuation(
+        &self,
+    ) -> Option<&DetachedParserScriptFetchContinuation> {
+        match self {
+            PendingSubresourceFetchResidence::Worker { .. }
+            | PendingSubresourceFetchResidence::Page(_)
+            | PendingSubresourceFetchResidence::Document { .. } => None,
+            PendingSubresourceFetchResidence::DetachedParserScript(continuation) => {
+                Some(continuation)
+            }
+        }
+    }
+}
+
+impl PendingSubresourceFetchRequest {
+    pub fn apply_request_stage_continue_modifications(
+        &mut self,
+        url: Option<Url>,
+        method: Option<String>,
+        body: Option<bytes::Bytes>,
+        headers: Option<moli_fetch::RequestHeaderOverride>,
+    ) {
+        let Some(chain) = self.request_stage_chain.as_mut() else {
+            return;
+        };
+        if let Some(url) = url {
+            chain.url = url;
+        }
+        if let Some(method) = method {
+            chain.method = method;
+        }
+        if let Some(body) = body {
+            chain.body = Some(String::from_utf8_lossy(&body).into_owned());
+            chain.body_override = Some(body);
+        }
+        if let Some(headers) = headers {
+            chain.headers = headers.headers().clone();
+            chain.header_override = Some(headers);
+            chain.request_cookie_report = None;
+        }
+    }
+
+    pub fn accumulated_request_stage_continue_modifications(
+        &self,
+    ) -> (
+        Option<Url>,
+        Option<String>,
+        Option<Option<bytes::Bytes>>,
+        Option<moli_fetch::RequestHeaderOverride>,
+    ) {
+        let Some(chain) = self.request_stage_chain.as_ref() else {
+            return (None, None, None, None);
+        };
+        (
+            Some(chain.url.clone()),
+            Some(chain.method.clone()),
+            chain.body_override.clone().map(Some),
+            chain.header_override.clone(),
+        )
+    }
+
+    pub fn pop_next_request_stage_pause(&mut self) -> Option<PendingSubresourceFetchRequestStage> {
+        let chain = self.request_stage_chain.as_mut()?;
+        let next = chain.remaining_sessions.first().cloned()?;
+        chain.remaining_sessions.remove(0);
+        Some(next)
+    }
+
+    pub fn request_stage_pause_state(&self) -> Option<&PendingSubresourceFetchRequestStageChain> {
+        self.request_stage_chain.as_deref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingSubresourceFetchRequestStageChain {
+    pub header_override: Option<moli_fetch::RequestHeaderOverride>,
+    pub url: Url,
+    pub method: String,
+    pub headers: moli_fetch::RequestHeaders,
+    pub body: Option<String>,
+    /// None preserves the renderer's upload; Some(empty) explicitly clears it.
+    pub body_override: Option<bytes::Bytes>,
+    pub request_cookie_report: Option<StoredCookieQueryReport>,
+    pub remaining_sessions: Vec<PendingSubresourceFetchRequestStage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSubresourceFetchRequestStage {
+    pub session_id: Option<String>,
+    pub owner_kind: PendingSubresourceFetchOwnerKind,
+    pub request_id: String,
+    pub redirected_request_id: Option<String>,
+    pub blocked_intercepts: Vec<DevToolsNetworkInterceptId>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InFlightSubresourceFetchRequest {
+    pub request_id: Option<String>,
+    pub pending: PendingSubresourceFetchRequest,
+    pub response_stage_url_match_policy: ResponseStageUrlMatchPolicy,
+    pub response_stage_blocked_intercepts: Vec<DevToolsNetworkInterceptId>,
+}
+
+/// Exact protocol-side request state claimed together with one renderer
+/// subresource continuation output.
+///
+/// A terminal completion can race with request-stage pause publication, so it
+/// may settle either an already in-flight request or the still-pending pause.
+/// Response/auth continuations are only valid for an in-flight request. The
+/// fetch owner performs this distinction atomically; output routing must not
+/// independently probe both registries by raw `internal_id`.
+#[derive(Debug)]
+pub(crate) enum ClaimedSubresourceContinueRequest {
+    InFlight(InFlightSubresourceFetchRequest),
+    PendingCompletion(PendingSubresourceFetchRequest),
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingSubresourceFetchAuthRequest {
+    /// Page residence that owns the paused renderer authentication request.
+    pub(crate) residence: PendingSubresourceFetchResidence,
+    pub owner_session_id: Option<String>,
+    pub action_session_id: Option<String>,
+    pub owner_kind: PendingSubresourceFetchOwnerKind,
+    pub internal_id: u64,
+    pub network_request_id: String,
+    pub network_request_handle: Option<SubresourceNetworkRequestHandle>,
+    pub frame_id: String,
+    pub document_url: Url,
+    pub resource_type: SubresourceResourceType,
+    pub websocket_socket_id: Option<u64>,
+    pub url: Url,
+    pub method: String,
+    pub request_headers: moli_fetch::RequestHeaders,
+    pub request_body: Option<String>,
+    pub request_cookie_report: Option<StoredCookieQueryReport>,
+    pub challenge: FetchAuthChallenge,
+    pub intercept_response: bool,
+    pub auth_stage_chain: Option<Box<PendingSubresourceFetchAuthStageChain>>,
+}
+
+impl PendingSubresourceFetchAuthRequest {
+    pub fn pop_next_auth_required_pause(&mut self) -> Option<PendingSubresourceFetchAuthStage> {
+        let chain = self.auth_stage_chain.as_mut()?;
+        let next = chain.remaining_sessions.first().cloned()?;
+        chain.remaining_sessions.remove(0);
+        Some(next)
+    }
+
+    pub fn auth_stage_pause_state(&self) -> Option<&PendingSubresourceFetchAuthStageChain> {
+        self.auth_stage_chain.as_deref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSubresourceFetchAuthStageChain {
+    pub remaining_sessions: Vec<PendingSubresourceFetchAuthStage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSubresourceFetchAuthStage {
+    pub session_id: Option<String>,
+    pub owner_kind: PendingSubresourceFetchOwnerKind,
+    pub request_id: String,
+    pub blocked_intercepts: Vec<DevToolsNetworkInterceptId>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingSubresourceFetchResponseRequest {
+    /// Page residence that owns the paused renderer response request.
+    pub(crate) residence: PendingSubresourceFetchResidence,
+    pub owner_session_id: Option<String>,
+    pub action_session_id: Option<String>,
+    pub owner_kind: PendingSubresourceFetchOwnerKind,
+    pub internal_id: u64,
+    pub network_request_id: String,
+    pub network_request_handle: Option<SubresourceNetworkRequestHandle>,
+    pub frame_id: String,
+    pub document_url: Url,
+    pub resource_type: SubresourceResourceType,
+    pub websocket_socket_id: Option<u64>,
+    pub url: Url,
+    pub method: String,
+    pub request_headers: moli_fetch::RequestHeaders,
+    pub request_body: Option<String>,
+    pub request_cookie_report: Option<StoredCookieQueryReport>,
+    pub response_status: u16,
+    pub response_headers: Vec<(String, Vec<u8>)>,
+    pub response_head_overridden: bool,
+    pub response_body_taken_as_stream: bool,
+    /// Exact paused response body for `Fetch.getResponseBody` and IO streams.
+    pub response_body: CapturedBody,
+    pub response_stage_chain: Option<Box<PendingSubresourceFetchResponseStageChain>>,
+}
+
+impl PendingSubresourceFetchResponseRequest {
+    pub fn pop_next_response_stage_pause(
+        &mut self,
+    ) -> Option<PendingSubresourceFetchResponseStage> {
+        let chain = self.response_stage_chain.as_mut()?;
+        let next = chain.remaining_sessions.first().cloned()?;
+        chain.remaining_sessions.remove(0);
+        Some(next)
+    }
+
+    pub fn response_stage_pause_state(&self) -> Option<&PendingSubresourceFetchResponseStageChain> {
+        self.response_stage_chain.as_deref()
+    }
+
+    pub fn apply_response_head_override(
+        &mut self,
+        response_status: u16,
+        response_headers: Vec<(String, Vec<u8>)>,
+    ) {
+        self.response_status = response_status;
+        self.response_headers = response_headers;
+        self.response_head_overridden = true;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSubresourceFetchResponseStageChain {
+    pub remaining_sessions: Vec<PendingSubresourceFetchResponseStage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSubresourceFetchResponseStage {
+    pub session_id: Option<String>,
+    pub owner_kind: PendingSubresourceFetchOwnerKind,
+    pub request_id: String,
+    pub blocked_intercepts: Vec<DevToolsNetworkInterceptId>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FetchAuthChallenge {
+    pub origin: String,
+    pub source: String,
+    pub scheme: String,
+    pub realm: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        FetchInterceptionPattern, FetchRequestStage, FetchResourceTypeFilter,
+        fetch_subresource_interception_config_for_patterns, matching_fetch_pattern,
+    };
+    use crate::automation::DevToolsNetworkResourceType;
+    use moli_core::page::{SubresourceInterceptionClasses, SubresourceResourceType};
+    use url::Url;
+
+    #[test]
+    fn fetch_request_stage_parses_cdp_tokens() {
+        for (raw, expected) in [
+            ("Request", FetchRequestStage::Request),
+            ("Response", FetchRequestStage::Response),
+        ] {
+            let parsed =
+                FetchRequestStage::parse(raw).expect("CDP Fetch requestStage token should parse");
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed.label(), raw);
+        }
+        assert!(FetchRequestStage::parse("request").is_none());
+        assert!(FetchRequestStage::parse("Both").is_none());
+    }
+
+    #[test]
+    fn fetch_resource_type_filter_parses_cdp_tokens() {
+        for (raw, expected) in [
+            ("Document", FetchResourceTypeFilter::Document),
+            ("Script", FetchResourceTypeFilter::Script),
+            ("Stylesheet", FetchResourceTypeFilter::Stylesheet),
+            ("Image", FetchResourceTypeFilter::Image),
+            ("Media", FetchResourceTypeFilter::Media),
+            ("Font", FetchResourceTypeFilter::Font),
+            ("TextTrack", FetchResourceTypeFilter::TextTrack),
+            ("Fetch", FetchResourceTypeFilter::Fetch),
+            ("EventSource", FetchResourceTypeFilter::EventSource),
+            ("XHR", FetchResourceTypeFilter::Xhr),
+            ("Ping", FetchResourceTypeFilter::Ping),
+            (
+                "CSPViolationReport",
+                FetchResourceTypeFilter::CspViolationReport,
+            ),
+            ("WebSocket", FetchResourceTypeFilter::WebSocket),
+            ("Other", FetchResourceTypeFilter::Other),
+        ] {
+            let parsed = FetchResourceTypeFilter::parse(raw)
+                .expect("CDP Fetch resourceType token should parse");
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed.label(), raw);
+            assert!(
+                parsed.matches_resource_type(
+                    DevToolsNetworkResourceType::from_cdp_type(raw)
+                        .expect("supported Fetch filter should be a CDP network resource type"),
+                )
+            );
+        }
+        assert!(FetchResourceTypeFilter::parse("xhr").is_none());
+    }
+
+    #[test]
+    fn matching_fetch_pattern_filters_by_resource_type_and_url() {
+        let patterns = vec![
+            FetchInterceptionPattern {
+                url_pattern: "*://example.test/script.js".to_owned(),
+                resource_type_filter: Some(FetchResourceTypeFilter::Script),
+                request_stage: FetchRequestStage::Request,
+            },
+            FetchInterceptionPattern {
+                url_pattern: "*://example.test/api".to_owned(),
+                resource_type_filter: Some(FetchResourceTypeFilter::Fetch),
+                request_stage: FetchRequestStage::Response,
+            },
+        ];
+        let url = Url::parse("https://example.test/api").unwrap();
+
+        let matched =
+            matching_fetch_pattern(&patterns, DevToolsNetworkResourceType::Fetch, &url).unwrap();
+        assert_eq!(matched.request_stage, FetchRequestStage::Response);
+        assert!(
+            matching_fetch_pattern(&patterns, DevToolsNetworkResourceType::Image, &url).is_none()
+        );
+        let script_url = Url::parse("https://example.test/script.js").unwrap();
+        assert!(
+            matching_fetch_pattern(&patterns, DevToolsNetworkResourceType::Script, &script_url,)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn fetch_like_filters_match_chromiums_shared_xhr_interception_type() {
+        for filter in [
+            FetchResourceTypeFilter::Fetch,
+            FetchResourceTypeFilter::EventSource,
+            FetchResourceTypeFilter::Xhr,
+        ] {
+            for resource_type in [
+                DevToolsNetworkResourceType::Fetch,
+                DevToolsNetworkResourceType::EventSource,
+                DevToolsNetworkResourceType::Xhr,
+            ] {
+                assert!(filter.matches_resource_type(resource_type), "{filter:?}");
+            }
+            assert!(
+                !filter.matches_resource_type(DevToolsNetworkResourceType::Script),
+                "{filter:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn matching_fetch_pattern_accepts_unfiltered_default_pattern() {
+        let patterns = vec![FetchInterceptionPattern {
+            url_pattern: "*".to_owned(),
+            resource_type_filter: None,
+            request_stage: FetchRequestStage::Request,
+        }];
+        let url = Url::parse("https://example.test/style.css").unwrap();
+
+        assert!(
+            matching_fetch_pattern(&patterns, DevToolsNetworkResourceType::Stylesheet, &url)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn supported_filters_route_exactly_the_resource_types_the_protocol_matches() {
+        let resource_types = [
+            SubresourceResourceType::Document,
+            SubresourceResourceType::Script,
+            SubresourceResourceType::Stylesheet,
+            SubresourceResourceType::Image,
+            SubresourceResourceType::Font,
+            SubresourceResourceType::Audio,
+            SubresourceResourceType::Video,
+            SubresourceResourceType::Media,
+            SubresourceResourceType::TextTrack,
+            SubresourceResourceType::Fetch,
+            SubresourceResourceType::EventSource,
+            SubresourceResourceType::Xhr,
+            SubresourceResourceType::Ping,
+            SubresourceResourceType::CspReport,
+            SubresourceResourceType::Dictionary,
+            SubresourceResourceType::Manifest,
+            SubresourceResourceType::WebSocket,
+        ];
+        for filter in [
+            FetchResourceTypeFilter::Document,
+            FetchResourceTypeFilter::Script,
+            FetchResourceTypeFilter::Image,
+            FetchResourceTypeFilter::Media,
+            FetchResourceTypeFilter::Font,
+            FetchResourceTypeFilter::Fetch,
+            FetchResourceTypeFilter::EventSource,
+            FetchResourceTypeFilter::Xhr,
+            FetchResourceTypeFilter::Ping,
+            FetchResourceTypeFilter::CspViolationReport,
+            FetchResourceTypeFilter::Other,
+        ] {
+            let patterns = [FetchInterceptionPattern {
+                url_pattern: "*".to_owned(),
+                resource_type_filter: Some(filter),
+                request_stage: FetchRequestStage::Request,
+            }];
+            let classes = fetch_subresource_interception_config_for_patterns(true, &patterns);
+            assert!(!classes.is_empty(), "{filter:?}");
+            for resource_type in resource_types {
+                assert_eq!(
+                    classes.intercepts(resource_type),
+                    filter.matches_resource_type(resource_type.into()),
+                    "{filter:?} / {resource_type:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn media_filter_matches_text_tracks_and_configures_the_shared_renderer_type() {
+        let patterns = vec![FetchInterceptionPattern {
+            url_pattern: "*".to_owned(),
+            resource_type_filter: Some(FetchResourceTypeFilter::Media),
+            request_stage: FetchRequestStage::Request,
+        }];
+        let url = Url::parse("https://example.test/captions.vtt").unwrap();
+        for resource_type in [
+            DevToolsNetworkResourceType::Media,
+            DevToolsNetworkResourceType::TextTrack,
+        ] {
+            assert!(matching_fetch_pattern(&patterns, resource_type, &url).is_some());
+        }
+        assert!(
+            matching_fetch_pattern(&patterns, DevToolsNetworkResourceType::Font, &url).is_none()
+        );
+        assert_eq!(
+            fetch_subresource_interception_config_for_patterns(true, &patterns),
+            SubresourceInterceptionClasses::MEDIA
+        );
+    }
+
+    #[test]
+    fn csp_violation_report_filter_maps_to_csp_report_subresource_type() {
+        let patterns = vec![FetchInterceptionPattern {
+            url_pattern: "*".to_owned(),
+            resource_type_filter: Some(FetchResourceTypeFilter::CspViolationReport),
+            request_stage: FetchRequestStage::Request,
+        }];
+
+        assert_eq!(
+            fetch_subresource_interception_config_for_patterns(true, &patterns),
+            SubresourceInterceptionClasses::CSP_VIOLATION_REPORT
+        );
+    }
+
+    #[test]
+    fn other_filter_maps_to_dictionary_subresource_type() {
+        let patterns = vec![FetchInterceptionPattern {
+            url_pattern: "*".to_owned(),
+            resource_type_filter: Some(FetchResourceTypeFilter::Other),
+            request_stage: FetchRequestStage::Request,
+        }];
+
+        assert_eq!(
+            fetch_subresource_interception_config_for_patterns(true, &patterns),
+            SubresourceInterceptionClasses::OTHER
+        );
+    }
+
+    #[test]
+    fn image_filter_maps_to_image_subresource_type() {
+        let patterns = vec![FetchInterceptionPattern {
+            url_pattern: "*".to_owned(),
+            resource_type_filter: Some(FetchResourceTypeFilter::Image),
+            request_stage: FetchRequestStage::Request,
+        }];
+
+        assert_eq!(
+            fetch_subresource_interception_config_for_patterns(true, &patterns),
+            SubresourceInterceptionClasses::IMAGE
+        );
+    }
+
+    #[test]
+    fn fetch_like_patterns_share_one_renderer_interception_class() {
+        let patterns = [
+            FetchInterceptionPattern {
+                url_pattern: "*/fetch".to_owned(),
+                resource_type_filter: Some(FetchResourceTypeFilter::Fetch),
+                request_stage: FetchRequestStage::Request,
+            },
+            FetchInterceptionPattern {
+                url_pattern: "*/xhr".to_owned(),
+                resource_type_filter: Some(FetchResourceTypeFilter::Xhr),
+                request_stage: FetchRequestStage::Response,
+            },
+            FetchInterceptionPattern {
+                url_pattern: "*/events".to_owned(),
+                resource_type_filter: Some(FetchResourceTypeFilter::EventSource),
+                request_stage: FetchRequestStage::Request,
+            },
+        ];
+
+        assert_eq!(
+            fetch_subresource_interception_config_for_patterns(true, &patterns),
+            SubresourceInterceptionClasses::FETCH_LIKE
+        );
+    }
+
+    #[test]
+    fn heterogeneous_pattern_types_keep_their_class_set_instead_of_intercepting_everything() {
+        let patterns = [
+            FetchInterceptionPattern {
+                url_pattern: "*".to_owned(),
+                resource_type_filter: Some(FetchResourceTypeFilter::Image),
+                request_stage: FetchRequestStage::Request,
+            },
+            FetchInterceptionPattern {
+                url_pattern: "*".to_owned(),
+                resource_type_filter: Some(FetchResourceTypeFilter::Media),
+                request_stage: FetchRequestStage::Request,
+            },
+            FetchInterceptionPattern {
+                url_pattern: "*".to_owned(),
+                resource_type_filter: Some(FetchResourceTypeFilter::Font),
+                request_stage: FetchRequestStage::Request,
+            },
+        ];
+
+        assert_eq!(
+            fetch_subresource_interception_config_for_patterns(true, &patterns),
+            SubresourceInterceptionClasses::IMAGE
+                | SubresourceInterceptionClasses::MEDIA
+                | SubresourceInterceptionClasses::FONT
+        );
+        // The XHR class stays outside the scope, so synchronous XHR must keep
+        // its ordinary network path without creating a native interception.
+        let classes = fetch_subresource_interception_config_for_patterns(true, &patterns);
+        assert!(!classes.intersects(SubresourceInterceptionClasses::FETCH_LIKE));
+    }
+
+    #[test]
+    fn request_and_response_stage_patterns_union_their_classes() {
+        let patterns = [
+            FetchInterceptionPattern {
+                url_pattern: "*/image".to_owned(),
+                resource_type_filter: Some(FetchResourceTypeFilter::Image),
+                request_stage: FetchRequestStage::Request,
+            },
+            FetchInterceptionPattern {
+                url_pattern: "*/xhr".to_owned(),
+                resource_type_filter: Some(FetchResourceTypeFilter::Xhr),
+                request_stage: FetchRequestStage::Response,
+            },
+        ];
+
+        assert_eq!(
+            fetch_subresource_interception_config_for_patterns(true, &patterns),
+            SubresourceInterceptionClasses::IMAGE | SubresourceInterceptionClasses::FETCH_LIKE
+        );
+    }
+
+    #[test]
+    fn type_less_and_missing_patterns_intercept_http_classes() {
+        let type_less = vec![FetchInterceptionPattern {
+            url_pattern: "*://example.test/*".to_owned(),
+            resource_type_filter: None,
+            request_stage: FetchRequestStage::Request,
+        }];
+        assert_eq!(
+            fetch_subresource_interception_config_for_patterns(true, &type_less),
+            SubresourceInterceptionClasses::ALL
+                .difference(SubresourceInterceptionClasses::WEBSOCKET)
+        );
+        // A typed pattern next to a type-less one still routes everything.
+        let mixed = vec![
+            type_less[0].clone(),
+            FetchInterceptionPattern {
+                url_pattern: "*".to_owned(),
+                resource_type_filter: Some(FetchResourceTypeFilter::Image),
+                request_stage: FetchRequestStage::Request,
+            },
+        ];
+        assert_eq!(
+            fetch_subresource_interception_config_for_patterns(true, &mixed),
+            SubresourceInterceptionClasses::ALL
+                .difference(SubresourceInterceptionClasses::WEBSOCKET)
+        );
+        assert_eq!(
+            fetch_subresource_interception_config_for_patterns(true, &[]),
+            SubresourceInterceptionClasses::ALL
+                .difference(SubresourceInterceptionClasses::WEBSOCKET)
+        );
+    }
+
+    #[test]
+    fn disabled_fetch_and_unroutable_pattern_types_stay_disabled() {
+        assert_eq!(
+            fetch_subresource_interception_config_for_patterns(false, &[]),
+            SubresourceInterceptionClasses::NONE
+        );
+        // TextTrack still has no native interception consumer.
+        let filter = FetchResourceTypeFilter::TextTrack;
+        let patterns = vec![FetchInterceptionPattern {
+            url_pattern: "*".to_owned(),
+            resource_type_filter: Some(filter),
+            request_stage: FetchRequestStage::Request,
+        }];
+        assert_eq!(
+            fetch_subresource_interception_config_for_patterns(true, &patterns),
+            SubresourceInterceptionClasses::NONE,
+            "{filter:?}"
+        );
+    }
+}

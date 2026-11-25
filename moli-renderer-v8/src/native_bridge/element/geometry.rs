@@ -1,0 +1,61 @@
+mod client_rect;
+#[cfg(any(test, feature = "devtools"))]
+mod hit_test;
+mod metrics;
+mod mock;
+mod provider;
+mod rects;
+mod scroll;
+mod scroll_into_view;
+
+pub use client_rect::ClientRect;
+#[cfg(feature = "devtools")]
+pub(crate) use hit_test::observable_deep_hit_test;
+#[cfg(feature = "devtools")]
+pub(crate) use hit_test::observable_input_hit_test;
+#[cfg(test)]
+pub(crate) use hit_test::observable_scrollbar_hit_test;
+#[cfg(feature = "devtools")]
+pub(crate) use hit_test::{
+    InputHitTestMode, InputHitTestPolicy, InputSurfaceHit, input_surface_hit_test,
+    input_target_in_document,
+};
+pub(in crate::native_bridge) use metrics::{
+    node_client_height_getter_function, node_client_left_getter_function,
+    node_client_top_getter_function, node_client_width_getter_function,
+    node_offset_height_getter_function, node_offset_left_getter_function,
+    node_offset_parent_getter_function, node_offset_top_getter_function,
+    node_offset_width_getter_function, node_scroll_by_callback, node_scroll_height_getter_function,
+    node_scroll_into_view_callback, node_scroll_into_view_if_needed_callback,
+    node_scroll_left_getter_function, node_scroll_left_setter_function, node_scroll_to_callback,
+    node_scroll_top_getter_function, node_scroll_top_setter_function,
+    node_scroll_width_getter_function,
+};
+pub(crate) use mock::{
+    compute_mock_client_rect, compute_mock_intersection_client_rect,
+    compute_mock_intersection_scrollport_client_rect,
+};
+#[cfg(feature = "devtools")]
+pub(crate) use provider::observable_geometry_query;
+pub(in crate::native_bridge) use provider::{element_for_hit_source, live_interaction_target};
+pub(crate) use provider::{
+    observable_bounding_client_rects, observable_caret_position, observable_document_metrics,
+    observable_event_offset, observable_geometry_batch, observable_hit_test,
+    observable_hit_test_all, observable_sources_with_fragments, observable_used_grid_tracks,
+    published_geometry_batch, read_bounding_client_rect, read_client_rects, read_element_metrics,
+};
+pub(in crate::native_bridge) use rects::{
+    node_get_bounding_client_rect_callback, node_get_client_rects_callback,
+};
+pub(crate) use scroll::queue_scroll_observable_effects;
+#[cfg(feature = "devtools")]
+pub(crate) use scroll::{
+    WheelScrollTarget, apply_scroll_observable_effects,
+    perform_latched_wheel_scroll_default_action, perform_scrollbar_scroll_default_action,
+    perform_wheel_scroll_default_action, select_wheel_scroll_target,
+};
+#[cfg(feature = "devtools")]
+pub(crate) use scroll_into_view::scroll_node_into_view_at_center;
+pub(crate) use scroll_into_view::{
+    scroll_node_into_view_at_start, scroll_node_into_view_if_needed,
+};

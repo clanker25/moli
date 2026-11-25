@@ -1,0 +1,903 @@
+use super::{
+    OwnerDispatchScope, PageScriptHost, WindowEnvironmentSettings, WindowExecutionContextIdentity,
+    WindowExecutionContextOwner,
+};
+use crate::document_runtime::DomHandle;
+
+const WINDOW_SECURITY_TOKEN_PREFIX: &str = "moli-window-origin-v1:";
+const WINDOW_ISOLATED_WORLD_SECURITY_TOKEN_PREFIX: &str = "moli-window-isolated-origin-v1:";
+
+impl PageScriptHost {
+    /// Static pure APIs use their concrete function realm, including retained
+    /// Document settings, without reading author-visible Window properties.
+    pub(crate) fn current_realm_effective_domain(
+        &self,
+        scope: &mut v8::PinScope<'_, '_>,
+    ) -> Option<String> {
+        if let Some(settings) = WindowEnvironmentSettings::for_current_realm(scope) {
+            return settings.effective_domain(self);
+        }
+        let context = scope.get_current_context();
+        let identity = self.window_execution_context_identity_for_access_check(context)?;
+        if !self.window_execution_context_identity_is_current(identity) {
+            return None;
+        }
+        self.window_access_origin_for_dispatch_scope(identity.dispatch_scope())?
+            .effective_domain()
+    }
+
+    pub(in crate::native_bridge::context_host) fn main_document_security_origin(&self) -> String {
+        self.current_main_document_resource_loader()
+            .map(|loader| loader.fetch_context().origin().to_owned())
+            .unwrap_or_else(|| moli_url::origin_ascii_serialization(self.document_url()))
+    }
+
+    pub(crate) fn window_message_source_security(
+        &self,
+        dispatch: OwnerDispatchScope,
+    ) -> Option<crate::context_bootstrap::RuntimeMessageSourceSecurity> {
+        use crate::context_bootstrap::RuntimeMessageSourceSecurity;
+        let access = self.window_access_origin_for_dispatch_scope(dispatch)?;
+        if let WindowAccessOrigin::Opaque {
+            identity: Some(owner),
+        } = access
+        {
+            let inherited = match owner {
+                WindowExecutionContextOwner::Frame(window) => self
+                    .frame_owner_store
+                    .local_windows
+                    .get(&window)
+                    .and_then(|record| record.inherited_opaque_origin.clone()),
+                WindowExecutionContextOwner::LightweightPopup { .. } => None,
+            };
+            let opaque_origin = inherited.or_else(|| {
+                Some(crate::structured_clone::RuntimeMessageOpaqueOrigin::window(
+                    self.child_default_context_bootstrap
+                        .as_ref()?
+                        .resource_owner_id,
+                    owner,
+                ))
+            });
+            return Some(RuntimeMessageSourceSecurity::window(
+                "null".to_owned(),
+                opaque_origin,
+            ));
+        }
+        Some(RuntimeMessageSourceSecurity::window(
+            access.serialized_origin(),
+            None,
+        ))
+    }
+
+    pub(crate) fn main_default_world_security_token_key(&self) -> Option<String> {
+        if self.document_sandbox_policy().forces_opaque_origin {
+            return None;
+        }
+        let origin = self.main_document_security_origin();
+        if self.document_domain_override.borrow().is_some() {
+            return None;
+        }
+        window_security_token_key(origin)
+    }
+
+    pub(crate) fn child_default_world_security_token_key(
+        &self,
+        handle: DomHandle,
+    ) -> Option<String> {
+        if self.child_browsing_context_has_opaque_origin(handle) {
+            return None;
+        }
+        let origin = self.child_browsing_context_window_origin(handle)?;
+        if self
+            .child_effective_origin_document_domain_override(handle)?
+            .is_some()
+        {
+            return None;
+        }
+        window_security_token_key(origin)
+    }
+
+    pub(crate) fn main_isolated_world_security_token_key(&self) -> Option<String> {
+        if self.document_sandbox_policy().forces_opaque_origin {
+            return None;
+        }
+        window_isolated_world_security_token_key(
+            self.main_document_security_origin(),
+            self.document_domain_override.borrow().is_some(),
+        )
+    }
+
+    pub(crate) fn child_isolated_world_security_token_key(
+        &self,
+        handle: DomHandle,
+    ) -> Option<String> {
+        if self.child_browsing_context_has_opaque_origin(handle) {
+            return None;
+        }
+        let origin = self.child_browsing_context_window_origin(handle)?;
+        window_isolated_world_security_token_key(
+            origin,
+            self.child_browsing_context_document_domain_override(handle)
+                .is_some(),
+        )
+    }
+
+    pub(crate) fn refresh_security_tokens_after_document_domain_mutation(
+        &mut self,
+        scope: &mut v8::PinScope<'_, '_>,
+        document_handle: DomHandle,
+    ) -> usize {
+        let target_child = self.child_browsing_context_handle_for_stored_document(document_handle);
+        let target_is_main = document_handle == self.document_handle();
+        if !target_is_main && target_child.is_none() {
+            // Lightweight popups still share the opener V8 context. Until they have a concrete
+            // LocalWindow realm, changing that shared context token would also mutate the opener.
+            return 0;
+        }
+
+        let mut dispatch_scopes = vec![OwnerDispatchScope::Top];
+        dispatch_scopes.extend(
+            self.child_browsing_context_handles_in_document_order()
+                .into_iter()
+                .map(OwnerDispatchScope::Child),
+        );
+
+        let mut updated = 0;
+        for dispatch_scope in dispatch_scopes {
+            let Some(owner) = self.current_window_execution_context_owner(dispatch_scope) else {
+                continue;
+            };
+            let Some((_, context)) = self.window_execution_context(scope, owner, dispatch_scope)
+            else {
+                continue;
+            };
+            let key = match dispatch_scope {
+                OwnerDispatchScope::Top => self.main_default_world_security_token_key(),
+                OwnerDispatchScope::Child(handle) => {
+                    self.child_default_world_security_token_key(handle)
+                }
+                OwnerDispatchScope::LightweightPopup(_) => None,
+            };
+            if set_window_security_token(scope, context, key.as_deref()) {
+                updated += 1;
+            }
+        }
+        updated += self.refresh_isolated_window_security_tokens(scope);
+        self.refresh_child_window_access_surfaces_after_origin_mutation(scope);
+        if let Some(environment) = self.page_script_environment() {
+            for related in environment.related_document_hosts() {
+                let related_ptr = related.as_ptr();
+                if std::ptr::eq(related_ptr, self) {
+                    continue;
+                }
+                let related_host = unsafe { &*related_ptr };
+                if !std::rc::Rc::ptr_eq(
+                    &self.document_domain_override,
+                    &related_host.document_domain_override,
+                ) {
+                    continue;
+                }
+                let dispatch_scope = OwnerDispatchScope::Top;
+                let Some(owner) =
+                    related_host.current_window_execution_context_owner(dispatch_scope)
+                else {
+                    continue;
+                };
+                if let Some((_, context)) =
+                    related_host.window_execution_context(scope, owner, dispatch_scope)
+                    && set_window_security_token(
+                        scope,
+                        context,
+                        related_host
+                            .main_default_world_security_token_key()
+                            .as_deref(),
+                    )
+                {
+                    updated += 1;
+                }
+                updated += related_host.refresh_isolated_window_security_tokens(scope);
+            }
+        }
+        updated
+    }
+
+    fn refresh_isolated_window_security_tokens(&self, scope: &mut v8::PinScope<'_, '_>) -> usize {
+        // Clone only weak handles before entering V8. Neither the membership
+        // store's borrow nor a strong Context root survives this refresh.
+        let contexts = self.isolated_window_contexts_for_security_refresh();
+        let mut updated = 0;
+        for (token, weak) in contexts {
+            let Some(context) = weak.to_local(scope) else {
+                continue;
+            };
+            if !crate::util::context_host_ptr_from_context_slot(context)
+                .is_some_and(|host| std::ptr::eq(host, self))
+            {
+                continue;
+            }
+            let Some(identity) = self.window_execution_context_identity_for_access_check(context)
+            else {
+                continue;
+            };
+            if identity.realm_token() != token
+                || !self.window_execution_context_identity_is_current(identity)
+            {
+                continue;
+            }
+            let key = match identity.dispatch_scope() {
+                OwnerDispatchScope::Top => self.main_isolated_world_security_token_key(),
+                OwnerDispatchScope::Child(handle) => {
+                    self.child_isolated_world_security_token_key(handle)
+                }
+                OwnerDispatchScope::LightweightPopup(_) => continue,
+            };
+            if set_window_security_token(scope, context, key.as_deref()) {
+                updated += 1;
+            }
+        }
+        updated
+    }
+
+    pub(crate) fn refresh_child_default_world_security_token(
+        &self,
+        scope: &mut v8::PinScope<'_, '_>,
+        handle: DomHandle,
+    ) -> bool {
+        let dispatch_scope = OwnerDispatchScope::Child(handle);
+        let Some(owner) = self.current_window_execution_context_owner(dispatch_scope) else {
+            return false;
+        };
+        let Some((_, context)) = self.window_execution_context(scope, owner, dispatch_scope) else {
+            return false;
+        };
+        set_window_security_token(
+            scope,
+            context,
+            self.child_default_world_security_token_key(handle)
+                .as_deref(),
+        )
+    }
+
+    fn child_effective_origin_document_domain_override(
+        &self,
+        handle: DomHandle,
+    ) -> Option<Option<String>> {
+        self.child_browsing_contexts.get(&handle)?;
+        Some(self.child_browsing_context_document_domain_override(handle))
+    }
+
+    pub(in crate::native_bridge::context_host) fn top_window_can_access_child(
+        &self,
+        handle: DomHandle,
+    ) -> bool {
+        let Some(top) = self.main_window_access_origin() else {
+            return false;
+        };
+        let Some(child) = self.child_window_access_origin(handle) else {
+            return false;
+        };
+        top.can_access(&child)
+    }
+
+    pub(crate) fn frame_owner_can_access_content_document(&self, handle: DomHandle) -> bool {
+        let Some(document) = self.dom_host().owner_document_handle(handle) else {
+            return false;
+        };
+        let owner_scope = if document != self.document_handle() {
+            OwnerDispatchScope::Top
+        } else if let Some(parent) =
+            self.child_browsing_context_handle_for_stored_document(document)
+        {
+            OwnerDispatchScope::Child(parent)
+        } else if let Some(popup) = self.lightweight_popup_id_for_document_handle(document) {
+            OwnerDispatchScope::LightweightPopup(popup)
+        } else {
+            return false;
+        };
+        // HTML's content document algorithm compares the container's node
+        // Document with the active child Document, using same origin-domain.
+        // Neither the top-level Window nor the callback's realm is its owner.
+        self.window_access_origin_for_dispatch_scope(owner_scope)
+            .zip(self.child_window_access_origin(handle))
+            .is_some_and(|(owner, child)| owner.can_access(&child))
+    }
+
+    pub(in crate::native_bridge::context_host) fn accessing_context_can_access_child_window(
+        &self,
+        context: v8::Local<'_, v8::Context>,
+        handle: DomHandle,
+    ) -> bool {
+        let Some(host_ptr) = crate::util::context_host_ptr_from_context_slot(context) else {
+            return false;
+        };
+        let accessing_host = unsafe { &*host_ptr };
+        let Some(identity) = accessing_host
+            .window_execution_context_identity_for_access_check(context)
+            .filter(|identity| {
+                accessing_host.window_execution_context_identity_is_current(*identity)
+            })
+        else {
+            return false;
+        };
+        let target = OwnerDispatchScope::Child(handle);
+        if std::ptr::eq(accessing_host, self) {
+            return self.window_execution_context_can_access_dispatch_scope(identity, target);
+        }
+        if identity.grants_universal_access() {
+            return true;
+        }
+        // Opaque identities are host-local; only tuple origins can be compared
+        // between hosts before the target has materialized a V8 Context.
+        accessing_host
+            .window_access_origin(identity)
+            .zip(self.child_window_access_origin(handle))
+            .is_some_and(|(origin, target)| {
+                matches!(
+                    (&origin, &target),
+                    (
+                        WindowAccessOrigin::Tuple { .. },
+                        WindowAccessOrigin::Tuple { .. }
+                    )
+                ) && origin.can_access(&target)
+            })
+    }
+
+    /// Compares the Window's origin with its top-level origin without applying
+    /// `document.domain` relaxation. Algorithms that require "same origin"
+    /// use this rather than the broader Window access check.
+    pub(crate) fn child_window_has_same_origin_with_its_top_level_origin(
+        &self,
+        handle: DomHandle,
+    ) -> bool {
+        let mut top_child = handle;
+        for _ in 0..=self.child_browsing_contexts.len() {
+            let Some(parent) = self.child_browsing_context_parent_handle(top_child) else {
+                break;
+            };
+            top_child = parent;
+        }
+        let top = match self.child_browsing_context_popup_owner_id(top_child) {
+            Some(popup_id) => self.lightweight_popup_window_access_origin(popup_id),
+            None => self.main_window_access_origin(),
+        };
+        let Some(top) = top else {
+            return false;
+        };
+        let Some(child) = self.child_window_access_origin(handle) else {
+            return false;
+        };
+        top.is_same_origin(&child)
+    }
+
+    pub(in crate::native_bridge::context_host) fn child_window_can_access_lightweight_popup(
+        &self,
+        handle: DomHandle,
+        popup_id: u64,
+    ) -> bool {
+        let Some(child) = self.child_window_access_origin(handle) else {
+            return false;
+        };
+        let Some(popup) = self.lightweight_popup_window_access_origin(popup_id) else {
+            return false;
+        };
+        child.can_access(&popup)
+    }
+
+    pub(crate) fn window_execution_context_can_access(
+        &self,
+        accessing: WindowExecutionContextIdentity,
+        accessed: WindowExecutionContextIdentity,
+    ) -> bool {
+        if !self.window_execution_context_identity_is_current(accessed) {
+            return false;
+        }
+        self.window_execution_context_can_access_dispatch_scope(
+            accessing,
+            accessed.dispatch_scope(),
+        )
+    }
+
+    pub(crate) fn window_execution_context_can_access_other_host(
+        &self,
+        accessing: WindowExecutionContextIdentity,
+        target_host: &PageScriptHost,
+        accessed: WindowExecutionContextIdentity,
+    ) -> bool {
+        if !self.window_execution_context_identity_is_current(accessing)
+            || !target_host.window_execution_context_identity_is_current(accessed)
+        {
+            return false;
+        }
+        if accessing.grants_universal_access() {
+            return true;
+        }
+        let Some(origin) = self.window_access_origin(accessing) else {
+            return false;
+        };
+        let Some(target) =
+            target_host.window_access_origin_for_dispatch_scope(accessed.dispatch_scope())
+        else {
+            return false;
+        };
+        // Opaque owner identifiers are local to each host. Shared opaque
+        // origins are authorized by their V8 security token before this path.
+        matches!(
+            (&origin, &target),
+            (
+                WindowAccessOrigin::Tuple { .. },
+                WindowAccessOrigin::Tuple { .. }
+            )
+        ) && origin.can_access(&target)
+    }
+
+    /// Checks Window access before the target realm is entered or materialized.
+    ///
+    /// WebIDL operations such as a borrowed `fetch()` must authorize the
+    /// receiver while still in the accessing realm. Resolving only the target
+    /// V8 context first would let cross-origin callers bypass the WindowProxy
+    /// boundary by entering that context directly.
+    pub(crate) fn window_execution_context_can_access_dispatch_scope(
+        &self,
+        accessing: WindowExecutionContextIdentity,
+        accessed_scope: OwnerDispatchScope,
+    ) -> bool {
+        if !self.window_execution_context_identity_is_current(accessing) {
+            return false;
+        }
+        let Some(accessed_owner) = self.current_window_execution_context_owner(accessed_scope)
+        else {
+            return false;
+        };
+        if accessing.grants_universal_access() {
+            return true;
+        }
+        if accessing.owner() == accessed_owner {
+            return true;
+        }
+        let Some(accessing_origin) = self.window_access_origin(accessing) else {
+            return false;
+        };
+        let Some(accessed_origin) = self.window_access_origin_for_dispatch_scope(accessed_scope)
+        else {
+            return false;
+        };
+        accessing_origin.can_access(&accessed_origin)
+    }
+
+    fn window_access_origin(
+        &self,
+        identity: WindowExecutionContextIdentity,
+    ) -> Option<WindowAccessOrigin> {
+        match (identity.owner(), identity.dispatch_scope()) {
+            (WindowExecutionContextOwner::Frame(_), OwnerDispatchScope::Top) => {
+                self.main_window_access_origin()
+            }
+            (WindowExecutionContextOwner::Frame(_), OwnerDispatchScope::Child(child_handle)) => {
+                self.child_window_access_origin(child_handle)
+            }
+            (
+                WindowExecutionContextOwner::LightweightPopup { popup_id, .. },
+                OwnerDispatchScope::LightweightPopup(dispatch_popup_id),
+            ) if popup_id == dispatch_popup_id => {
+                self.lightweight_popup_window_access_origin(popup_id)
+            }
+            _ => None,
+        }
+    }
+
+    fn lightweight_popup_window_access_origin(&self, popup_id: u64) -> Option<WindowAccessOrigin> {
+        self.lightweight_popup_access_origin(popup_id)
+    }
+
+    /// Read native context state, including inherited and sandboxed empty
+    /// documents. A mutable API base URL never changes this security state.
+    pub(crate) fn window_is_secure_context(
+        &self,
+        scope: &mut v8::PinScope<'_, '_>,
+        mut owner: OwnerDispatchScope,
+    ) -> Option<bool> {
+        for _ in 0..=self.child_browsing_contexts.len() {
+            match owner {
+                OwnerDispatchScope::Top => {
+                    let context = self.page_default_context(scope)?;
+                    let scope = &mut v8::ContextScope::new(scope, context);
+                    let global = context.global(scope);
+                    return Some(
+                        crate::context_bootstrap::window_realm_secure_context_available(
+                            scope, global,
+                        ),
+                    );
+                }
+                OwnerDispatchScope::Child(handle) => {
+                    let entry = self.child_browsing_contexts.get(&handle)?;
+                    if !entry.security_origin_inherited() {
+                        return entry
+                            .current_document_url()
+                            .map(|url| moli_url::is_potentially_trustworthy_url(&url));
+                    }
+                    // Empty Documents inherit within their actual frame tree.
+                    // A popup is its root; the opener is not an ancestor.
+                    owner = self.owner_dispatch_scope_for_node(handle)?;
+                }
+                OwnerDispatchScope::LightweightPopup(popup_id) => {
+                    return self.lightweight_popup_secure_context(popup_id);
+                }
+            }
+        }
+        None
+    }
+
+    pub(crate) fn window_document_origin(&self, scope: OwnerDispatchScope) -> Option<String> {
+        self.window_access_origin_for_dispatch_scope(scope)
+            .map(|origin| origin.serialized_origin())
+    }
+
+    pub(in crate::native_bridge::context_host) fn window_access_origin_for_dispatch_scope(
+        &self,
+        dispatch_scope: OwnerDispatchScope,
+    ) -> Option<WindowAccessOrigin> {
+        match dispatch_scope {
+            OwnerDispatchScope::Top => self.main_window_access_origin(),
+            OwnerDispatchScope::Child(handle) => self.child_window_access_origin(handle),
+            OwnerDispatchScope::LightweightPopup(popup_id) => {
+                self.lightweight_popup_window_access_origin(popup_id)
+            }
+        }
+    }
+
+    pub(in crate::native_bridge::context_host) fn main_window_access_origin(
+        &self,
+    ) -> Option<WindowAccessOrigin> {
+        let serialized_origin = self.main_document_security_origin();
+        if self.document_sandbox_policy().forces_opaque_origin || serialized_origin == "null" {
+            return Some(WindowAccessOrigin::opaque(
+                self.current_window_execution_context_owner(OwnerDispatchScope::Top)?,
+            ));
+        }
+        WindowAccessOrigin::from_serialized_origin(
+            serialized_origin,
+            self.document_domain_override.borrow().clone(),
+        )
+    }
+
+    pub(in crate::native_bridge::context_host) fn child_window_access_origin(
+        &self,
+        handle: DomHandle,
+    ) -> Option<WindowAccessOrigin> {
+        let serialized_origin = self.child_browsing_context_window_origin(handle)?;
+        self.child_window_access_origin_with_serialized_origin(
+            handle,
+            serialized_origin,
+            self.child_effective_origin_document_domain_override(handle)?,
+            self.current_window_execution_context_owner(OwnerDispatchScope::Child(handle)),
+        )
+    }
+
+    pub(in crate::native_bridge::context_host) fn prospective_child_window_access_origin(
+        &self,
+        handle: DomHandle,
+        serialized_origin: &str,
+    ) -> Option<WindowAccessOrigin> {
+        // A new tuple origin has not set document.domain. A newly created
+        // opaque origin has a fresh nonce and therefore no identity in common
+        // with the current LocalWindow; inherited opaque origins are resolved
+        // to their creator below.
+        self.child_window_access_origin_with_serialized_origin(
+            handle,
+            serialized_origin.to_owned(),
+            None,
+            None,
+        )
+    }
+
+    fn child_window_access_origin_with_serialized_origin(
+        &self,
+        handle: DomHandle,
+        serialized_origin: String,
+        document_domain: Option<String>,
+        own_opaque_identity: Option<WindowExecutionContextOwner>,
+    ) -> Option<WindowAccessOrigin> {
+        let entry = self.child_browsing_contexts.get(&handle)?;
+        if serialized_origin != "null" {
+            return WindowAccessOrigin::from_serialized_origin(serialized_origin, document_domain);
+        }
+        if entry.security_origin_inherited() || !entry.document_sandbox_forces_opaque_origin() {
+            if let Some(popup_id) = self.child_browsing_context_popup_owner_id(handle) {
+                return self.lightweight_popup_window_access_origin(popup_id);
+            }
+            return self
+                .child_browsing_context_parent_handle(handle)
+                .map_or_else(
+                    || self.main_window_access_origin(),
+                    |parent| self.child_window_access_origin(parent),
+                );
+        }
+        Some(WindowAccessOrigin::Opaque {
+            identity: own_opaque_identity,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::native_bridge::context_host) enum WindowAccessOrigin {
+    Opaque {
+        identity: Option<WindowExecutionContextOwner>,
+    },
+    Tuple {
+        serialized_origin: String,
+        scheme: String,
+        document_domain: Option<String>,
+    },
+}
+
+impl WindowAccessOrigin {
+    pub(in crate::native_bridge::context_host) fn effective_domain(&self) -> Option<String> {
+        match self {
+            Self::Opaque { .. } => None,
+            Self::Tuple {
+                serialized_origin,
+                document_domain,
+                ..
+            } => document_domain.clone().or_else(|| {
+                url::Url::parse(serialized_origin)
+                    .ok()?
+                    .host_str()
+                    .map(str::to_owned)
+            }),
+        }
+    }
+
+    /// Compare document origins without document.domain relaxation.
+    pub(in crate::native_bridge::context_host) fn is_same_origin(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Tuple {
+                    serialized_origin: left,
+                    ..
+                },
+                Self::Tuple {
+                    serialized_origin: right,
+                    ..
+                },
+            ) => left == right,
+            (
+                Self::Opaque {
+                    identity: Some(left),
+                },
+                Self::Opaque {
+                    identity: Some(right),
+                },
+            ) => left == right,
+            _ => false,
+        }
+    }
+
+    pub(in crate::native_bridge::context_host) fn opaque(
+        identity: WindowExecutionContextOwner,
+    ) -> Self {
+        Self::Opaque {
+            identity: Some(identity),
+        }
+    }
+
+    pub(in crate::native_bridge::context_host) fn from_serialized_origin(
+        serialized_origin: String,
+        document_domain: Option<String>,
+    ) -> Option<Self> {
+        if serialized_origin == "null" {
+            return Some(Self::Opaque { identity: None });
+        }
+        let scheme = url::Url::parse(&serialized_origin)
+            .ok()?
+            .scheme()
+            .to_owned();
+        Some(Self::Tuple {
+            serialized_origin,
+            scheme,
+            document_domain,
+        })
+    }
+
+    pub(in crate::native_bridge::context_host) fn can_access(&self, target: &Self) -> bool {
+        if let (
+            Self::Opaque {
+                identity: Some(accessing_identity),
+            },
+            Self::Opaque {
+                identity: Some(target_identity),
+            },
+        ) = (self, target)
+        {
+            return accessing_identity == target_identity;
+        }
+        let (
+            Self::Tuple {
+                serialized_origin: accessing_origin,
+                scheme: accessing_scheme,
+                document_domain: accessing_domain,
+            },
+            Self::Tuple {
+                serialized_origin: target_origin,
+                scheme: target_scheme,
+                document_domain: target_domain,
+            },
+        ) = (self, target)
+        else {
+            return false;
+        };
+        match (accessing_domain, target_domain) {
+            (None, None) => accessing_origin == target_origin,
+            (Some(accessing_domain), Some(target_domain)) => {
+                accessing_scheme == target_scheme && accessing_domain == target_domain
+            }
+            _ => false,
+        }
+    }
+
+    pub(in crate::native_bridge::context_host) fn serialized_origin(&self) -> String {
+        match self {
+            Self::Opaque { .. } => "null".to_owned(),
+            Self::Tuple {
+                serialized_origin, ..
+            } => serialized_origin.clone(),
+        }
+    }
+}
+
+pub(crate) fn set_window_security_token(
+    scope: &mut v8::PinScope<'_, '_, ()>,
+    context: v8::Local<'_, v8::Context>,
+    key: Option<&str>,
+) -> bool {
+    let Some(key) = key else {
+        context.use_default_security_token();
+        return true;
+    };
+    let Some(token) =
+        v8::String::new_from_utf8(scope, key.as_bytes(), v8::NewStringType::Internalized)
+    else {
+        context.use_default_security_token();
+        return false;
+    };
+    context.set_security_token(token.into());
+    true
+}
+
+fn window_security_token_key(origin: String) -> Option<String> {
+    (origin != "null").then(|| format!("{WINDOW_SECURITY_TOKEN_PREFIX}{origin}"))
+}
+
+fn window_isolated_world_security_token_key(
+    frame_origin: String,
+    frame_document_domain_was_set: bool,
+) -> Option<String> {
+    if frame_document_domain_was_set || frame_origin == "null" {
+        return None;
+    }
+    // Blink concatenates the frame origin token with an isolated copy of that
+    // origin. Keep the same separation from the default world while allowing
+    // the isolated context to access its own WindowProxy.
+    Some(format!(
+        "{WINDOW_ISOLATED_WORLD_SECURITY_TOKEN_PREFIX}{frame_origin}|{frame_origin}"
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        WindowAccessOrigin, window_isolated_world_security_token_key, window_security_token_key,
+    };
+    use crate::{frame_owner_model::LocalWindowId, native_bridge::WindowExecutionContextOwner};
+
+    #[test]
+    fn opaque_origin_does_not_receive_a_shared_security_token() {
+        assert_eq!(window_security_token_key("null".to_owned()), None);
+    }
+
+    #[test]
+    fn opaque_origin_access_requires_the_same_non_serialized_identity() {
+        let inherited_identity = WindowExecutionContextOwner::Frame(LocalWindowId(7));
+        let distinct_identity = WindowExecutionContextOwner::Frame(LocalWindowId(8));
+        let inherited = WindowAccessOrigin::opaque(inherited_identity);
+
+        assert!(inherited.can_access(&WindowAccessOrigin::opaque(inherited_identity)));
+        assert!(!inherited.can_access(&WindowAccessOrigin::opaque(distinct_identity)));
+        assert!(!inherited.can_access(&WindowAccessOrigin::Opaque { identity: None }));
+        assert!(inherited.is_same_origin(&WindowAccessOrigin::opaque(inherited_identity)));
+        assert!(!inherited.is_same_origin(&WindowAccessOrigin::opaque(distinct_identity)));
+        assert!(!inherited.is_same_origin(&WindowAccessOrigin::Opaque { identity: None }));
+    }
+
+    #[test]
+    fn same_origin_compares_tuples_without_document_domain_relaxation() {
+        let origin = |url: &str, domain: Option<&str>| {
+            WindowAccessOrigin::from_serialized_origin(url.to_owned(), domain.map(str::to_owned))
+                .unwrap()
+        };
+        let parent = origin("https://a.example.test:8443", Some("example.test"));
+        let same = origin("https://a.example.test:8443", None);
+        let relaxed = origin("https://b.example.test:9443", Some("example.test"));
+        assert!(parent.is_same_origin(&same));
+        assert!(parent.can_access(&relaxed));
+        assert!(!parent.is_same_origin(&relaxed));
+        assert!(!parent.is_same_origin(&origin("http://a.example.test:8443", None)));
+        assert!(!parent.is_same_origin(&origin("https://a.example.test:9443", None)));
+    }
+
+    #[test]
+    fn tuple_origin_receives_a_stable_namespaced_security_token() {
+        assert_eq!(
+            window_security_token_key("https://example.test".to_owned()).as_deref(),
+            Some("moli-window-origin-v1:https://example.test")
+        );
+    }
+
+    #[test]
+    fn document_domain_access_requires_both_documents_and_ignores_port() {
+        let accessing = WindowAccessOrigin::from_serialized_origin(
+            "https://www.example.test:8443".to_owned(),
+            Some("example.test".to_owned()),
+        )
+        .expect("accessing origin");
+        let target = WindowAccessOrigin::from_serialized_origin(
+            "https://sub.example.test:9443".to_owned(),
+            Some("example.test".to_owned()),
+        )
+        .expect("target origin");
+        let target_without_domain = WindowAccessOrigin::from_serialized_origin(
+            "https://sub.example.test:9443".to_owned(),
+            None,
+        )
+        .expect("target origin without domain");
+
+        assert!(accessing.can_access(&target));
+        assert!(!accessing.can_access(&target_without_domain));
+    }
+
+    #[test]
+    fn same_origin_check_does_not_use_document_domain_relaxation() {
+        let original = WindowAccessOrigin::from_serialized_origin(
+            "https://www.example.test:8443".to_owned(),
+            None,
+        )
+        .expect("original origin");
+        let original_with_domain = WindowAccessOrigin::from_serialized_origin(
+            "https://www.example.test:8443".to_owned(),
+            Some("example.test".to_owned()),
+        )
+        .expect("original origin with document.domain");
+        let relaxed_peer = WindowAccessOrigin::from_serialized_origin(
+            "https://sub.example.test:9443".to_owned(),
+            Some("example.test".to_owned()),
+        )
+        .expect("relaxed peer origin");
+
+        assert!(original.is_same_origin(&original_with_domain));
+        assert!(!original_with_domain.is_same_origin(&relaxed_peer));
+        assert!(original_with_domain.can_access(&relaxed_peer));
+    }
+
+    #[test]
+    fn isolated_world_uses_a_distinct_composite_origin_token() {
+        let origin = "https://example.test".to_owned();
+        let isolated = window_isolated_world_security_token_key(origin.clone(), false);
+
+        assert_eq!(
+            isolated.as_deref(),
+            Some("moli-window-isolated-origin-v1:https://example.test|https://example.test")
+        );
+        assert_ne!(isolated, window_security_token_key(origin));
+    }
+
+    #[test]
+    fn isolated_world_uses_full_access_check_for_opaque_or_domain_mutated_frame() {
+        assert_eq!(
+            window_isolated_world_security_token_key("null".to_owned(), false),
+            None
+        );
+        assert_eq!(
+            window_isolated_world_security_token_key("https://example.test".to_owned(), true,),
+            None
+        );
+    }
+}

@@ -1,0 +1,92 @@
+<!doctype html>
+<meta charset="utf-8">
+<textarea id="drop-target" style="display:block;width:200px;height:200px">hello world</textarea>
+<script src="/wpt/resources/testharness.js"></script>
+<script src="/wpt/resources/testharnessreport.js"></script>
+<script src="/wpt/resources/moli-wpt-adapter.js"></script>
+<script>
+const input = document.getElementById("drop-target");
+const events = [];
+let firstDataTransfer = null;
+
+input.focus();
+input.setSelectionRange(6, 11);
+
+const dropped = new Promise(function (resolve) {
+  input.addEventListener("dragenter", function (event) {
+    firstDataTransfer = event.dataTransfer;
+    events.push(
+      "dragenter:" +
+        (event instanceof DragEvent) +
+        ":" +
+        event.dataTransfer.getData("text") +
+        ":" +
+        event.dataTransfer.dropEffect +
+        ":" +
+        event.dataTransfer.effectAllowed,
+    );
+  });
+
+  input.addEventListener("dragover", function (event) {
+    events.push(
+      "dragover-before:" +
+        (event.dataTransfer === firstDataTransfer) +
+        ":" +
+        event.dataTransfer.getData("text"),
+    );
+    event.dataTransfer.setData("text", "mutated-in-over");
+    event.dataTransfer.dropEffect = "move";
+    events.push(
+      "dragover-after:" +
+        event.dataTransfer.getData("text") +
+        ":" +
+        event.dataTransfer.dropEffect,
+    );
+  });
+
+  input.addEventListener("drop", function (event) {
+    event.dataTransfer.setData("text", "mutated-in-drop");
+    events.push(
+      "drop:" +
+        (event.dataTransfer === firstDataTransfer) +
+        ":" +
+        event.dataTransfer.getData("text") +
+        ":" +
+        event.dataTransfer.dropEffect +
+        ":" +
+        input.value,
+    );
+    setTimeout(resolve, 0);
+  });
+
+  input.addEventListener(
+    "input",
+    function () {
+      events.push(
+        "input:" + input.value + ":" + input.selectionStart + ":" + input.selectionEnd,
+      );
+    },
+    { once: true },
+  );
+});
+
+promise_test(async function () {
+  await dropped;
+  assert_array_equals(
+    events,
+    [
+      "dragenter:true::move:copyMove",
+      "dragover-before:false:",
+      "dragover-after::move",
+      "dragover-before:false:",
+      "dragover-after::move",
+      "drop:false:drop-text:copy:hello world",
+      "input:hello drop-text:15:15",
+    ],
+    "each dispatch owns its view, dragover stays protected, and the editor copies the explicit drop payload",
+  );
+  assert_equals(firstDataTransfer.getData("text"), "", "ended store is unreadable");
+  assert_equals(firstDataTransfer.types.length, 0, "ended store exposes no types");
+  assert_equals(firstDataTransfer.items.length, 0, "ended store exposes no items");
+}, "Input.dispatchDragEvent preserves protected data through the text drop lifecycle");
+</script>

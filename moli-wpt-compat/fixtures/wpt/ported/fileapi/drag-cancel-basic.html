@@ -1,0 +1,86 @@
+<!doctype html>
+<meta charset="utf-8">
+<div id="target" style="width:200px;height:200px"></div>
+<script src="/wpt/resources/testharness.js"></script>
+<script src="/wpt/resources/testharnessreport.js"></script>
+<script src="/wpt/resources/moli-wpt-adapter.js"></script>
+<script>
+const target = document.getElementById("target");
+const events = [];
+let firstDataTransfer = null;
+
+window.__assertCanceledDragState = function () {
+  assert_array_equals(
+    events,
+    ["dragenter::true", "dragover::false", "dragleave::false"],
+    "cancellation leaves the completed drag lifecycle intact",
+  );
+  assert_equals(firstDataTransfer.getData("text"), "", "canceled data is unreadable");
+  assert_equals(firstDataTransfer.types.length, 0, "canceled store exposes no types");
+  assert_equals(firstDataTransfer.items.length, 0, "canceled store exposes no items");
+};
+
+const dropped = new Promise(function (resolve) {
+  target.addEventListener("dragenter", function (event) {
+    if (firstDataTransfer === null) {
+      firstDataTransfer = event.dataTransfer;
+    }
+    events.push(
+      "dragenter:" +
+        event.dataTransfer.getData("text") +
+        ":" +
+        (event.dataTransfer === firstDataTransfer),
+    );
+  });
+
+  target.addEventListener("dragover", function (event) {
+    event.preventDefault();
+    event.dataTransfer.setData("text", "mutated-before-cancel");
+    events.push(
+      "dragover:" +
+        event.dataTransfer.getData("text") +
+        ":" +
+        (event.dataTransfer === firstDataTransfer),
+    );
+  });
+
+  target.addEventListener("dragCancel", function (event) {
+    events.push("dragCancel:" + event.dataTransfer.getData("text"));
+  });
+
+  target.addEventListener("dragleave", function (event) {
+    events.push(
+      "dragleave:" +
+        event.dataTransfer.getData("text") +
+        ":" +
+        (event.dataTransfer === firstDataTransfer),
+    );
+  });
+
+  target.addEventListener("drop", function (event) {
+    events.push(
+      "drop:" +
+        event.dataTransfer.getData("text") +
+        ":" +
+        (event.dataTransfer === firstDataTransfer),
+    );
+    setTimeout(resolve, 0);
+  });
+});
+
+promise_test(async function () {
+  await dropped;
+  assert_array_equals(
+    events,
+    [
+      "dragenter::true",
+      "dragover::false",
+      "dragleave::false",
+      "dragenter::false",
+      "dragover::false",
+      "drop:fresh-after-cancel:false",
+    ],
+    "dragCancel ends the store and rejects late drops until a new dragenter starts a fresh session",
+  );
+}, "Input.dispatchDragEvent dragCancel clears the active drag session");
+</script>

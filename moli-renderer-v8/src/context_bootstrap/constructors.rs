@@ -1,0 +1,70 @@
+use super::shared::*;
+use crate::{
+    custom_elements,
+    native_bridge::{
+        abort::dom_exception_value, node_runtime_and_handle_from_object,
+        node_runtime_and_handle_from_object_or_detached,
+    },
+    util::{
+        call_global_bridge_method, context_host_ptr_from_global_bridge, global_bridge_method,
+        throw_type_error, v8_string, v8str,
+    },
+};
+use moli_webapi::dom_exception;
+
+use moli_webapi::constructors as core;
+mod custom_elements_registry;
+mod document_nodes;
+mod dom_implementation;
+mod elements;
+mod text_codecs;
+
+pub(super) use core::{
+    event_target_constructor_callback, illegal_constructor_callback, shell_constructor_callback,
+    xpath_evaluator_constructor_callback,
+};
+pub(super) use custom_elements_registry::{
+    custom_elements_registry_constructor_callback,
+    install_custom_element_registry_template_bindings,
+};
+pub(super) use document_nodes::{
+    comment_constructor_callback, document_constructor_callback,
+    document_fragment_constructor_callback, text_constructor_callback,
+};
+pub(crate) use dom_exception::{
+    WebTransportErrorClonePayload, WebTransportErrorSource, build_dom_exception_object,
+    build_quota_exceeded_error_object, dom_error_constructor_callback, dom_exception_clone_fields,
+    dom_exception_constructor_callback, install_dom_exception_template_bindings,
+    new_dom_error_value, new_dom_exception_value, new_most_derived_dom_exception_value,
+    new_quota_exceeded_error_value, new_websocket_error_value, quota_exceeded_error_clone_fields,
+    quota_exceeded_error_constructor_callback, rtc_error_constructor_callback,
+    throw_dom_exception_value, web_transport_error_clone_payload_from_object,
+    web_transport_error_constructor_callback, websocket_error_close_info,
+};
+pub(crate) use dom_implementation::ensure_dom_implementation_singleton;
+pub(super) use dom_implementation::install_dom_implementation_template_bindings;
+pub(super) use elements::{
+    audio_constructor_callback, image_constructor_callback, option_constructor_callback,
+};
+pub(crate) use elements::{
+    html_element_constructor_callback, html_element_constructor_with_early_sanity_trap,
+};
+pub(super) use text_codecs::{
+    install_text_codec_template_bindings, text_decoder_constructor_callback,
+    text_encoder_constructor_callback,
+};
+
+pub(crate) fn build_web_transport_error_from_clone_payload<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    payload: &WebTransportErrorClonePayload,
+) -> Option<v8::Local<'s, v8::Object>> {
+    if !super::exposed_interfaces::is_realm_interface_exposed(scope, "WebTransportError") {
+        throw_dom_exception_value(
+            scope,
+            "WebTransportError is not exposed in this realm.",
+            "DataCloneError",
+        );
+        return None;
+    }
+    dom_exception::build_web_transport_error_from_clone_payload(scope, payload)
+}

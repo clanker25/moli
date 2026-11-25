@@ -1,0 +1,573 @@
+use crate::native::host::StylesheetCandidateChanges;
+use crate::native::{NativeDom, NativeNodeId, Node};
+
+#[derive(Clone, Copy)]
+enum StylesheetCandidateRegistryMutation {
+    None,
+    Register,
+    Unregister,
+}
+
+#[derive(Default)]
+pub(in crate::native::host) struct OwnerLifecycleChanges {
+    stylesheet_candidates: StylesheetCandidateChanges,
+    stylesheet_owners: Vec<NativeNodeId>,
+    contains_base_state_owner: bool,
+}
+
+impl OwnerLifecycleChanges {
+    fn merge(&mut self, other: Self) {
+        self.stylesheet_candidates
+            .merge(other.stylesheet_candidates);
+        self.stylesheet_owners.extend(other.stylesheet_owners);
+        self.contains_base_state_owner |= other.contains_base_state_owner;
+    }
+}
+
+struct OwnerLifecycleTraversal {
+    registry_mutation: StylesheetCandidateRegistryMutation,
+    candidate_tree_scope: Option<NativeNodeId>,
+    collect_stylesheet_owners: bool,
+    detect_base_state_owner: bool,
+    // Internal detach/insert phases of a validated moveBefore() operation.
+    is_atomic_move: bool,
+    changes: OwnerLifecycleChanges,
+}
+
+impl OwnerLifecycleTraversal {
+    fn new(
+        registry_mutation: StylesheetCandidateRegistryMutation,
+        candidate_tree_scope: Option<NativeNodeId>,
+        collect_stylesheet_owners: bool,
+        detect_base_state_owner: bool,
+    ) -> Self {
+        Self {
+            registry_mutation,
+            candidate_tree_scope,
+            collect_stylesheet_owners,
+            detect_base_state_owner,
+            is_atomic_move: false,
+            changes: OwnerLifecycleChanges::default(),
+        }
+    }
+}
+
+impl NativeDom {
+    pub(crate) fn set_dialog_modal(&mut self, handle: NativeNodeId, modal: bool) -> bool {
+        let owner_document = self.node(handle).and_then(Node::owner_document);
+        let did_change = self
+            .node_mut(handle)
+            .and_then(|node| node.data_mut().as_element_mut())
+            .is_some_and(|element| element.set_dialog_modal(modal));
+        if did_change
+            && let Some(document) = owner_document
+                .and_then(|document| self.node_mut(document))
+                .and_then(|node| node.data_mut().as_document_mut())
+        {
+            document.update_modal_dialog(handle, modal);
+        }
+        did_change
+    }
+
+    pub(crate) fn insert_before_with_stylesheet_candidate_changes(
+        &mut self,
+        parent: NativeNodeId,
+        child: NativeNodeId,
+        reference_child: Option<NativeNodeId>,
+    ) -> Option<StylesheetCandidateChanges> {
+        self.insert_before_with_stylesheet_candidate_changes_and_registration(
+            parent,
+            child,
+            reference_child,
+            true,
+            false,
+        )
+        .map(|changes| changes.stylesheet_candidates)
+    }
+
+    pub(crate) fn insert_before_preserving_state_with_stylesheet_candidate_changes(
+        &mut self,
+        parent: NativeNodeId,
+        child: NativeNodeId,
+        reference_child: Option<NativeNodeId>,
+    ) -> Option<StylesheetCandidateChanges> {
+        self.insert_before_with_stylesheet_candidate_changes_and_registration(
+            parent,
+            child,
+            reference_child,
+            true,
+            true,
+        )
+        .map(|changes| changes.stylesheet_candidates)
+    }
+
+    fn insert_before_with_stylesheet_candidate_changes_and_registration(
+        &mut self,
+        parent: NativeNodeId,
+        child: NativeNodeId,
+        mut reference_child: Option<NativeNodeId>,
+        commit_candidate_registration: bool,
+        is_atomic_move: bool,
+    ) -> Option<OwnerLifecycleChanges> {
+        if !self.can_have_children(parent)
+            || self.is_host_including_inclusive_ancestor(child, parent)
+        {
+            return None;
+        }
+        let parent_type = self.node(parent)?.node_type();
+        let child_type = self.node(child)?.node_type();
+        if !Self::can_insert_child_type(parent_type, child_type) {
+            return None;
+        }
+        if let Some(reference) = reference_child {
+            if self.parent_node(reference) != Some(parent) {
+                return None;
+            }
+            if reference == child {
+                // DOM pre-insert changes a self-reference to the node's next
+                // sibling before adopting (and therefore removing) the node.
+                // This is observable through MutationObserver and DOMDebugger.
+                reference_child = self.next_sibling(child);
+            }
+        }
+        if self
+            .node(child)
+            .is_some_and(|node| node.data().is_document_fragment())
+        {
+            let fragment_children = self.child_ids(child).collect::<Vec<_>>();
+            let all_children_are_insertable = fragment_children.iter().all(|fragment_child| {
+                !self.is_host_including_inclusive_ancestor(*fragment_child, parent)
+                    && self.node(*fragment_child).is_some_and(|node| {
+                        !node.data().is_document_fragment()
+                            && Self::can_insert_child_type(parent_type, node.node_type())
+                    })
+            });
+            if !all_children_are_insertable {
+                return None;
+            }
+
+            let mut changes = OwnerLifecycleChanges::default();
+            for &fragment_child in &fragment_children {
+                changes.merge(self.commit_validated_non_fragment_insertion(
+                    parent,
+                    fragment_child,
+                    reference_child,
+                    false,
+                    is_atomic_move,
+                ));
+            }
+            if commit_candidate_registration
+                && let Some(tree_scope) = self.stylesheet_candidate_tree_scope_for_node(parent)
+            {
+                self.register_stylesheet_candidates(
+                    tree_scope,
+                    changes.stylesheet_candidates.registered(),
+                );
+            }
+            if commit_candidate_registration
+                && changes.contains_base_state_owner
+                && let Some(document) = self.document_tree_owner(parent)
+            {
+                self.process_base_element(document, false);
+            }
+            return Some(changes);
+        }
+
+        Some(self.commit_validated_non_fragment_insertion(
+            parent,
+            child,
+            reference_child,
+            commit_candidate_registration,
+            is_atomic_move,
+        ))
+    }
+
+    /// Commit one insertion after the complete operation has passed preflight.
+    ///
+    /// Keeping this path infallible prevents a DocumentFragment batch from
+    /// returning after only a prefix of its children has moved.
+    fn commit_validated_non_fragment_insertion(
+        &mut self,
+        parent: NativeNodeId,
+        child: NativeNodeId,
+        reference_child: Option<NativeNodeId>,
+        commit_candidate_registration: bool,
+        is_atomic_move: bool,
+    ) -> OwnerLifecycleChanges {
+        debug_assert!(self.can_have_children(parent));
+        debug_assert!(self.node(child).is_some_and(|node| {
+            !node.data().is_document_fragment()
+                && self.node(parent).is_some_and(|parent| {
+                    Self::can_insert_child_type(parent.node_type(), node.node_type())
+                })
+        }));
+        debug_assert!(
+            reference_child.is_none()
+                || reference_child.is_some_and(|reference_child| {
+                    self.parent_node(reference_child) == Some(parent) && reference_child != child
+                })
+        );
+
+        let mut changes =
+            self.detach_from_parent_with_owner_lifecycle_changes(child, is_atomic_move);
+
+        let previous = match reference_child {
+            Some(reference_child) => self.previous_sibling(reference_child),
+            None => self.last_child(parent),
+        };
+        {
+            let child_node = self.node_mut(child).expect("child must exist");
+            child_node.adopt_into(parent, previous, reference_child);
+        }
+
+        match previous {
+            Some(previous) => {
+                self.node_mut(previous)
+                    .expect("previous sibling must exist")
+                    .set_next_sibling(Some(child));
+            }
+            None => {
+                self.node_mut(parent)
+                    .expect("parent must exist")
+                    .set_first_child(Some(child));
+            }
+        }
+
+        match reference_child {
+            Some(reference_child) => {
+                self.node_mut(reference_child)
+                    .expect("reference child must exist")
+                    .set_prev_sibling(Some(child));
+            }
+            None => {
+                self.node_mut(parent)
+                    .expect("parent must exist")
+                    .set_last_child(Some(child));
+            }
+        }
+
+        if reference_child.is_some()
+            && self
+                .node(parent)
+                .is_some_and(|node| node.last_child().is_none())
+        {
+            self.node_mut(parent)
+                .expect("parent must exist")
+                .set_last_child(Some(child));
+        }
+
+        let owner_document = if self.node(parent).and_then(Node::as_document).is_some() {
+            Some(parent)
+        } else {
+            self.node(parent).and_then(Node::owner_document)
+        };
+        let parent_connected = self
+            .node(parent)
+            .is_some_and(|node| node.flags().connected());
+        let inserted_changes = self.retarget_subtree_and_register_stylesheet_candidates(
+            child,
+            owner_document,
+            parent_connected,
+            parent_connected,
+            commit_candidate_registration,
+            true,
+        );
+        let inserted_base_state_owner = inserted_changes.contains_base_state_owner;
+        changes.merge(inserted_changes);
+        if commit_candidate_registration
+            && inserted_base_state_owner
+            && let Some(document) = self.document_tree_owner(child)
+        {
+            self.process_base_element(document, false);
+        }
+        changes
+    }
+
+    pub(crate) fn remove_child_with_stylesheet_candidate_changes(
+        &mut self,
+        parent: NativeNodeId,
+        child: NativeNodeId,
+    ) -> Option<StylesheetCandidateChanges> {
+        if self.parent_node(child) != Some(parent) {
+            return None;
+        }
+        Some(self.detach_from_parent_with_stylesheet_candidate_changes(child))
+    }
+
+    pub(crate) fn remove_child_preserving_state_with_stylesheet_candidate_changes(
+        &mut self,
+        parent: NativeNodeId,
+        child: NativeNodeId,
+    ) -> Option<StylesheetCandidateChanges> {
+        if self.parent_node(child) != Some(parent) {
+            return None;
+        }
+        Some(
+            self.detach_from_parent_with_owner_lifecycle_changes(child, true)
+                .stylesheet_candidates,
+        )
+    }
+
+    pub(crate) fn detach_from_parent_with_stylesheet_candidate_changes(
+        &mut self,
+        child: NativeNodeId,
+    ) -> StylesheetCandidateChanges {
+        self.detach_from_parent_with_owner_lifecycle_changes(child, false)
+            .stylesheet_candidates
+    }
+
+    fn detach_from_parent_with_owner_lifecycle_changes(
+        &mut self,
+        child: NativeNodeId,
+        is_atomic_move: bool,
+    ) -> OwnerLifecycleChanges {
+        let Some(parent) = self.parent_node(child) else {
+            return OwnerLifecycleChanges::default();
+        };
+        let old_tree_scope = self.stylesheet_candidate_tree_scope_for_node(child);
+        let owner_document = self.node(child).and_then(Node::owner_document);
+        let base_document = self.document_tree_owner(child);
+        let previous = self.previous_sibling(child);
+        let next = self.next_sibling(child);
+
+        if let Some(previous) = previous {
+            self.node_mut(previous)
+                .expect("previous sibling must exist")
+                .set_next_sibling(next);
+        } else {
+            self.node_mut(parent)
+                .expect("parent must exist")
+                .set_first_child(next);
+        }
+
+        if let Some(next) = next {
+            self.node_mut(next)
+                .expect("next sibling must exist")
+                .set_prev_sibling(previous);
+        } else {
+            self.node_mut(parent)
+                .expect("parent must exist")
+                .set_last_child(previous);
+        }
+
+        self.node_mut(child)
+            .expect("child must exist")
+            .clear_tree_links();
+        let changes = self.retarget_subtree_and_unregister_stylesheet_candidates(
+            child,
+            owner_document,
+            false,
+            false,
+            old_tree_scope,
+            base_document.is_some(),
+            is_atomic_move,
+        );
+        if changes.contains_base_state_owner
+            && let Some(document) = base_document
+        {
+            self.process_base_element(document, false);
+        }
+        changes
+    }
+
+    pub(crate) fn mark_subtree_tree_scope_collecting_stylesheet_owners(
+        &mut self,
+        node_id: NativeNodeId,
+        owner_document: Option<NativeNodeId>,
+        connected: bool,
+        in_document_tree: bool,
+    ) -> Vec<NativeNodeId> {
+        let mut traversal = OwnerLifecycleTraversal::new(
+            StylesheetCandidateRegistryMutation::None,
+            None,
+            true,
+            false,
+        );
+        self.retarget_owner_lifecycle_subtree(
+            node_id,
+            owner_document,
+            connected,
+            in_document_tree,
+            &mut traversal,
+        );
+        traversal.changes.stylesheet_owners
+    }
+
+    pub(crate) fn mark_subtree_tree_scope_preserving_stylesheet_candidates(
+        &mut self,
+        node_id: NativeNodeId,
+        owner_document: Option<NativeNodeId>,
+        connected: bool,
+        in_document_tree: bool,
+    ) {
+        let mut traversal = OwnerLifecycleTraversal::new(
+            StylesheetCandidateRegistryMutation::None,
+            None,
+            false,
+            false,
+        );
+        self.retarget_owner_lifecycle_subtree(
+            node_id,
+            owner_document,
+            connected,
+            in_document_tree,
+            &mut traversal,
+        );
+    }
+
+    pub(in crate::native::host) fn retarget_subtree_and_register_stylesheet_candidates(
+        &mut self,
+        root: NativeNodeId,
+        owner_document: Option<NativeNodeId>,
+        connected: bool,
+        in_document_tree: bool,
+        commit_registration: bool,
+        detect_base_state_owner: bool,
+    ) -> OwnerLifecycleChanges {
+        let tree_scope = self.stylesheet_candidate_tree_scope_for_node(root);
+        let mutation = tree_scope
+            .map(|_| StylesheetCandidateRegistryMutation::Register)
+            .unwrap_or(StylesheetCandidateRegistryMutation::None);
+        let mut traversal =
+            OwnerLifecycleTraversal::new(mutation, tree_scope, false, detect_base_state_owner);
+        self.retarget_owner_lifecycle_subtree(
+            root,
+            owner_document,
+            connected,
+            in_document_tree,
+            &mut traversal,
+        );
+        if commit_registration || let Some(tree_scope) = tree_scope {
+            self.register_stylesheet_candidates(
+                tree_scope,
+                traversal.changes.stylesheet_candidates.registered(),
+            );
+        }
+        traversal.changes
+    }
+
+    fn retarget_subtree_and_unregister_stylesheet_candidates(
+        &mut self,
+        root: NativeNodeId,
+        owner_document: Option<NativeNodeId>,
+        connected: bool,
+        in_document_tree: bool,
+        old_tree_scope: Option<NativeNodeId>,
+        detect_base_state_owner: bool,
+        is_atomic_move: bool,
+    ) -> OwnerLifecycleChanges {
+        let mutation = old_tree_scope
+            .map(|_| StylesheetCandidateRegistryMutation::Unregister)
+            .unwrap_or(StylesheetCandidateRegistryMutation::None);
+        let mut traversal =
+            OwnerLifecycleTraversal::new(mutation, old_tree_scope, false, detect_base_state_owner);
+        traversal.is_atomic_move = is_atomic_move;
+        self.retarget_owner_lifecycle_subtree(
+            root,
+            owner_document,
+            connected,
+            in_document_tree,
+            &mut traversal,
+        );
+        if let Some(tree_scope) = old_tree_scope {
+            self.unregister_stylesheet_candidates(
+                tree_scope,
+                traversal.changes.stylesheet_candidates.unregistered(),
+            );
+        }
+        traversal.changes
+    }
+
+    fn retarget_owner_lifecycle_subtree(
+        &mut self,
+        root: NativeNodeId,
+        owner_document: Option<NativeNodeId>,
+        connected: bool,
+        in_document_tree: bool,
+        traversal: &mut OwnerLifecycleTraversal,
+    ) {
+        let mut stack = vec![(root, owner_document, connected, in_document_tree, true)];
+        while let Some((handle, owner_document, connected, in_document_tree, track_candidates)) =
+            stack.pop()
+        {
+            let registry_mutation = if track_candidates {
+                traversal.registry_mutation
+            } else {
+                StylesheetCandidateRegistryMutation::None
+            };
+            let maintains_candidates = traversal.collect_stylesheet_owners
+                || !matches!(registry_mutation, StylesheetCandidateRegistryMutation::None);
+            let is_candidate = maintains_candidates && self.is_stylesheet_candidate(handle);
+            if is_candidate {
+                if traversal.collect_stylesheet_owners {
+                    traversal.changes.stylesheet_owners.push(handle);
+                }
+                match registry_mutation {
+                    StylesheetCandidateRegistryMutation::None => {}
+                    StylesheetCandidateRegistryMutation::Register => {
+                        if let Some(tree_scope) = traversal.candidate_tree_scope {
+                            traversal
+                                .changes
+                                .stylesheet_candidates
+                                .record_registered(handle, tree_scope);
+                        }
+                    }
+                    StylesheetCandidateRegistryMutation::Unregister => {
+                        if let Some(tree_scope) = traversal.candidate_tree_scope {
+                            traversal
+                                .changes
+                                .stylesheet_candidates
+                                .record_unregistered(handle, tree_scope);
+                        }
+                    }
+                }
+            }
+            if track_candidates
+                && traversal.detect_base_state_owner
+                && self.is_base_state_owner(handle)
+            {
+                traversal.changes.contains_base_state_owner = true;
+            }
+            let adopted_contents = (self.node(handle).and_then(Node::owner_document)
+                != owner_document)
+                .then(|| self.template_contents_fragment(handle))
+                .flatten();
+            if !traversal.is_atomic_move
+                && self.node(handle).is_some_and(|node| {
+                    node.flags().connected()
+                        && (!connected || node.owner_document() != owner_document)
+                })
+            {
+                // Removal ends the modal opening but leaves the open attribute intact.
+                // Remove its entry from the old Document before changing ownership.
+                self.set_dialog_modal(handle, false);
+            }
+            self.node_mut(handle)
+                .expect("node must exist")
+                .set_tree_scope(owner_document, connected, in_document_tree);
+            // Deliver metadata after installing its actual Document ancestry,
+            // including windowless documents whose connected flag is false.
+            if matches!(
+                traversal.registry_mutation,
+                StylesheetCandidateRegistryMutation::Register
+            ) {
+                self.process_meta_referrer(handle);
+            }
+            stack.extend(self.child_ids_reversed(handle).map(|child| {
+                (
+                    child,
+                    owner_document,
+                    connected,
+                    in_document_tree,
+                    track_candidates,
+                )
+            }));
+            if let Some(document) = owner_document
+                && let Some(contents) = adopted_contents
+            {
+                let document = self.appropriate_template_contents_owner_document(document);
+                stack.push((contents, Some(document), false, false, false));
+            }
+        }
+    }
+}

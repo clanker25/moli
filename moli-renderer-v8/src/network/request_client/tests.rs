@@ -1,0 +1,2160 @@
+mod module_destination_cache;
+mod websocket;
+
+use anyhow::Result;
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    sync::oneshot,
+    time::{Duration, sleep, timeout},
+};
+use url::Url;
+
+use moli_cookie_jar::{
+    BrowserCookieFacadeContext, NetworkCookieRequestContext, new_shared_browser_cookie_store,
+};
+use moli_fetch::{
+    BrowserRequestMetadata, FetchCancelHandle, RawResponse, RedirectInfo, RequestCredentialsMode,
+    RequestMode, RequestResourceType, ResponseHead, ScriptFetchRequestMetadata,
+    StreamingRawResponse, cookie_header_for_request,
+};
+
+use super::{
+    FetchConfig, Request, ResourceRequestClient, raw_subresource_memory_cache_key,
+    streaming_raw_response_from_cached_subresource,
+};
+use crate::network::{BrowserResourceRuntimeOwner, BrowserResourceRuntimeOwnerRoot};
+use crate::protocol_types::OptionalResourceFetchMask;
+use crate::types::{SubresourceResourceType, SubresourceResponseBodyWriter};
+
+// These transport/cache tests use browser navigation semantics; origin policy
+// tests below construct their own explicit origin.
+fn browser_navigation_request(url: &str) -> Result<Request> {
+    Ok(Request::get(url)?.with_request_origin(moli_url::WebOrigin::Opaque))
+}
+
+#[test]
+fn cached_script_completion_unlocks_and_updates_cache_before_notifying_consumers() -> Result<()> {
+    let owner = ResourceRequestClient::new(&FetchConfig::default())?;
+    let client = owner.handle();
+    let request = Request::get("https://example.test/app.js")?
+        .with_script_fetch_metadata(moli_fetch::ScriptFetchRequestMetadata::default());
+    let (key, lookup) = client.lookup_cached_script_text(&request, "test");
+    let super::ScriptTextCacheLookup::Owner(subscription) = lookup else {
+        panic!("first script load owns the download");
+    };
+    let load = Arc::clone(subscription.load());
+    let runtime = client.resource_runtime.clone();
+    let lookup_key = key.clone();
+    let notified = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let notification = Arc::clone(&notified);
+    let _consumer = subscription.wait_callback(Box::new(move |result| {
+        let mut cache = runtime
+            .memory_cache()
+            .try_lock()
+            .expect("callback may reenter cache");
+        assert!(matches!(
+            cache.lookup_script_text(lookup_key),
+            super::ScriptTextCacheLookup::CompletedHit(_)
+        ));
+        assert_eq!(result.unwrap().body_text(), "loaded");
+        notification.store(true, std::sync::atomic::Ordering::Relaxed);
+    }));
+    let response = moli_fetch::Response::from_head_and_text_body(
+        ResponseHead {
+            final_url: request.url.clone(),
+            status: 200,
+            status_text: None,
+            headers: vec![("cache-control".into(), b"max-age=60".to_vec())],
+            request_cookie_report: None,
+            cookie_set_reports: Vec::new(),
+            redirected: false,
+            redirect_chain: Vec::new(),
+            from_cache: false,
+            cache_state: Default::default(),
+            negotiated_http_version: None,
+        },
+        "loaded".into(),
+    );
+    client.complete_cached_script_text_load(&key, &load, &request, Ok(response));
+    assert!(notified.load(std::sync::atomic::Ordering::Relaxed));
+    Ok(())
+}
+
+#[test]
+fn browser_client_rejects_http_requests_even_with_an_initiator() -> Result<()> {
+    let owner = ResourceRequestClient::new(&FetchConfig::default())?;
+    let url = Url::parse("https://example.test/")?;
+    let http = Request::get_with_url(url.clone()).with_initiator_url(&url);
+    assert!(http.request_origin().is_none());
+    let error = owner.handle().apply_network_policy(http).unwrap_err();
+    assert!(error.to_string().contains("explicit environment origin"));
+
+    let browser = Request::new_browser("GET", url.clone(), None, Vec::new(), (&url).into());
+    owner.handle().apply_network_policy(browser)?;
+    Ok(())
+}
+
+#[test]
+fn loader_clones_share_one_browser_resource_runtime() {
+    let loader = ResourceRequestClient::new(&FetchConfig::default()).expect("loader");
+    let clone = loader.clone();
+
+    assert!(loader.shares_resource_runtime_with(&clone));
+    assert!(loader.shares_page_network_policy_with(&clone));
+    assert_eq!(
+        loader.resource_runtime_diagnostics().runtime_id,
+        clone.resource_runtime_diagnostics().runtime_id
+    );
+}
+
+#[test]
+fn loader_clones_share_one_resource_disk_pool() {
+    let loader = ResourceRequestClient::new(&FetchConfig::default()).expect("loader");
+    let clone = loader.clone();
+    let pool = loader
+        .disk_pool()
+        .expect("resource runtime should create one disk pool");
+    let mut writer =
+        SubresourceResponseBodyWriter::with_memory_limit_and_disk_pool(2, clone.disk_pool());
+    writer.append(b"shared");
+    let body = writer.finish();
+
+    assert_eq!(body.materialize_bytes().unwrap(), b"shared");
+    assert_eq!(pool.diagnostics().disk_footprint_bytes, 6);
+    assert_eq!(
+        loader
+            .resource_runtime_diagnostics()
+            .disk_pool
+            .expect("disk pool diagnostics should be present")
+            .disk_footprint_bytes,
+        6
+    );
+    drop(body);
+    assert_eq!(pool.diagnostics().free_bytes, 6);
+}
+
+#[test]
+fn loader_clones_share_one_parkable_image_manager() {
+    let loader = ResourceRequestClient::new(&FetchConfig::default()).expect("loader");
+    let clone = loader.clone();
+    // Test shared ownership without a concurrent sweep temporarily retaining
+    // the image. Background scheduling has its own live-runtime coverage.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("image-manager ownership test runtime");
+    let runner =
+        crate::network::RendererResourceTaskRunner::from_tokio_handle(runtime.handle().clone());
+    let image = loader
+        .parkable_image_manager(&runner)
+        .from_frozen_bytes(vec![7; 2 * 1024]);
+
+    assert_eq!(
+        clone
+            .resource_runtime_diagnostics()
+            .parkable_images
+            .image_count,
+        1
+    );
+    assert_eq!(
+        clone
+            .resource_runtime_diagnostics()
+            .parkable_images
+            .retained_memory_bytes,
+        2 * 1024
+    );
+    drop(image);
+    assert_eq!(
+        loader
+            .resource_runtime_diagnostics()
+            .parkable_images
+            .image_count,
+        0
+    );
+}
+
+#[test]
+fn page_loader_fork_shares_backend_but_isolates_mutable_policy() {
+    let parent_owner = ResourceRequestClient::new(&FetchConfig::default()).expect("parent loader");
+    let parent = parent_owner.handle().with_browser_site_context(
+        BrowserCookieFacadeContext::default()
+            .with_site_for_cookies_url(&Url::parse("https://parent.test/").unwrap())
+            .with_top_frame_origin_url(&Url::parse("https://parent.test/").unwrap()),
+    );
+    parent.set_extra_http_headers(&vec![("x-page".to_owned(), "parent".to_owned())].into());
+    let page = parent.fork_with_isolated_page_network_policy();
+
+    assert!(parent.shares_resource_runtime_with(&page));
+    assert!(!parent.shares_page_network_policy_with(&page));
+    assert_ne!(
+        parent.page_network_policy().memory_cache_partition_id(),
+        page.page_network_policy().memory_cache_partition_id(),
+        "a new Page target must own a distinct renderer memory-cache partition"
+    );
+    assert!(page.browser_site_context().is_none());
+
+    page.set_network_offline(true);
+    page.set_extra_http_headers(&vec![("x-page".to_owned(), "child".to_owned())].into());
+
+    assert!(!parent.page_network_policy().snapshot().network_offline());
+    assert!(page.page_network_policy().snapshot().network_offline());
+}
+
+#[test]
+fn document_loader_fork_keeps_page_memory_cache_ownership() {
+    let owner = ResourceRequestClient::new(&FetchConfig::default()).expect("Page loader");
+    let document = owner.fork_with_isolated_document_network_policy();
+
+    assert!(owner.shares_resource_runtime_with(&document));
+    assert!(!owner.shares_page_network_policy_with(&document));
+    assert_eq!(
+        owner.page_network_policy().memory_cache_partition_id(),
+        document.page_network_policy().memory_cache_partition_id(),
+        "replacement Documents must retain their Page's memory-cache partition"
+    );
+}
+
+#[test]
+fn worker_loader_fork_preserves_creator_browser_site_context() {
+    let context = BrowserCookieFacadeContext::default()
+        .with_site_for_cookies_url(&Url::parse("https://top.test/").unwrap())
+        .with_top_frame_origin_url(&Url::parse("https://top.test/").unwrap());
+    let parent_owner = ResourceRequestClient::new(&FetchConfig::default()).expect("parent loader");
+    let parent = parent_owner
+        .handle()
+        .with_browser_site_context(context.clone());
+
+    let worker = parent.fork_with_isolated_worker_network_policy();
+
+    assert!(parent.shares_resource_runtime_with(&worker));
+    assert!(!parent.shares_page_network_policy_with(&worker));
+    assert!(parent.shares_memory_cache_partition_with(&worker));
+    assert_eq!(worker.browser_site_context(), Some(&context));
+}
+
+#[test]
+fn loader_cookie_policy_preserves_destination_frame_partition_and_parent_settings() -> Result<()> {
+    use moli_cookie_jar::{NetworkStorageAccessStatus, StoredCookiePartitionKey};
+    let top = Url::parse("https://top.test/")?;
+    let frame = Url::parse("https://frame.test/")?;
+    let owner = ResourceRequestClient::new(&FetchConfig::default())?;
+    let parent_context = BrowserCookieFacadeContext::default()
+        .with_site_for_cookies_url(&top)
+        .with_top_frame_origin_url(&top)
+        .with_storage_access_status(NetworkStorageAccessStatus::Granted)
+        .with_cookie_partition_key(StoredCookiePartitionKey::site(
+            "https://top.test".into(),
+            false,
+        ));
+    let loader = owner
+        .handle()
+        .with_browser_site_context(parent_context.clone());
+    let key = moli_storage_key::MoliStorageKey::from_url_and_top_level_site(
+        &frame,
+        "https://top.test".into(),
+        None,
+    )
+    .serialized_storage_key();
+    let request = browser_navigation_request(frame.as_str())?
+        .with_subframe_navigation_cookie_context()
+        .with_network_partition_key(Some(key.clone()));
+    let prepared = loader.apply_network_policy(request)?;
+    let context = &prepared.cookie_context.browser_context;
+    assert_eq!(
+        context.cookie_partition_key,
+        Some(StoredCookiePartitionKey::site(
+            "https://top.test".into(),
+            true
+        ))
+    );
+    assert_eq!(context.site_for_cookies_url, Some(top));
+    assert_eq!(
+        context.storage_access_status,
+        NetworkStorageAccessStatus::Granted
+    );
+    assert_eq!(prepared.network_partition_key(), Some(key.as_str()));
+    let inherited = loader.apply_network_policy(browser_navigation_request(frame.as_str())?)?;
+    assert_eq!(inherited.cookie_context.browser_context, parent_context);
+    Ok(())
+}
+
+#[test]
+fn independently_created_loaders_use_isolated_browser_resource_runtimes() {
+    let left = ResourceRequestClient::new(&FetchConfig::default()).expect("left loader");
+    let right = ResourceRequestClient::new(&FetchConfig::default()).expect("right loader");
+
+    assert!(!left.shares_resource_runtime_with(&right));
+    assert_ne!(
+        left.resource_runtime_diagnostics().runtime_id,
+        right.resource_runtime_diagnostics().runtime_id
+    );
+
+    let runner = crate::network::RendererResourceTaskRunner::for_test();
+    let _left_image = left
+        .parkable_image_manager(&runner)
+        .from_frozen_bytes(vec![1; 1024]);
+    assert_eq!(
+        left.resource_runtime_diagnostics()
+            .parkable_images
+            .image_count,
+        1
+    );
+    assert_eq!(
+        right
+            .resource_runtime_diagnostics()
+            .parkable_images
+            .image_count,
+        0
+    );
+
+    let left_data = left
+        .disk_pool()
+        .expect("left runtime should have a disk pool")
+        .store(b"left")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        left.resource_runtime_diagnostics()
+            .disk_pool
+            .unwrap()
+            .disk_footprint_bytes,
+        4
+    );
+    assert_eq!(
+        right
+            .resource_runtime_diagnostics()
+            .disk_pool
+            .unwrap()
+            .disk_footprint_bytes,
+        0
+    );
+    drop(left_data);
+}
+
+fn unique_test_cache_dir() -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "moli-renderer-v8-cache-test-{}-{unique}",
+        std::process::id()
+    ))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_cache_tee_drop_after_body_eof_cancels_pending_completion_and_releases_exact_runtime()
+-> Result<()> {
+    let registration = BrowserResourceRuntimeOwner::new(
+        &FetchConfig::default(),
+        new_shared_browser_cookie_store(),
+    );
+    let (root, binding) = BrowserResourceRuntimeOwnerRoot::new(registration);
+    let registrar = root.registrar();
+    let old_runtime = binding.current();
+    let client = ResourceRequestClient::from_browser_resource_runtime(old_runtime.clone());
+    let request = browser_navigation_request("https://cache.test/last-chunk.css")?
+        .with_resource_type(RequestResourceType::CssStyleSheet);
+    let cache_key = raw_subresource_memory_cache_key(&request)
+        .expect("stylesheet request should use the raw subresource memory cache");
+
+    let (body_tx, body_rx) = tokio::sync::mpsc::unbounded_channel();
+    body_tx
+        .send(b"last".to_vec())
+        .expect("fake upstream body receiver should be live");
+    drop(body_tx);
+    let cancel_handle = FetchCancelHandle::new();
+    let (mut completion_tx, completion_rx) = oneshot::channel();
+    let inner = StreamingRawResponse::new_with_head(
+        ResponseHead {
+            status_text: None,
+            final_url: request.url.clone(),
+            status: 200,
+            headers: vec![("cache-control".to_owned(), b"max-age=60".to_vec())],
+            request_cookie_report: None,
+            cookie_set_reports: Vec::new(),
+            redirected: false,
+            redirect_chain: Vec::new(),
+            from_cache: false,
+            cache_state: Default::default(),
+            negotiated_http_version: None,
+        },
+        body_rx,
+        cancel_handle.clone(),
+        completion_rx,
+    )
+    .with_lifetime_lease(old_runtime.clone());
+    let (body_eof_tx, body_eof_rx) = oneshot::channel();
+    let mut outward = client.tee_raw_subresource_response_for_memory_cache_with_body_eof_observer(
+        request,
+        cache_key,
+        inner,
+        Some(body_eof_tx),
+    );
+
+    let replacement = registrar
+        .replace_owned(BrowserResourceRuntimeOwner::new(
+            &FetchConfig::default(),
+            new_shared_browser_cookie_store(),
+        ))
+        .expect("replacement runtime should register on the same root");
+    drop(replacement);
+    drop(client);
+    drop(old_runtime);
+    assert_eq!(root.owner_count_for_testing(), 2);
+
+    assert_eq!(outward.next_chunk().await.as_deref(), Some(&b"last"[..]));
+    body_eof_rx
+        .await
+        .expect("tee should observe upstream body EOF before completion");
+    assert!(
+        !completion_tx.is_closed(),
+        "upstream completion must remain pending at the test barrier"
+    );
+
+    drop(outward);
+    completion_tx.closed().await;
+    assert!(
+        cancel_handle.is_cancelled(),
+        "dropping the outward response must cancel the pending inner response"
+    );
+
+    let retired_reports = root.reap_retired();
+    assert_eq!(retired_reports.len(), 1);
+    assert!(retired_reports[0].is_clean());
+    assert_eq!(root.owner_count_for_testing(), 1);
+    let active_reports = root.shutdown_and_join_reports_for_testing();
+    assert_eq!(active_reports.len(), 1);
+    assert!(active_reports[0].is_clean());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_cacheable_stream_stalled_between_chunks_cancels_real_fetch_and_reaps_exact_owner()
+-> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let (disconnected_tx, disconnected_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        read_http_request_head(&mut stream).await?;
+        stream
+            .write_all(
+                concat!(
+                    "HTTP/1.1 200 OK\r\n",
+                    "Content-Type: text/css\r\n",
+                    "Cache-Control: max-age=60\r\n",
+                    "Transfer-Encoding: chunked\r\n",
+                    "\r\n",
+                    "4\r\n",
+                    "a{}b\r\n",
+                )
+                .as_bytes(),
+            )
+            .await?;
+
+        // The next response chunk is deliberately never published. A read is
+        // an exact cancellation witness: no further HTTP request bytes are
+        // expected, so EOF means the client closed the in-progress transfer.
+        let mut byte = [0_u8; 1];
+        let disconnected = stream.read(&mut byte).await? == 0;
+        let _ = disconnected_tx.send(disconnected);
+        Ok::<_, std::io::Error>(())
+    });
+
+    let registration = BrowserResourceRuntimeOwner::new(
+        &FetchConfig::default(),
+        new_shared_browser_cookie_store(),
+    );
+    let (root, binding) = BrowserResourceRuntimeOwnerRoot::new(registration);
+    let registrar = root.registrar();
+    let old_runtime = binding.current();
+    let client = ResourceRequestClient::from_browser_resource_runtime(old_runtime.clone());
+    let cancel_handle = FetchCancelHandle::new();
+    let request = browser_navigation_request(&format!("http://{addr}/stalled.css"))?
+        .with_resource_type(RequestResourceType::CssStyleSheet);
+    assert!(
+        raw_subresource_memory_cache_key(&request).is_some(),
+        "the request must exercise the renderer memory-cache tee"
+    );
+    let mut outward = client
+        .fetch_raw_stream_with_cancel(request, cancel_handle.clone())
+        .await?;
+    assert_eq!(outward.next_chunk().await.as_deref(), Some(&b"a{}b"[..]));
+
+    let replacement = registrar
+        .replace_owned(BrowserResourceRuntimeOwner::new(
+            &FetchConfig::default(),
+            new_shared_browser_cookie_store(),
+        ))
+        .expect("replacement runtime should register on the same root");
+    drop(replacement);
+    drop(client);
+    drop(old_runtime);
+    assert_eq!(root.owner_count_for_testing(), 2);
+
+    drop(outward);
+    assert!(
+        timeout(Duration::from_secs(3), disconnected_rx).await??,
+        "the server must observe cancellation while stalled between chunks"
+    );
+    assert!(
+        cancel_handle.is_cancelled(),
+        "dropping the outward tee must cancel its exact inner fetch"
+    );
+
+    let retired_reports = root.reap_retired();
+    assert_eq!(retired_reports.len(), 1);
+    assert!(
+        retired_reports[0].is_clean(),
+        "the exact retired fetch owner must join cleanly: {:?}",
+        retired_reports[0]
+    );
+    let active_reports = root.shutdown_and_join_reports_for_testing();
+    assert_eq!(active_reports.len(), 1);
+    assert!(active_reports[0].is_clean());
+    server.await??;
+    Ok(())
+}
+
+async fn read_http_request_head(stream: &mut tokio::net::TcpStream) -> std::io::Result<()> {
+    let mut request = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        let read = stream.read(&mut byte).await?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "client closed before sending complete request",
+            ));
+        }
+        request.push(byte[0]);
+        if request.ends_with(b"\r\n\r\n") {
+            return Ok(());
+        }
+    }
+}
+
+async fn read_http_request_text(stream: &mut tokio::net::TcpStream) -> std::io::Result<String> {
+    let mut request = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        let read = stream.read(&mut byte).await?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "client closed before sending complete request",
+            ));
+        }
+        request.push(byte[0]);
+        if request.ends_with(b"\r\n\r\n") {
+            return String::from_utf8(request).map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+            });
+        }
+    }
+}
+
+#[test]
+fn merge_loader_network_policy_headers_uses_header_name_keys_and_request_order() {
+    let policy = super::PageNetworkPolicy::default();
+    policy.set_extra_http_headers(
+        &vec![
+            ("X-Test".to_owned(), "context".to_owned()),
+            ("Accept".to_owned(), "text/html".to_owned()),
+        ]
+        .into(),
+    );
+    let mut request = browser_navigation_request("https://example.test/headers")
+        .unwrap()
+        .with_page_network_policy();
+    request.request_headers = vec![
+        ("x-test".to_owned(), "request".to_owned()),
+        ("X-New".to_owned(), "new".to_owned()),
+    ]
+    .into();
+    let merged = policy
+        .snapshot()
+        .apply_to_request(request)
+        .unwrap()
+        .request_headers;
+
+    assert_eq!(
+        merged.to_byte_strings(),
+        vec![
+            ("Accept".to_owned(), "text/html".to_owned()),
+            ("x-test".to_owned(), "request".to_owned()),
+            ("X-New".to_owned(), "new".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn csp_report_subresource_maps_to_csp_report_request_type() {
+    assert_eq!(
+        crate::network::request_resource_type_for_subresource(SubresourceResourceType::CspReport),
+        Some(RequestResourceType::CspReport)
+    );
+    assert_eq!(
+        SubresourceResourceType::CspReport.as_cdp_type(),
+        "CSPViolationReport"
+    );
+}
+
+#[test]
+fn dictionary_subresource_maps_to_dictionary_request_type_and_other_cdp_type() {
+    assert_eq!(
+        crate::network::request_resource_type_for_subresource(SubresourceResourceType::Dictionary),
+        Some(RequestResourceType::Dictionary)
+    );
+    assert_eq!(SubresourceResourceType::Dictionary.as_cdp_type(), "Other");
+}
+
+#[test]
+fn audio_video_subresources_keep_media_request_type_and_cdp_type() {
+    assert_eq!(
+        crate::network::request_resource_type_for_subresource(SubresourceResourceType::Audio),
+        Some(RequestResourceType::Media)
+    );
+    assert_eq!(
+        crate::network::request_resource_type_for_subresource(SubresourceResourceType::Video),
+        Some(RequestResourceType::Media)
+    );
+    assert_eq!(SubresourceResourceType::Audio.as_cdp_type(), "Media");
+    assert_eq!(SubresourceResourceType::Video.as_cdp_type(), "Media");
+}
+
+#[test]
+fn loader_disables_every_optional_resource_family_by_default() {
+    let loader = ResourceRequestClient::new(&FetchConfig::default()).expect("loader");
+    let optional = [
+        SubresourceResourceType::Image,
+        SubresourceResourceType::Font,
+        SubresourceResourceType::Audio,
+        SubresourceResourceType::Video,
+        SubresourceResourceType::Media,
+        SubresourceResourceType::TextTrack,
+    ];
+
+    assert_eq!(
+        loader.optional_resource_fetch_mask(),
+        OptionalResourceFetchMask::NONE
+    );
+    for resource_type in optional {
+        assert!(
+            !loader.optional_resource_fetch_enabled(resource_type),
+            "{resource_type:?} must be disabled on a default loader"
+        );
+    }
+    for resource_type in [
+        SubresourceResourceType::Script,
+        SubresourceResourceType::Stylesheet,
+        SubresourceResourceType::Fetch,
+        SubresourceResourceType::Xhr,
+    ] {
+        assert!(
+            loader.optional_resource_fetch_enabled(resource_type),
+            "{resource_type:?} must remain outside this policy"
+        );
+    }
+}
+
+#[test]
+fn loader_preserves_each_optional_resource_bit_without_aliasing() {
+    let resources = [
+        (
+            SubresourceResourceType::Image,
+            OptionalResourceFetchMask::IMAGE,
+        ),
+        (
+            SubresourceResourceType::Font,
+            OptionalResourceFetchMask::FONT,
+        ),
+        (
+            SubresourceResourceType::Audio,
+            OptionalResourceFetchMask::AUDIO,
+        ),
+        (
+            SubresourceResourceType::Video,
+            OptionalResourceFetchMask::VIDEO,
+        ),
+        (
+            SubresourceResourceType::Media,
+            OptionalResourceFetchMask::MEDIA,
+        ),
+        (
+            SubresourceResourceType::TextTrack,
+            OptionalResourceFetchMask::TEXT_TRACK,
+        ),
+    ];
+    let loader = ResourceRequestClient::new(&FetchConfig::default()).expect("loader");
+
+    for (enabled_type, enabled_bit) in resources {
+        loader.set_optional_resource_fetch_mask(enabled_bit);
+        assert_eq!(loader.optional_resource_fetch_mask(), enabled_bit);
+        for (observed_type, _) in resources {
+            assert_eq!(
+                loader.optional_resource_fetch_enabled(observed_type),
+                observed_type == enabled_type,
+                "enabling {enabled_type:?} changed {observed_type:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn loader_image_compatibility_switch_preserves_other_resource_bits() {
+    let loader = ResourceRequestClient::new(&FetchConfig::default()).expect("loader");
+    let preserved = OptionalResourceFetchMask::AUDIO | OptionalResourceFetchMask::FONT;
+    loader.set_optional_resource_fetch_mask(preserved);
+
+    loader.set_image_fetch_enabled(true);
+    assert_eq!(
+        loader.optional_resource_fetch_mask(),
+        preserved | OptionalResourceFetchMask::IMAGE
+    );
+
+    loader.set_image_fetch_enabled(false);
+    assert_eq!(loader.optional_resource_fetch_mask(), preserved);
+}
+
+#[test]
+fn memory_caches_partition_explicit_origin_independently_of_referrer() -> Result<()> {
+    let url = Url::parse("https://scripts.test/app.js")?;
+    let origin = moli_url::WebOrigin::from_url(&url);
+    let request = Request::new_browser("GET", url.clone(), None, Vec::new(), origin)
+        .with_initiator_url(&url)
+        .with_resource_type(RequestResourceType::CssStyleSheet)
+        .with_script_fetch_metadata(ScriptFetchRequestMetadata::default());
+    let opaque = request
+        .clone()
+        .with_request_origin(moli_url::WebOrigin::Opaque);
+    let no_cors = request
+        .clone()
+        .with_request_mode(moli_fetch::RequestMode::NoCors);
+    for other in [opaque, no_cors] {
+        assert_ne!(
+            super::script_text_cache_key(&request),
+            super::script_text_cache_key(&other)
+        );
+        assert_ne!(
+            raw_subresource_memory_cache_key(&request),
+            raw_subresource_memory_cache_key(&other)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn script_text_memory_cache_key_partitions_credentials_and_cookie_context() -> Result<()> {
+    let url = Url::parse("https://scripts.test/app.js")?;
+    let base_request = || {
+        browser_navigation_request(url.as_str())
+            .unwrap()
+            .with_script_fetch_metadata(ScriptFetchRequestMetadata::default())
+    };
+
+    let include_key = super::script_text_cache_key(
+        &base_request().with_credentials_mode(RequestCredentialsMode::Include),
+    );
+    let omit_key = super::script_text_cache_key(
+        &base_request().with_credentials_mode(RequestCredentialsMode::Omit),
+    );
+    assert_ne!(
+        include_key, omit_key,
+        "script text cache must not share responses across credentials modes"
+    );
+
+    let same_origin = Url::parse("https://scripts.test/page")?;
+    let cross_origin = Url::parse("https://other.test/page")?;
+    let mut same_site_request = base_request();
+    same_site_request.cookie_context =
+        NetworkCookieRequestContext::subresource("GET").with_initiator_url(&url, &same_origin);
+    let mut cross_site_request = base_request();
+    cross_site_request.cookie_context =
+        NetworkCookieRequestContext::subresource("GET").with_initiator_url(&url, &cross_origin);
+
+    assert_ne!(
+        super::script_text_cache_key(&same_site_request),
+        super::script_text_cache_key(&cross_site_request),
+        "script text cache must not share responses across cookie contexts"
+    );
+
+    let first_page = Url::parse("https://scripts.test/first-page")?;
+    let second_page = Url::parse("https://scripts.test/second-page")?;
+    let mut first_page_request = base_request();
+    first_page_request.cookie_context =
+        NetworkCookieRequestContext::subresource("GET").with_initiator_url(&url, &first_page);
+    let mut second_page_request = base_request();
+    second_page_request.cookie_context =
+        NetworkCookieRequestContext::subresource("GET").with_initiator_url(&url, &second_page);
+    assert_eq!(
+        super::script_text_cache_key(&first_page_request),
+        super::script_text_cache_key(&second_page_request),
+        "same-site page URL changes should not partition reusable script/module responses"
+    );
+
+    let first_partition_key = base_request().with_network_partition_key(Some(
+        "storage-key:v1;origin=https://scripts.test;top-level-site=https://app.example.test;opaque-nonce=1"
+            .to_owned(),
+    ));
+    let second_partition_key = base_request().with_network_partition_key(Some(
+        "storage-key:v1;origin=https://scripts.test;top-level-site=https://app.example.test;opaque-nonce=2"
+            .to_owned(),
+    ));
+    assert_ne!(
+        super::script_text_cache_key(&first_partition_key),
+        super::script_text_cache_key(&second_partition_key),
+        "script text cache must not share responses across network partition keys"
+    );
+
+    let no_integrity_key = super::script_text_cache_key(&base_request());
+    let integrity_key = super::script_text_cache_key(&base_request().with_script_fetch_metadata(
+        ScriptFetchRequestMetadata {
+            integrity: Some("sha384-integrity".to_owned()),
+            ..ScriptFetchRequestMetadata::default()
+        },
+    ));
+    assert_ne!(
+        no_integrity_key, integrity_key,
+        "script text cache must not share responses across integrity metadata"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_fetch_commits_set_cookie_before_body_completion() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_http_request_head(&mut stream).await.unwrap();
+        stream
+            .write_all(
+                concat!(
+                    "HTTP/1.1 200 OK\r\n",
+                    "Content-Type: text/html; charset=utf-8\r\n",
+                    "Set-Cookie: sid=server; Path=/\r\n",
+                    "Transfer-Encoding: chunked\r\n",
+                    "\r\n",
+                    "c\r\n",
+                    "hello world!\r\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(100)).await;
+        stream.write_all(b"0\r\n\r\n").await.unwrap();
+    });
+
+    let cookie_store = new_shared_browser_cookie_store();
+    let loader = ResourceRequestClient::new_with_cookie_store(
+        &FetchConfig::default(),
+        Arc::clone(&cookie_store),
+    )?;
+    let request = browser_navigation_request(&format!("http://{addr}/stream"))?;
+    let mut response = loader
+        .fetch_raw_stream_with_cancel(request, FetchCancelHandle::new())
+        .await?;
+
+    assert_eq!(
+        cookie_header_for_request(
+            &cookie_store,
+            &Url::parse(&format!("http://{addr}/subresource"))?,
+            NetworkCookieRequestContext::subresource("GET"),
+        )?,
+        Some("sid=server".to_owned())
+    );
+    assert_eq!(
+        response.next_chunk().await.as_deref(),
+        Some(&b"hello world!"[..])
+    );
+
+    response.finish().await?;
+    server.await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_streaming_response_cancels_the_source_transfer() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let (disconnect_tx, disconnect_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_http_request_head(&mut stream).await.unwrap();
+        stream
+            .write_all(
+                concat!(
+                    "HTTP/1.1 200 OK\r\n",
+                    "Content-Type: text/html; charset=utf-8\r\n",
+                    "Transfer-Encoding: chunked\r\n",
+                    "\r\n",
+                    "1\r\n",
+                    "a\r\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut disconnected = false;
+        for _ in 0..200 {
+            sleep(Duration::from_millis(10)).await;
+            if stream.write_all(b"1\r\na\r\n").await.is_err() {
+                disconnected = true;
+                break;
+            }
+        }
+        let _ = disconnect_tx.send(disconnected);
+    });
+
+    let loader = ResourceRequestClient::new(&FetchConfig::default())?;
+    let request = browser_navigation_request(&format!("http://{addr}/stream"))?;
+    let mut response = loader
+        .fetch_raw_stream_with_cancel(request, FetchCancelHandle::new())
+        .await?;
+
+    assert_eq!(response.next_chunk().await.as_deref(), Some(&b"a"[..]));
+    drop(response);
+
+    assert!(
+        timeout(Duration::from_secs(3), disconnect_rx).await??,
+        "server never observed the client cancelling the streaming response"
+    );
+
+    server.await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn browser_resource_text_rejects_cors_redirect_destination_before_reading_body() -> Result<()>
+{
+    let source = TcpListener::bind("127.0.0.1:0").await?;
+    let source_url = Url::parse(&format!("http://{}/start", source.local_addr()?))?;
+    let destination = TcpListener::bind("127.0.0.1:0").await?;
+    let destination_url = format!("http://{}/final", destination.local_addr()?);
+    let redirect = tokio::spawn(async move {
+        let (mut stream, _) = source.accept().await?;
+        read_http_request_head(&mut stream).await?;
+        let response = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: {destination_url}\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(response.as_bytes()).await
+    });
+    let (release_body, body_gate) = oneshot::channel();
+    let final_response = tokio::spawn(async move {
+        let (mut stream, _) = destination.accept().await?;
+        let request = read_http_request_text(&mut stream).await?;
+        assert!(
+            request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("Origin: null"))
+        );
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n")
+            .await?;
+        let _ = body_gate.await;
+        Ok::<_, std::io::Error>(())
+    });
+
+    let loader = ResourceRequestClient::new(&FetchConfig::default())?;
+    let document_url = Url::parse("http://document.test/page")?;
+    let request = Request::new_browser("GET", source_url, None, Vec::new(), (&document_url).into())
+        .with_initiator_url(&document_url)
+        .with_request_mode(RequestMode::Cors)
+        .with_credentials_mode(RequestCredentialsMode::SameOrigin)
+        .with_browser_request_metadata(BrowserRequestMetadata::Fetch);
+    let error = timeout(
+        Duration::from_secs(5),
+        loader.fetch_browser_resource_text(request),
+    )
+    .await?
+    .expect_err("reject the CORS response while its body is still pending");
+    assert_eq!(
+        error.to_string(),
+        "CORS check failed: no Access-Control-Allow-Origin for null"
+    );
+    let _ = release_body.send(());
+    redirect.await??;
+    final_response.await??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn browser_resource_text_checks_cors_on_a_shared_script_cache_hit() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let url = Url::parse(&format!("http://{}/app.js", listener.local_addr()?))?;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        read_http_request_head(&mut stream).await?;
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nCache-Control: max-age=60\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnull").await
+    });
+
+    let loader = ResourceRequestClient::new(&FetchConfig::default())?;
+    let document_url = Url::parse("http://document.test/page")?;
+    let request = Request::new_browser("GET", url, None, Vec::new(), (&document_url).into())
+        .with_initiator_url(&document_url)
+        .with_request_mode(RequestMode::Cors)
+        .with_credentials_mode(RequestCredentialsMode::SameOrigin)
+        .with_browser_request_metadata(BrowserRequestMetadata::Script)
+        .with_script_fetch_metadata(ScriptFetchRequestMetadata::default());
+    loader
+        .fetch_cacheable_script_text_stream(request.clone())
+        .await?;
+    server.await??;
+
+    let error = loader
+        .fetch_browser_resource_text(request)
+        .await
+        .expect_err("a shared transport response must still pass the resource's CORS check");
+    assert_eq!(
+        error.to_string(),
+        "CORS check failed: no Access-Control-Allow-Origin for http://document.test"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn text_stream_fetch_uses_disk_cache_for_safe_gets() -> Result<()> {
+    let cache_dir = unique_test_cache_dir();
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_http_request_head(&mut stream).await.unwrap();
+        let body = "cached-renderer-text-stream";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: max-age=60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    });
+
+    let mut config = FetchConfig::default();
+    config.set_http_cache_dir(Some(cache_dir.display().to_string()));
+    let loader = ResourceRequestClient::new(&config)?;
+    let url = format!("http://{addr}/cacheable.txt");
+
+    let first = loader
+        .fetch_text_stream(browser_navigation_request(&url)?.with_page_network_policy())
+        .await?;
+    let second = loader
+        .fetch_text_stream(browser_navigation_request(&url)?.with_page_network_policy())
+        .await?;
+
+    assert_eq!(first.body_text(), "cached-renderer-text-stream");
+    assert_eq!(second.body_text(), "cached-renderer-text-stream");
+
+    server.await?;
+    let _ = std::fs::remove_dir_all(cache_dir);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn script_text_fetch_uses_shared_memory_resource_cache_with_fresh_cache_headers() -> Result<()>
+{
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_http_request_head(&mut stream).await.unwrap();
+        let body = "window.scriptMemoryCacheHit = true;";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nCache-Control: max-age=60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+
+        assert!(
+            timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "second script fetch should be served from the loader memory cache"
+        );
+    });
+
+    let loader = ResourceRequestClient::new(&FetchConfig::default())?;
+    let url = format!("http://{addr}/app.js");
+    let request = || {
+        browser_navigation_request(&url).map(|request| {
+            request.with_script_fetch_metadata(ScriptFetchRequestMetadata::default())
+        })
+    };
+
+    let first = loader
+        .fetch_cacheable_script_text_stream(request()?)
+        .await?;
+    let second = loader
+        .fetch_cacheable_script_text_stream(request()?)
+        .await?;
+
+    assert_eq!(first.body_text(), "window.scriptMemoryCacheHit = true;");
+    assert_eq!(second.body_text(), "window.scriptMemoryCacheHit = true;");
+    assert!(!first.from_cache);
+    assert!(second.from_cache);
+    assert!(second.network_request_extra_info().is_none());
+
+    server.await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cache_bypass_replaces_script_text_memory_entry() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        for body in [
+            "window.cacheGeneration = 1;",
+            "window.cacheGeneration = 1;",
+            "window.cacheGeneration = 2;",
+        ] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_request_head(&mut stream).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nCache-Control: max-age=60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+        assert!(
+            timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "normal loading after bypass should retain both Page-local script entries"
+        );
+    });
+
+    let loader = ResourceRequestClient::new(&FetchConfig::default())?;
+    let peer = loader.fork_with_isolated_page_network_policy();
+    let url = format!("http://{addr}/app.js");
+    let request = || {
+        browser_navigation_request(&url).map(|request| {
+            request
+                .with_page_network_policy()
+                .with_script_fetch_metadata(ScriptFetchRequestMetadata::default())
+        })
+    };
+
+    let first = loader
+        .fetch_cacheable_script_text_stream(request()?)
+        .await?;
+    let peer_first = peer.fetch_cacheable_script_text_stream(request()?).await?;
+    loader.set_cache_disabled(true);
+    let bypassed = loader
+        .fetch_cacheable_script_text_stream(request()?)
+        .await?;
+    loader.set_cache_disabled(false);
+    let restored = loader
+        .fetch_cacheable_script_text_stream(request()?)
+        .await?;
+    let peer_restored = peer.fetch_cacheable_script_text_stream(request()?).await?;
+
+    assert_eq!(first.body_text(), "window.cacheGeneration = 1;");
+    assert_eq!(peer_first.body_text(), "window.cacheGeneration = 1;");
+    assert_eq!(bypassed.body_text(), "window.cacheGeneration = 2;");
+    assert_eq!(restored.body_text(), "window.cacheGeneration = 2;");
+    assert_eq!(peer_restored.body_text(), "window.cacheGeneration = 1;");
+    assert!(!first.from_cache);
+    assert!(!peer_first.from_cache);
+    assert!(!bypassed.from_cache);
+    assert!(restored.from_cache);
+    assert!(peer_restored.from_cache);
+
+    server.await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unique_script_text_fetches_stay_within_one_loader_memory_budget() -> Result<()> {
+    const SCRIPT_COUNT: usize = 40;
+    const SCRIPT_BYTES: usize = 256 * 1024;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let body = format!("/*{}*/", "x".repeat(SCRIPT_BYTES - 4));
+        for _ in 0..SCRIPT_COUNT {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_request_head(&mut stream).await.unwrap();
+            let response_head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nCache-Control: max-age=3600\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response_head.as_bytes()).await.unwrap();
+            stream.write_all(body.as_bytes()).await.unwrap();
+        }
+    });
+
+    let loader = ResourceRequestClient::new(&FetchConfig::default())?;
+    for index in 0..SCRIPT_COUNT {
+        let url = format!("http://{addr}/script-{index}.js");
+        let request = browser_navigation_request(&url)?
+            .with_script_fetch_metadata(ScriptFetchRequestMetadata::default());
+        let response = loader.fetch_cacheable_script_text_stream(request).await?;
+        assert_eq!(response.body_bytes().len(), SCRIPT_BYTES);
+    }
+
+    server.await?;
+    let diagnostics = loader.memory_cache_diagnostics();
+    assert!(
+        diagnostics.retained_bytes <= diagnostics.retained_bytes_limit,
+        "loader memory cache exceeded its shared budget: {diagnostics:?}"
+    );
+    assert!(
+        diagnostics.completed_script_entry_count < SCRIPT_COUNT,
+        "unique completed scripts should evict older strong references: {diagnostics:?}"
+    );
+    assert_eq!(diagnostics.pending_script_entry_count, 0);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stylesheet_text_stream_uses_shared_memory_resource_cache_without_http_cache_dir()
+-> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_http_request_head(&mut stream).await.unwrap();
+        let body = "body { color: rgb(1, 2, 3); }";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/css\r\nCache-Control: max-age=60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+
+        assert!(
+            timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "second stylesheet text stream should be served from the loader memory cache"
+        );
+    });
+
+    let loader = ResourceRequestClient::new(&FetchConfig::default())?;
+    let url = format!("http://{addr}/cached.css");
+    let request = || {
+        browser_navigation_request(&url).map(|request| {
+            request
+                .with_page_network_policy()
+                .with_resource_type(RequestResourceType::CssStyleSheet)
+        })
+    };
+
+    let first = loader.fetch_text_stream(request()?).await?;
+    let second = loader.fetch_text_stream(request()?).await?;
+
+    assert_eq!(first.body_text(), "body { color: rgb(1, 2, 3); }");
+    assert_eq!(second.body_text(), "body { color: rgb(1, 2, 3); }");
+    assert!(!first.from_cache);
+    assert!(second.from_cache);
+
+    server.await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn text_stream_fetch_handles_local_data_stylesheet_urls() -> Result<()> {
+    let loader = ResourceRequestClient::new(&FetchConfig::default())?;
+    let response = loader
+        .fetch_text_stream(
+            browser_navigation_request("data:text/css,:root%7Bbackground:green%7D")?
+                .with_page_network_policy()
+                .with_resource_type(RequestResourceType::CssStyleSheet),
+        )
+        .await?;
+
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        response.final_url.as_str(),
+        "data:text/css,:root%7Bbackground:green%7D"
+    );
+    assert!(
+        response
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("content-type") && value == b"text/css")
+    );
+    assert_eq!(response.body_text(), ":root{background:green}");
+    assert!(!response.from_cache);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn local_blob_method_errors_reach_streaming_and_callback_consumers() -> Result<()> {
+    let loader = ResourceRequestClient::new(&FetchConfig::default())?;
+    let origin = moli_url::WebOrigin::from_url(&Url::parse("https://method.test/page")?);
+    for method in [
+        "HEAD", "POST", "PUT", "DELETE", "OPTIONS", "PATCH", "CUSTOM",
+    ] {
+        let request = Request::new_browser_bytes(
+            method,
+            "blob:https://method.test/unregistered",
+            None,
+            Vec::new(),
+            origin.clone(),
+        )?;
+        let expected = format!("blob URL fetch requires GET, got `{method}`");
+        let error = loader.fetch_text_stream(request.clone()).await.unwrap_err();
+        assert_eq!(error.to_string(), expected);
+        let error = loader
+            .fetch_cacheable_script_text_stream(request.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), expected);
+        let error = loader
+            .fetch_raw_stream_with_cancel(request.clone(), FetchCancelHandle::new())
+            .await
+            .expect_err("raw stream must reject non-GET blob requests");
+        assert_eq!(error.to_string(), expected);
+        let error = loader
+            .fetch_raw_stream_with_cancel_and_network_metadata(
+                request.clone(),
+                FetchCancelHandle::new(),
+            )
+            .await
+            .expect_err("observed raw stream must reject non-GET blob requests");
+        assert_eq!(error.to_string(), expected);
+        let (tx, rx) = oneshot::channel();
+        loader.fetch_text_callback(request, move |result| {
+            tx.send(result).expect("callback receiver is live");
+        })?;
+        let error = rx.await?.unwrap_err();
+        assert_eq!(error.to_string(), expected);
+
+        let data = loader
+            .fetch_text_stream(Request::new_browser_bytes(
+                method,
+                "data:text/plain,payload",
+                None,
+                Vec::new(),
+                origin.clone(),
+            )?)
+            .await?;
+        assert_eq!(
+            data.status, 200,
+            "data: must not inherit the blob method restriction"
+        );
+        assert_eq!(data.body_text(), "payload");
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_script_text_waiter_preserves_owner_cache_state() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let (release_tx, release_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_http_request_head(&mut stream).await.unwrap();
+        let body = "export default function fromCacheCoalescing() {}";
+        let response_head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nCache-Control: max-age=60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(response_head.as_bytes()).await.unwrap();
+        let _ = release_rx.await;
+        stream.write_all(body.as_bytes()).await.unwrap();
+
+        assert!(
+            timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "coalesced and completed-cache script loads should share the single network request"
+        );
+    });
+
+    let loader = ResourceRequestClient::new(&FetchConfig::default())?;
+    let url = format!("http://{addr}/module.js");
+    let request = || {
+        browser_navigation_request(&url).map(|request| {
+            request.with_script_fetch_metadata(ScriptFetchRequestMetadata::default())
+        })
+    };
+
+    let first_request = request()?;
+    let second_request = request()?;
+    let first = loader.fetch_cacheable_script_text_stream(first_request);
+    let second = loader.fetch_cacheable_script_text_stream(second_request);
+    let release = async move {
+        sleep(Duration::from_millis(50)).await;
+        let _ = release_tx.send(());
+    };
+
+    let (first, second, _) = tokio::join!(first, second, release);
+    let first = first?;
+    let second = second?;
+    assert_eq!(
+        first.body_text(),
+        "export default function fromCacheCoalescing() {}"
+    );
+    assert_eq!(
+        second.body_text(),
+        "export default function fromCacheCoalescing() {}"
+    );
+    assert!(!first.from_cache);
+    assert!(
+        !second.from_cache,
+        "in-flight coalescing should preserve the owner's network provenance"
+    );
+    assert_eq!(first.cache_state, moli_fetch::ResponseCacheState::None);
+    assert_eq!(second.cache_state, moli_fetch::ResponseCacheState::None);
+
+    let third = loader
+        .fetch_cacheable_script_text_stream(request()?)
+        .await?;
+    assert_eq!(
+        third.body_text(),
+        "export default function fromCacheCoalescing() {}"
+    );
+    assert!(
+        third.from_cache,
+        "completed script text cache hits should still report memory-cache provenance"
+    );
+    assert_eq!(third.cache_state, moli_fetch::ResponseCacheState::Local);
+
+    server.await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn script_text_fetch_respects_configured_request_timeout() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_http_request_head(&mut stream).await.unwrap();
+        stream
+            .write_all(
+                concat!(
+                    "HTTP/1.1 200 OK\r\n",
+                    "Content-Type: application/javascript\r\n",
+                    "Content-Length: 32\r\n",
+                    "Connection: close\r\n",
+                    "\r\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(500)).await;
+        let _ = stream.write_all(b"window.scriptLoaded = true;\n").await;
+    });
+
+    let mut config = FetchConfig::default();
+    config.set_request_timeout_ms(100);
+    let loader = ResourceRequestClient::new(&config)?;
+    let request = browser_navigation_request(&format!("http://{addr}/slow-script.js"))?
+        .with_script_fetch_metadata(ScriptFetchRequestMetadata::default());
+    let error = timeout(
+        Duration::from_secs(2),
+        loader.fetch_cacheable_script_text_stream(request),
+    )
+    .await
+    .expect("script fetch should complete with the configured request timeout")
+    .unwrap_err();
+
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.to_string().contains("Timeout was reached")),
+        "expected configured curl request timeout, got: {error:#}"
+    );
+    server.await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compatibility_fetch_uses_streaming_disk_cache_for_safe_gets() -> Result<()> {
+    let cache_dir = unique_test_cache_dir();
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_http_request_head(&mut stream).await.unwrap();
+        let body = "cached-renderer-compat-fetch";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: max-age=60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    });
+
+    let mut config = FetchConfig::default();
+    config.set_http_cache_dir(Some(cache_dir.display().to_string()));
+    let loader = ResourceRequestClient::new(&config)?;
+    let url = format!("http://{addr}/cacheable.txt");
+
+    let first = loader
+        .fetch(browser_navigation_request(&url)?.with_page_network_policy())
+        .await?;
+    let second = loader
+        .fetch(browser_navigation_request(&url)?.with_page_network_policy())
+        .await?;
+
+    assert_eq!(first.body_text(), "cached-renderer-compat-fetch");
+    assert_eq!(second.body_text(), "cached-renderer-compat-fetch");
+
+    server.await?;
+    let _ = std::fs::remove_dir_all(cache_dir);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compatibility_raw_fetch_uses_streaming_disk_cache_for_safe_gets() -> Result<()> {
+    let cache_dir = unique_test_cache_dir();
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_http_request_head(&mut stream).await.unwrap();
+        let body = b"cached-renderer-compat-raw\xff";
+        let response_head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nCache-Control: max-age=60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(response_head.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+    });
+
+    let mut config = FetchConfig::default();
+    config.set_http_cache_dir(Some(cache_dir.display().to_string()));
+    let loader = ResourceRequestClient::new(&config)?;
+    let url = format!("http://{addr}/cacheable.bin");
+
+    let first = loader
+        .fetch_raw(browser_navigation_request(&url)?.with_page_network_policy())
+        .await?;
+    let second = loader
+        .fetch_raw(browser_navigation_request(&url)?.with_page_network_policy())
+        .await?;
+
+    assert_eq!(first.body_bytes(), b"cached-renderer-compat-raw\xff");
+    assert_eq!(second.body_bytes(), b"cached-renderer-compat-raw\xff");
+
+    server.await?;
+    let _ = std::fs::remove_dir_all(cache_dir);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn prepared_accept_preserves_image_cache_and_partitions_representations() -> Result<()> {
+    let image_accept = "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8";
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let target = Url::parse(&format!("http://{}/image", listener.local_addr()?))?;
+    let server = tokio::spawn(async move {
+        for (index, expected) in [image_accept, "application/custom", ""]
+            .into_iter()
+            .enumerate()
+        {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            while !bytes.ends_with(b"\r\n\r\n") {
+                let mut chunk = [0_u8; 4096];
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(read, 0, "request headers must finish");
+                bytes.extend_from_slice(&chunk[..read]);
+                assert!(bytes.len() < 65536, "bounded request headers");
+            }
+            let request = String::from_utf8(bytes).unwrap();
+            let values: Vec<_> = request
+                .lines()
+                .filter_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("accept").then(|| value.trim())
+                })
+                .collect();
+            assert_eq!(values, [expected], "{request}");
+            let body = format!("body{index}");
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nCache-Control: max-age=60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).await.unwrap();
+            stream.write_all(body.as_bytes()).await.unwrap();
+        }
+    });
+    let loader = ResourceRequestClient::new(&FetchConfig::default())?;
+    for (accept, cached, body) in [
+        (None, false, "body0"),
+        (Some(image_accept), true, "body0"),
+        (Some("application/custom"), false, "body1"),
+        (Some("application/custom"), true, "body1"),
+        (Some(""), false, "body2"),
+        (Some(""), true, "body2"),
+    ] {
+        let headers = accept
+            .map(|value| {
+                vec![(
+                    if cached { "aCcEpT" } else { "Accept" }.to_owned(),
+                    value.to_owned(),
+                )]
+            })
+            .unwrap_or_default();
+        let mut request =
+            Request::new_browser("GET", target.clone(), None, headers, (&target).into())
+                .with_request_mode(moli_fetch::RequestMode::NoCors)
+                .with_browser_request_metadata(BrowserRequestMetadata::Image)
+                .with_resource_type(RequestResourceType::Image)
+                .with_page_network_policy();
+        // ServiceWorker fallback already admits a prepared request; ordinary
+        // resource dispatch must retain the same cache eligibility and key.
+        loader.prepare_service_worker_request(&mut request);
+        let response = timeout(
+            Duration::from_secs(15),
+            loader.fetch_raw_stream_with_cancel(request, FetchCancelHandle::new()),
+        )
+        .await??;
+        assert_eq!(response.from_cache, cached, "Accept={accept:?}");
+        let response = response.into_materialized_raw_response().await?;
+        assert_eq!(response.body_bytes(), body.as_bytes());
+    }
+    server.await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn image_raw_stream_uses_shared_memory_resource_cache_without_http_cache_dir() -> Result<()> {
+    const BODY: &[u8] = b"cached-image-body";
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let request = read_http_request_text(&mut stream).await?;
+        assert!(request.starts_with("GET /cached.png HTTP/"), "{request}");
+        let response_head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nCache-Control: max-age=60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            BODY.len()
+        );
+        stream.write_all(response_head.as_bytes()).await?;
+        stream.write_all(BODY).await?;
+        Ok::<(), std::io::Error>(())
+    });
+
+    let loader = ResourceRequestClient::new(&FetchConfig::default())?;
+    let target = Url::parse(&format!("http://{addr}/cached.png"))?;
+    let first = loader
+        .fetch_raw_stream_with_cancel(
+            browser_navigation_request(&format!("{target}#first"))?
+                .with_page_network_policy()
+                .with_resource_type(RequestResourceType::Image),
+            FetchCancelHandle::new(),
+        )
+        .await?
+        .into_materialized_raw_response()
+        .await?;
+    assert!(!first.from_cache);
+    assert_eq!(first.final_url.fragment(), Some("first"));
+    assert_eq!(first.body_bytes(), BODY);
+    server.await??;
+
+    // The fixture has closed its listening socket. Every remaining request
+    // must use the same in-memory bytes and its own URL.
+    for (fragment, with_network_metadata) in [
+        (Some("second"), false),
+        (Some("third"), true),
+        (Some(""), false),
+        (None, true),
+    ] {
+        let mut url = target.clone();
+        url.set_fragment(fragment);
+        let request = browser_navigation_request(url.as_str())?
+            .with_page_network_policy()
+            .with_resource_type(RequestResourceType::Image);
+        let cancel = FetchCancelHandle::new();
+        let response = if with_network_metadata {
+            loader
+                .fetch_raw_stream_with_cancel_and_network_metadata(request, cancel)
+                .await?
+                .into_response()
+        } else {
+            loader.fetch_raw_stream_with_cancel(request, cancel).await?
+        }
+        .into_materialized_raw_response()
+        .await?;
+        assert!(response.from_cache, "{url}");
+        assert_eq!(response.final_url, url);
+        assert_eq!(response.body_bytes(), BODY);
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn image_raw_stream_keeps_explicit_redirect_fragment_outside_memory_cache() -> Result<()> {
+    const BODY: &str = "redirect-target";
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let redirect = "HTTP/1.1 302 Found\r\nLocation: /redirected.png#server\r\nCache-Control: max-age=60\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let image = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nCache-Control: max-age=60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{BODY}",
+            BODY.len()
+        );
+        for response in [redirect, &image, redirect, &image] {
+            let (mut stream, _) = listener.accept().await?;
+            let request = read_http_request_text(&mut stream).await?;
+            assert!(
+                request.starts_with("GET /redirected.png HTTP/"),
+                "{request}"
+            );
+            stream.write_all(response.as_bytes()).await?;
+        }
+        Ok::<(), std::io::Error>(())
+    });
+
+    let loader = ResourceRequestClient::new(&FetchConfig::default())?;
+    let final_url = Url::parse(&format!("http://{addr}/redirected.png#server"))?;
+    // The first response has the same final URL as its original request.
+    // It must still be excluded from the cache because it followed a redirect.
+    for fragment in ["server", "client"] {
+        let mut url = final_url.clone();
+        url.set_fragment(Some(fragment));
+        let request = browser_navigation_request(url.as_str())?
+            .with_page_network_policy()
+            .with_resource_type(RequestResourceType::Image);
+        let response = loader
+            .fetch_raw_stream_with_cancel_and_network_metadata(request, FetchCancelHandle::new())
+            .await?
+            .into_response()
+            .into_materialized_raw_response()
+            .await?;
+        assert!(!response.from_cache, "{url}");
+        assert!(response.redirected, "{url}");
+        assert_eq!(response.final_url, final_url);
+        assert_eq!(response.redirect_chain.len(), 1);
+        assert_eq!(response.redirect_chain[0].from_url, url);
+        assert_eq!(response.redirect_chain[0].to_url, final_url);
+        assert_eq!(response.body_bytes(), BODY.as_bytes());
+    }
+
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cache_bypass_replaces_raw_subresource_memory_entry() -> Result<()> {
+    async fn body(mut response: StreamingRawResponse) -> Result<(Vec<u8>, bool)> {
+        let from_cache = response.from_cache;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.next_chunk().await {
+            bytes.extend_from_slice(&chunk);
+        }
+        response.finish().await?;
+        Ok((bytes, from_cache))
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        for payload in [
+            b"image-v1".as_slice(),
+            b"image-v1".as_slice(),
+            b"image-v2".as_slice(),
+        ] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_request_head(&mut stream).await.unwrap();
+            let response_head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nCache-Control: max-age=60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            );
+            stream.write_all(response_head.as_bytes()).await.unwrap();
+            stream.write_all(payload).await.unwrap();
+        }
+        assert!(
+            timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "normal loading after bypass should retain both Page-local image entries"
+        );
+    });
+
+    let loader = ResourceRequestClient::new(&FetchConfig::default())?;
+    let peer = loader.fork_with_isolated_page_network_policy();
+    let url = format!("http://{addr}/cached.png");
+    let request = || {
+        browser_navigation_request(&url).map(|request| {
+            request
+                .with_page_network_policy()
+                .with_resource_type(RequestResourceType::Image)
+        })
+    };
+
+    let first = body(
+        loader
+            .fetch_raw_stream_with_cancel(request()?, FetchCancelHandle::new())
+            .await?,
+    )
+    .await?;
+    let peer_first = body(
+        peer.fetch_raw_stream_with_cancel(request()?, FetchCancelHandle::new())
+            .await?,
+    )
+    .await?;
+    loader.set_cache_disabled(true);
+    let bypassed = body(
+        loader
+            .fetch_raw_stream_with_cancel(request()?, FetchCancelHandle::new())
+            .await?,
+    )
+    .await?;
+    loader.set_cache_disabled(false);
+    let restored = body(
+        loader
+            .fetch_raw_stream_with_cancel(request()?, FetchCancelHandle::new())
+            .await?,
+    )
+    .await?;
+    let peer_restored = body(
+        peer.fetch_raw_stream_with_cancel(request()?, FetchCancelHandle::new())
+            .await?,
+    )
+    .await?;
+
+    assert_eq!(first, (b"image-v1".to_vec(), false));
+    assert_eq!(peer_first, (b"image-v1".to_vec(), false));
+    assert_eq!(bypassed, (b"image-v2".to_vec(), false));
+    assert_eq!(restored, (b"image-v2".to_vec(), true));
+    assert_eq!(peer_restored, (b"image-v1".to_vec(), true));
+
+    server.await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn browser_fetch_raw_stream_uses_shared_memory_resource_cache_without_http_cache_dir()
+-> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_http_request_head(&mut stream).await.unwrap();
+        let body = b"cached-fetch-body";
+        let response_head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: max-age=60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(response_head.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+
+        assert!(
+            timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "second browser fetch raw stream should be served from the loader memory cache"
+        );
+    });
+
+    let loader = ResourceRequestClient::new(&FetchConfig::default())?;
+    let url = format!("http://{addr}/cached-fetch.txt");
+    let request = || {
+        browser_navigation_request(&url).map(|request| {
+            request
+                .with_page_network_policy()
+                .with_browser_request_metadata(BrowserRequestMetadata::Fetch)
+        })
+    };
+
+    let mut first = loader
+        .fetch_raw_stream_with_cancel(request()?, FetchCancelHandle::new())
+        .await?;
+    assert!(!first.from_cache);
+    let mut first_body = Vec::new();
+    while let Some(chunk) = first.next_chunk().await {
+        first_body.extend_from_slice(&chunk);
+    }
+    first.finish().await?;
+
+    let mut second = loader
+        .fetch_raw_stream_with_cancel(request()?, FetchCancelHandle::new())
+        .await?;
+    assert!(second.from_cache);
+    let mut second_body = Vec::new();
+    while let Some(chunk) = second.next_chunk().await {
+        second_body.extend_from_slice(&chunk);
+    }
+    second.finish().await?;
+
+    assert_eq!(first_body, b"cached-fetch-body");
+    assert_eq!(second_body, b"cached-fetch-body");
+
+    server.await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cached_subresource_clears_transport_observations_but_preserves_redirects() -> Result<()> {
+    let start_url = Url::parse("http://example.test/redirect.txt")?;
+    let final_url = Url::parse("http://example.test/final.txt")?;
+    let transport = moli_fetch::NetworkRequestExtraInfo {
+        headers: vec![("Cookie".into(), "fixture=one".into())],
+        cookie_report: Default::default(),
+    };
+    let reports = moli_cookie_jar::BrowserCookieStore::default()
+        .store_response_headers_with_reports(
+            &final_url,
+            &[("set-cookie".into(), b"cache=original; Path=/".to_vec())],
+        );
+    assert_eq!(reports.len(), 1);
+    let response = RawResponse::from_head_and_body(
+        ResponseHead {
+            status_text: None,
+            final_url: final_url.clone(),
+            status: 200,
+            headers: vec![("content-type".to_owned(), b"text/plain".to_vec())],
+            request_cookie_report: None,
+            cookie_set_reports: reports.clone(),
+            redirected: true,
+            redirect_chain: vec![RedirectInfo {
+                source: moli_fetch::RedirectSource::Network,
+                from_url: start_url,
+                to_url: final_url,
+                status: 301,
+                headers: vec![("location".to_owned(), b"/final.txt".to_vec())],
+                network_extra_info_available: true,
+                request_extra_info: Some(transport.clone()),
+                dispatched_request: None,
+                response_extra_info: Some(moli_fetch::NetworkResponseExtraInfo {
+                    request_extra_info: transport.clone(),
+                    status: 301,
+                    headers: Vec::new(),
+                    cookie_set_reports: reports.clone(),
+                }),
+                redirect_has_extra_info: true,
+                request_cookie_report: None,
+                cookie_set_reports: reports.clone(),
+                from_cache: false,
+                negotiated_http_version: None,
+            }],
+            from_cache: false,
+            cache_state: Default::default(),
+            negotiated_http_version: None,
+        },
+        b"cached-final-body".to_vec(),
+    )
+    .with_network_request_extra_info(Some(transport));
+
+    let cached_text = super::response_with_memory_cache_hit(
+        response.clone().into_lossy_materialized_text_response(),
+    );
+    assert!(cached_text.from_cache);
+    assert!(cached_text.network_request_extra_info().is_none());
+    assert!(cached_text.cookie_set_reports.is_empty());
+    let redirect = &cached_text.redirect_chain[0];
+    assert!(redirect.from_cache);
+    assert!(!redirect.network_extra_info_available);
+    assert!(!redirect.redirect_has_extra_info);
+    assert!(redirect.request_extra_info.is_none());
+    assert!(redirect.response_extra_info.is_none());
+    assert!(redirect.cookie_set_reports.is_empty());
+    assert_eq!(cached_text.body_text(), "cached-final-body");
+
+    let mut response = streaming_raw_response_from_cached_subresource(response)?;
+
+    assert!(response.from_cache);
+    assert_eq!(response.redirect_chain.len(), 1);
+    assert!(response.redirect_chain[0].from_cache);
+    assert!(!response.redirect_chain[0].network_extra_info_available);
+    assert!(!response.redirect_chain[0].redirect_has_extra_info);
+    assert!(response.redirect_chain[0].request_extra_info.is_none());
+    assert!(response.redirect_chain[0].response_extra_info.is_none());
+    assert!(response.network_request_extra_info().is_none());
+    assert!(response.cookie_set_reports.is_empty());
+    assert!(response.redirect_chain[0].cookie_set_reports.is_empty());
+    let mut body = Vec::new();
+    while let Some(chunk) = response.next_chunk().await {
+        body.extend_from_slice(&chunk);
+    }
+    response.finish().await?;
+    assert_eq!(body, b"cached-final-body");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn loader_applies_network_policy_only_to_opt_in_requests() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let (mut first, _) = listener.accept().await.unwrap();
+        let first_request = read_http_request_text(&mut first).await.unwrap();
+        let first_seen = first_request
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("x-cdp-test")
+                    .then(|| value.trim().to_owned())
+            })
+            .unwrap_or_default();
+        let first_body = format!("plain:{first_seen}");
+        let first_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            first_body.len(),
+            first_body
+        );
+        first.write_all(first_response.as_bytes()).await.unwrap();
+
+        let (mut second, _) = listener.accept().await.unwrap();
+        let second_request = read_http_request_text(&mut second).await.unwrap();
+        let second_seen = second_request
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("x-cdp-test")
+                    .then(|| value.trim().to_owned())
+            })
+            .unwrap_or_default();
+        let second_body = format!("optin:{second_seen}");
+        let second_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            second_body.len(),
+            second_body
+        );
+        second.write_all(second_response.as_bytes()).await.unwrap();
+    });
+
+    let loader = ResourceRequestClient::new(&FetchConfig::default())?;
+    loader.set_extra_http_headers(
+        &vec![("x-cdp-test".to_owned(), "loader-policy".to_owned())].into(),
+    );
+
+    let plain = loader
+        .fetch(browser_navigation_request(&format!("http://{addr}/plain"))?)
+        .await?;
+    assert_eq!(plain.body_text(), "plain:");
+
+    let opt_in = loader
+        .fetch(
+            browser_navigation_request(&format!("http://{addr}/optin"))?.with_page_network_policy(),
+        )
+        .await?;
+    assert_eq!(opt_in.body_text(), "optin:loader-policy");
+
+    server.await?;
+    Ok(())
+}
+
+#[test]
+fn service_worker_bypass_isolated_between_page_request_clients() -> Result<()> {
+    let shared = ResourceRequestClient::new(&FetchConfig::default())?;
+    let first_page = shared.fork_with_isolated_page_network_policy();
+    let second_page = shared.fork_with_isolated_page_network_policy();
+    first_page.set_bypass_service_worker(true);
+    second_page.set_bypass_service_worker(false);
+
+    assert!(!shared.bypass_service_worker());
+    assert!(first_page.bypass_service_worker());
+    assert!(!second_page.bypass_service_worker());
+
+    first_page.set_bypass_service_worker(false);
+    second_page.set_bypass_service_worker(true);
+
+    assert!(!shared.bypass_service_worker());
+    assert!(!first_page.bypass_service_worker());
+    assert!(second_page.bypass_service_worker());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn loader_opt_in_network_policy_enforces_blocked_and_offline() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _ = read_http_request_head(&mut stream).await;
+        let body = "reachable";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    });
+
+    let loader = ResourceRequestClient::new(&FetchConfig::default())?;
+    let blocked_url = format!("http://{addr}/blocked");
+    loader.set_blocked_url_patterns(std::slice::from_ref(&blocked_url));
+    let blocked = loader
+        .fetch(browser_navigation_request(&blocked_url)?.with_page_network_policy())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(blocked.contains("net::ERR_BLOCKED_BY_CLIENT"));
+
+    let plain = loader
+        .fetch(browser_navigation_request(&format!("http://{addr}/plain"))?)
+        .await?;
+    assert_eq!(plain.body_text(), "reachable");
+
+    loader.set_network_offline(true);
+    let offline = loader
+        .fetch(
+            browser_navigation_request(&format!("http://{addr}/offline"))?
+                .with_page_network_policy(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(offline.contains("Network emulation offline"));
+
+    server.await?;
+    Ok(())
+}
+
+#[test]
+fn browser_resource_executor_progresses_without_polling_the_callers_runtime() {
+    let owner = ResourceRequestClient::new(&FetchConfig::default()).unwrap();
+    let first = owner.resource_task_runner();
+    let second = owner.clone().resource_task_runner();
+    assert!(first.shares_executor_with(&second));
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    first.spawn(async move {
+        tokio::task::yield_now().await;
+        tx.send(()).unwrap();
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the single resource worker must progress while the caller blocks");
+}
+
+#[test]
+fn resource_runtime_reuse_distinguishes_instance_web_security_policy() -> anyhow::Result<()> {
+    let default = FetchConfig::default();
+    let mut disabled = default.clone();
+    disabled.set_web_security_disabled(true);
+    let strict = ResourceRequestClient::new(&default)?;
+    let relaxed = ResourceRequestClient::new(&disabled)?;
+    assert!(
+        strict
+            .browser_resource_runtime()
+            .matches_fetch_config(&default)
+    );
+    assert!(
+        !strict
+            .browser_resource_runtime()
+            .matches_fetch_config(&disabled)
+    );
+    assert!(
+        relaxed
+            .browser_resource_runtime()
+            .matches_fetch_config(&disabled)
+    );
+    assert!(
+        !relaxed
+            .browser_resource_runtime()
+            .matches_fetch_config(&default)
+    );
+    assert!(!strict.web_security_disabled());
+    assert!(relaxed.web_security_disabled());
+    Ok(())
+}

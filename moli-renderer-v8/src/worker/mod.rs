@@ -1,0 +1,91 @@
+//! Dedicated Web Worker implementation.
+//!
+//! Each worker runs on its own OS thread with a dedicated Tokio `LocalRuntime`
+//! and V8 isolate, matching Chromium's threading model.  Communication with the
+//! parent context uses `tokio::sync::mpsc` channels carrying V8 structured-clone
+//! payloads.
+//! payload bytes, so `postMessage` semantics are not limited to JSON.
+//!
+//! The worker's V8 isolate is registered with the custom V8 platform
+//! (`v8_platform.rs`) so foreground tasks posted by V8 background threads are
+//! routed to the worker's own Tokio runtime — no manual pumping required.
+
+pub(crate) mod abort;
+mod data_url;
+mod file_reading_tasks;
+mod global_scope;
+mod handle;
+mod inspector_task_runner;
+mod module_mime;
+mod module_runtime;
+mod networking_tasks;
+mod resource_output;
+mod script_loading;
+mod script_mime;
+mod thread;
+mod timer_callback;
+pub(crate) use file_reading_tasks::{
+    queue_worker_file_reading_task, take_worker_file_reading_task,
+};
+pub(crate) use networking_tasks::queue_worker_networking_task;
+pub(crate) use thread::perform_callback_cleanup_checkpoint_if_worker;
+
+pub(crate) use data_url::decode_data_url_script_source;
+pub(crate) use global_scope::{
+    NestedWorkerContext, WorkerFetchCompletion, WorkerFetchEvent, WorkerFetchResponse,
+    WorkerFetchStreamingChunk, WorkerFetchStreamingFinished, WorkerFetchStreamingStarted,
+    WorkerGlobalState, WorkerOpfsCompletion, WorkerWebCryptoCompletion, cancel_worker_opfs_task,
+    check_worker_websocket_csp, close_worker_websocket,
+    dispatch_worker_trusted_types_sink_violation_event,
+    ensure_worker_opfs_directory_iterator_registry, ensure_worker_opfs_handle_registry,
+    forget_nested_worker_context, forget_worker_broadcast_channel_wrapper,
+    forget_worker_message_port_wrapper, forward_nested_worker_error_after_owner_close,
+    get_worker_state, register_worker_blob_read_task, register_worker_broadcast_channel_wrapper,
+    register_worker_message_port_wrapper, register_worker_opfs_iterator_task,
+    register_worker_opfs_move_task, register_worker_opfs_task, register_worker_webcrypto_task,
+    register_worker_websocket, reserve_nested_worker_context, send_worker_websocket_binary,
+    send_worker_websocket_blob, send_worker_websocket_text, service_worker_runtime_identity,
+    try_worker_xhr_abort_callback, try_worker_xhr_reschedule_timeout_after_timeout_change,
+    try_worker_xhr_send_callback, worker_allows_eval_code_generation_by_csp,
+    worker_allows_trusted_type_policy_name, worker_allows_trusted_types_eval,
+    worker_allows_wasm_code_generation_by_csp, worker_broadcast_channel_registry,
+    worker_broadcast_channel_storage_key, worker_broadcast_channel_wake_sender,
+    worker_broadcast_channel_wrapper, worker_current_script_url, worker_global_is_closed,
+    worker_global_origin, worker_message_port_registry, worker_message_port_wake_sender,
+    worker_message_port_wrapper, worker_notification_permission_state,
+    worker_opfs_directory_iterator_registry, worker_opfs_handle_registry,
+    worker_realm_secure_context_available, worker_service_worker_control_state, worker_storage_key,
+    worker_storage_partition_identity, worker_termination_requested,
+    worker_trusted_types_for_script_requirements,
+};
+pub(crate) use handle::WorkerMessage;
+pub(crate) use handle::{
+    WorkerBootstrapCompletion, WorkerBootstrapFailure, WorkerBootstrapSuccess,
+    WorkerConsoleMessage, WorkerErrorPhase, WorkerErrorReport, WorkerErrorSource,
+    WorkerFetchHandlerType, WorkerParentErrorEventKind, WorkerRuntimeEvent,
+    WorkerRuntimeInspectorMessageBatch, WorkerScriptResource, WorkerScriptResourceKind,
+    WorkerToParentMessage,
+};
+pub(crate) use handle::{
+    WorkerControlHandle, WorkerHandle, WorkerNetworkPolicy, WorkerSecureContextPolicy,
+};
+pub(crate) use module_mime::{
+    ensure_worker_css_module_mime, ensure_worker_json_module_mime, ensure_worker_wasm_module_mime,
+};
+pub(crate) use module_runtime::worker_wasm_instance_for_namespace;
+pub(crate) use script_loading::ensure_worker_script_redirect_chain_same_origin;
+pub(crate) use script_mime::{
+    ensure_worker_script_mime_acceptable, worker_response_has_webassembly_mime,
+};
+pub(crate) use thread::{
+    WorkerGlobalKind, WorkerScriptKind, WorkerScriptSource, WorkerSpawnOptions,
+    dispatch_current_worker_callback_exception, spawn_worker_with_options,
+};
+
+#[cfg(test)]
+pub(crate) use thread::with_nested_error_selection_gate_for_test;
+
+#[cfg(test)]
+pub(crate) use handle::{
+    WorkerPendingFetchContinue, WorkerPendingSubresourceFetch, WorkerPendingXhrContinue,
+};

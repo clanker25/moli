@@ -1,0 +1,46 @@
+use super::{
+    CursorDirection, IdbKeyRangeQuery, IndexOptions, IndexedDbCursorOpenOperation,
+    IndexedDbTransactionOperation, KeyPath, ObjectStoreKey, TransactionHandle, create_index_object,
+    create_request_object, dom_exception_value, index_info_from_store_metadata,
+    indexed_db_index_info, indexed_db_index_object_store, indexed_db_object_store_database,
+    indexed_db_object_store_transaction, parse_cursor_direction, parse_idb_key, parse_idb_key_path,
+    parse_key_or_range, parse_optional_count, prepare_object_store_write,
+    queue_transaction_request, remove_database_index_metadata, request_error_object,
+    schedule_transaction_operation, set_database_index_metadata, submit_cursor_open_operation,
+    transaction_handle_from_value,
+};
+use crate::context_bootstrap::indexed_db::indexed_db_transaction_status;
+use crate::webidl;
+
+mod attributes;
+pub(super) mod collection;
+pub(in crate::context_bootstrap::indexed_db::stores) mod cursor_open_parse;
+mod index;
+mod object_store;
+mod rename;
+
+pub(super) use self::attributes::*;
+pub(super) use self::index::*;
+pub(super) use self::object_store::*;
+pub(super) use self::rename::*;
+
+// Allocate and admit only after key conversion has succeeded. Conversion can
+// run author code, so a transaction aborted by a getter must be checked again.
+fn create_operation_request<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    source: v8::Local<'s, v8::Object>,
+    transaction: v8::Local<'s, v8::Object>,
+) -> Option<v8::Local<'s, v8::Object>> {
+    if !indexed_db_transaction_status(scope, transaction).is_some_and(|state| state.active) {
+        let error = dom_exception_value(
+            scope,
+            "The transaction is not active.",
+            "TransactionInactiveError",
+        );
+        scope.throw_exception(error);
+        return None;
+    }
+    let request = create_request_object(scope, source.into(), transaction)?;
+    queue_transaction_request(scope, transaction, request);
+    Some(request)
+}

@@ -1,0 +1,46 @@
+use super::{
+    CursorDirection, CursorSnapshotEntry, DatabaseHandle, IndexInfo, IndexedDbError,
+    IndexedDbExecutionOwner, IndexedDbExternalObject, IndexedDbManager,
+    IndexedDbObjectStoreMetadata, IndexedDbRuntimeArray, IndexedDbStorageScope, IndexedDbValue,
+    IndexedDbWrapperKind, Key, KeyPath, ObjectStoreInfo, ObjectStoreKey, PreparedObjectStoreKey,
+    PreparedObjectStoreWrite, TransactionHandle, TransactionMode,
+    context_host_ptr_from_global_bridge, global_constructor_prototype,
+    indexed_db_database_store_metadata, indexed_db_object_store_metadata, indexed_db_runtime_array,
+    indexed_db_typed_execution_owner, indexed_db_typed_storage_scope,
+    push_unique_object_to_indexed_db_runtime_array, register_indexed_db_cursor_lifecycle,
+    register_indexed_db_database_lifecycle, register_indexed_db_index_lifecycle,
+    register_indexed_db_object_store_lifecycle, register_indexed_db_request_lifecycle,
+    register_indexed_db_transaction_lifecycle, register_indexed_db_wrapper_with_owner,
+    remove_indexed_db_database_index_metadata, remove_indexed_db_database_store_metadata,
+    replace_indexed_db_database_metadata, replace_indexed_db_runtime_array,
+    set_indexed_db_database_index_metadata, set_indexed_db_database_store_metadata, v8_string,
+    v8str,
+};
+use crate::context_bootstrap::indexed_db::{
+    INDEX_OBJECT_STORE, OBJECT_STORE_DATABASE, OBJECT_STORE_TRANSACTION,
+    SCHEMA_AUTO_INCREMENT_SLOT, SCHEMA_KEY_PATH_SLOT, SCHEMA_MULTI_ENTRY_SLOT, SCHEMA_NAME_SLOT,
+    SCHEMA_UNIQUE_SLOT,
+};
+use std::collections::BTreeSet;
+use v8::{ValueDeserializerHelper, ValueSerializerHelper};
+
+mod clone;
+mod cursors;
+mod env;
+mod keys;
+mod objects;
+mod registry;
+
+pub(super) use self::clone::*;
+pub(super) use self::cursors::*;
+pub(in crate::context_bootstrap) use self::env::indexed_db_usage_bytes_for_storage_key;
+pub(crate) use self::env::set_indexed_db_manager_for_context;
+pub(super) use self::env::*;
+#[cfg(test)]
+pub(crate) use self::env::{
+    indexed_db_manager_context_slot_present_for_test,
+    indexed_db_manager_isolate_slot_present_for_test,
+};
+pub(super) use self::keys::*;
+pub(super) use self::objects::*;
+pub(super) use self::registry::*;

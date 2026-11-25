@@ -1,0 +1,867 @@
+use super::headers::{headers_entries, headers_list};
+use super::response::{
+    ParsedResponseInit, install_response_body_methods, new_error_response, new_response_with_init,
+};
+use super::*;
+use crate::context_bootstrap::readable_stream_disturbed;
+use crate::network_host::request_scope::callback_child_handle;
+use crate::util::{
+    callback_data_index_value, callback_data_item, get_private_value, set_private_value,
+    throw_range_error, v8_string,
+};
+use crate::web_api_interfaces;
+use crate::webidl;
+use moli_webapi_declare::{WebApiFunctionTemplate, WebApiObject};
+
+pub(in crate::network_host) const REQUEST_METHOD_SLOT: &str = "__lmRequestMethod";
+pub(crate) const REQUEST_URL_SLOT: &str = "__lmRequestUrl";
+pub(in crate::network_host) const REQUEST_HEADERS_SLOT: &str = "__lmRequestHeaders";
+pub(in crate::network_host) const REQUEST_DESTINATION_SLOT: &str = "__lmRequestDestination";
+pub(in crate::network_host) const REQUEST_REFERRER_SLOT: &str = "__lmRequestReferrer";
+pub(in crate::network_host) const REQUEST_REFERRER_POLICY_SLOT: &str = "__lmRequestReferrerPolicy";
+pub(in crate::network_host) const REQUEST_MODE_SLOT: &str = "__lmRequestMode";
+pub(in crate::network_host) const REQUEST_CREDENTIALS_SLOT: &str = "__lmRequestCredentials";
+pub(in crate::network_host) const REQUEST_CACHE_SLOT: &str = "__lmRequestCache";
+pub(in crate::network_host) const REQUEST_REDIRECT_SLOT: &str = "__lmRequestRedirect";
+pub(in crate::network_host) const REQUEST_INTEGRITY_SLOT: &str = "__lmRequestIntegrity";
+pub(in crate::network_host) const REQUEST_KEEPALIVE_SLOT: &str = "__lmRequestKeepalive";
+pub(in crate::network_host) const REQUEST_PRIORITY_SLOT: &str = "__lmRequestPriority";
+pub(in crate::network_host) const REQUEST_SIGNAL_SLOT: &str = "__lmRequestSignal";
+pub(in crate::network_host) const REQUEST_DUPLEX_SLOT: &str = "__lmRequestDuplex";
+pub(in crate::network_host) const REQUEST_IS_HISTORY_NAVIGATION_SLOT: &str =
+    "__lmRequestIsHistoryNavigation";
+pub(in crate::network_host) const REQUEST_IS_RELOAD_NAVIGATION_SLOT: &str =
+    "__lmRequestIsReloadNavigation";
+pub(in crate::network_host) const REQUEST_BODY_SLOT: &str = "__lmRequestBody";
+pub(in crate::network_host) const REQUEST_BODY_USED_SLOT: &str = "__lmRequestBodyUsed";
+pub(crate) use moli_webapi::fetch_response::{
+    RESPONSE_BODY_SLOT, RESPONSE_BODY_USED_SLOT, RESPONSE_HEADERS_SLOT,
+    RESPONSE_INTERNAL_HEADERS_SLOT, RESPONSE_INTERNAL_STATUS_SLOT,
+    RESPONSE_INTERNAL_STATUS_TEXT_SLOT, RESPONSE_OK_SLOT, RESPONSE_REDIRECTED_SLOT,
+    RESPONSE_STATUS_SLOT, RESPONSE_STATUS_TEXT_SLOT, RESPONSE_TYPE_SLOT, RESPONSE_URL_SLOT,
+};
+use moli_webapi::fetch_response::{clone_response_surface, response_value_attribute};
+
+#[derive(WebApiObject)]
+#[webapi(interface = web_api_interfaces::Request)]
+struct RequestCloneShellDeclaration {
+    #[webapi(slot = REQUEST_BODY_USED_SLOT, init = false)]
+    body_used: (),
+}
+
+#[derive(WebApiFunctionTemplate)]
+#[webapi(interface = web_api_interfaces::Request, enumerable)]
+struct RequestTemplateMethodsDeclaration {
+    #[webapi(method = "clone", length = 0, callback = request_clone_callback)]
+    clone: (),
+}
+
+#[derive(WebApiFunctionTemplate)]
+#[webapi(interface = web_api_interfaces::Response, enumerable)]
+struct ResponseTemplateMethodsDeclaration {
+    #[webapi(static_method = "error", length = 0, callback = response_static_error_callback)]
+    error: (),
+
+    #[webapi(
+        static_method = "redirect",
+        length = 1,
+        callback = response_static_redirect_callback
+    )]
+    redirect: (),
+
+    #[webapi(static_method = "json", length = 1, callback = response_static_json_callback)]
+    json: (),
+
+    #[webapi(method = "clone", length = 0, callback = response_clone_callback)]
+    clone: (),
+}
+
+#[derive(WebApiFunctionTemplate)]
+#[webapi(interface = web_api_interfaces::Request, enumerable)]
+struct RequestSlotAccessorsDeclaration {
+    #[webapi(accessor_property, getter = request_slot_attribute_getter_callback, data = callback_data_index_value(scope, 0))]
+    method: (),
+    #[webapi(accessor_property, getter = request_slot_attribute_getter_callback, data = callback_data_index_value(scope, 1))]
+    url: (),
+    #[webapi(accessor_property, getter = request_slot_attribute_getter_callback, data = callback_data_index_value(scope, 2))]
+    headers: (),
+    #[webapi(accessor_property, getter = request_slot_attribute_getter_callback, data = callback_data_index_value(scope, 3))]
+    destination: (),
+    #[webapi(accessor_property, getter = request_slot_attribute_getter_callback, data = callback_data_index_value(scope, 4))]
+    referrer: (),
+    #[webapi(accessor_property, getter = request_slot_attribute_getter_callback, data = callback_data_index_value(scope, 5))]
+    referrer_policy: (),
+    #[webapi(accessor_property, getter = request_slot_attribute_getter_callback, data = callback_data_index_value(scope, 6))]
+    mode: (),
+    #[webapi(accessor_property, getter = request_slot_attribute_getter_callback, data = callback_data_index_value(scope, 7))]
+    credentials: (),
+    #[webapi(accessor_property, getter = request_slot_attribute_getter_callback, data = callback_data_index_value(scope, 8))]
+    cache: (),
+    #[webapi(accessor_property, getter = request_slot_attribute_getter_callback, data = callback_data_index_value(scope, 9))]
+    redirect: (),
+    #[webapi(accessor_property, getter = request_slot_attribute_getter_callback, data = callback_data_index_value(scope, 10))]
+    integrity: (),
+    #[webapi(accessor_property, getter = request_slot_attribute_getter_callback, data = callback_data_index_value(scope, 11))]
+    keepalive: (),
+    #[webapi(accessor_property, getter = request_slot_attribute_getter_callback, data = callback_data_index_value(scope, 12))]
+    signal: (),
+    #[webapi(accessor_property, getter = request_slot_attribute_getter_callback, data = callback_data_index_value(scope, 13))]
+    duplex: (),
+    #[webapi(accessor_property, getter = request_slot_attribute_getter_callback, data = callback_data_index_value(scope, 14))]
+    is_history_navigation: (),
+    #[webapi(accessor_property, getter = request_slot_attribute_getter_callback, data = callback_data_index_value(scope, 15))]
+    is_reload_navigation: (),
+    #[webapi(accessor_property, getter = request_slot_attribute_getter_callback, data = callback_data_index_value(scope, 16))]
+    body: (),
+    #[webapi(accessor_property, getter = request_slot_attribute_getter_callback, data = callback_data_index_value(scope, 17))]
+    body_used: (),
+}
+
+#[derive(WebApiFunctionTemplate)]
+#[webapi(interface = web_api_interfaces::Response, enumerable)]
+struct ResponseSlotAccessorsDeclaration {
+    #[webapi(accessor_property, name = "type", getter = response_slot_attribute_getter_callback, data = callback_data_index_value(scope, 18))]
+    response_type: (),
+    #[webapi(accessor_property, getter = response_slot_attribute_getter_callback, data = callback_data_index_value(scope, 19))]
+    url: (),
+    #[webapi(accessor_property, getter = response_slot_attribute_getter_callback, data = callback_data_index_value(scope, 20))]
+    redirected: (),
+    #[webapi(accessor_property, getter = response_slot_attribute_getter_callback, data = callback_data_index_value(scope, 21))]
+    status: (),
+    #[webapi(accessor_property, getter = response_slot_attribute_getter_callback, data = callback_data_index_value(scope, 22))]
+    ok: (),
+    #[webapi(accessor_property, getter = response_slot_attribute_getter_callback, data = callback_data_index_value(scope, 23))]
+    status_text: (),
+    #[webapi(accessor_property, getter = response_slot_attribute_getter_callback, data = callback_data_index_value(scope, 24))]
+    headers: (),
+    #[webapi(accessor_property, getter = response_slot_attribute_getter_callback, data = callback_data_index_value(scope, 25))]
+    body: (),
+    #[webapi(accessor_property, getter = response_slot_attribute_getter_callback, data = callback_data_index_value(scope, 26))]
+    body_used: (),
+}
+
+pub(in crate::network_host) fn mark_request_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) {
+    web_api_interfaces::Request::DESCRIPTOR
+        .initialize(scope, object)
+        .expect("Request brand declaration should initialize");
+}
+
+pub(crate) fn is_branded_request_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) -> bool {
+    web_api_interfaces::Request::is_instance(scope, object)
+}
+
+pub(crate) fn request_headers_entries<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    request: v8::Local<'s, v8::Object>,
+) -> Vec<(String, String)> {
+    request_slot_object(scope, request, REQUEST_HEADERS_SLOT)
+        .map(|headers| headers_list(scope, headers))
+        .unwrap_or_default()
+}
+
+pub(crate) fn request_method<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    request: v8::Local<'s, v8::Object>,
+) -> String {
+    request_slot_string(scope, request, REQUEST_METHOD_SLOT).unwrap_or_else(|| "GET".to_owned())
+}
+
+fn require_request_receiver<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) -> Option<v8::Local<'s, v8::Object>> {
+    if is_branded_request_object(scope, object) {
+        return Some(object);
+    }
+    throw_type_error(scope, "Illegal invocation");
+    None
+}
+
+pub(in crate::network_host) fn set_request_slot_value(
+    scope: &mut v8::PinScope<'_, '_>,
+    request: v8::Local<'_, v8::Object>,
+    slot: &str,
+    value: v8::Local<'_, v8::Value>,
+) {
+    set_private_value(scope, request, slot, value);
+}
+
+pub(in crate::network_host) fn set_request_slot_bool(
+    scope: &mut v8::PinScope<'_, '_>,
+    request: v8::Local<'_, v8::Object>,
+    slot: &str,
+    value: bool,
+) {
+    set_request_slot_value(scope, request, slot, v8::Boolean::new(scope, value).into());
+}
+
+pub(in crate::network_host) fn request_slot_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    request: v8::Local<'s, v8::Object>,
+    slot: &str,
+) -> Option<v8::Local<'s, v8::Value>> {
+    get_private_value(scope, request, slot)
+}
+
+pub(in crate::network_host) fn request_slot_bool<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    request: v8::Local<'s, v8::Object>,
+    slot: &str,
+) -> bool {
+    request_slot_value(scope, request, slot).is_some_and(|value| value.boolean_value(scope))
+}
+
+pub(crate) fn request_slot_string<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    request: v8::Local<'s, v8::Object>,
+    slot: &str,
+) -> Option<String> {
+    request_slot_value(scope, request, slot)
+        .and_then(|value| value.to_string(scope))
+        .map(|value| value.to_rust_string_lossy(scope))
+}
+
+pub(in crate::network_host) fn request_slot_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    request: v8::Local<'s, v8::Object>,
+    slot: &str,
+) -> Option<v8::Local<'s, v8::Object>> {
+    request_slot_value(scope, request, slot)
+        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
+}
+
+pub(in crate::network_host) fn mark_response_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) {
+    web_api_interfaces::Response::DESCRIPTOR
+        .initialize(scope, object)
+        .expect("Response brand declaration should initialize");
+}
+
+pub(crate) fn is_branded_response_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) -> bool {
+    web_api_interfaces::Response::is_instance(scope, object)
+}
+
+fn require_response_receiver<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) -> Option<v8::Local<'s, v8::Object>> {
+    if is_branded_response_object(scope, object) {
+        return Some(object);
+    }
+    throw_type_error(scope, "Illegal invocation");
+    None
+}
+
+pub(in crate::network_host) fn set_response_slot_value(
+    scope: &mut v8::PinScope<'_, '_>,
+    response: v8::Local<'_, v8::Object>,
+    slot: &str,
+    value: v8::Local<'_, v8::Value>,
+) {
+    set_private_value(scope, response, slot, value);
+}
+
+pub(crate) fn set_response_slot_bool(
+    scope: &mut v8::PinScope<'_, '_>,
+    response: v8::Local<'_, v8::Object>,
+    slot: &str,
+    value: bool,
+) {
+    set_response_slot_value(scope, response, slot, v8::Boolean::new(scope, value).into());
+}
+
+pub(crate) fn set_response_slot_string(
+    scope: &mut v8::PinScope<'_, '_>,
+    response: v8::Local<'_, v8::Object>,
+    slot: &str,
+    value: &str,
+) {
+    let Some(value) = v8_string(scope, value) else {
+        return;
+    };
+    set_response_slot_value(scope, response, slot, value.into());
+}
+
+pub(in crate::network_host) fn response_slot_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    response: v8::Local<'s, v8::Object>,
+    slot: &str,
+) -> Option<v8::Local<'s, v8::Value>> {
+    get_private_value(scope, response, slot)
+}
+
+pub(crate) fn response_slot_bool<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    response: v8::Local<'s, v8::Object>,
+    slot: &str,
+) -> bool {
+    response_slot_value(scope, response, slot).is_some_and(|value| value.boolean_value(scope))
+}
+
+pub(crate) fn response_slot_number<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    response: v8::Local<'s, v8::Object>,
+    slot: &str,
+) -> Option<f64> {
+    response_slot_value(scope, response, slot).and_then(|value| value.number_value(scope))
+}
+
+pub(crate) fn response_slot_string<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    response: v8::Local<'s, v8::Object>,
+    slot: &str,
+) -> Option<String> {
+    response_slot_value(scope, response, slot)
+        .and_then(|value| value.to_string(scope))
+        .map(|value| value.to_rust_string_lossy(scope))
+}
+
+pub(crate) fn response_slot_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    response: v8::Local<'s, v8::Object>,
+    slot: &str,
+) -> Option<v8::Local<'s, v8::Object>> {
+    response_slot_value(scope, response, slot)
+        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
+}
+
+pub(crate) fn consume_webassembly_streaming_response_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'s, v8::Value>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let Some(response) = webassembly_streaming_response_object(scope, value) else {
+        throw_type_error(
+            scope,
+            "An argument must be provided, which must be a Response or Promise<Response> object",
+        );
+        return None;
+    };
+    if !response_ok(scope, response) {
+        throw_type_error(scope, "HTTP status code is not ok");
+        return None;
+    }
+    if !response_content_type(scope, response)
+        .is_some_and(|content_type| moli_web_mime::is_webassembly_mime(&content_type))
+    {
+        throw_type_error(
+            scope,
+            "Incorrect response MIME type. Expected 'application/wasm'.",
+        );
+        return None;
+    }
+    if body_already_used(scope, response, RESPONSE_BODY_USED_SLOT) {
+        throw_type_error(
+            scope,
+            "Cannot compile WebAssembly.Module from an already read Response",
+        );
+        return None;
+    }
+
+    set_response_slot_bool(scope, response, RESPONSE_BODY_USED_SLOT, true);
+    match consume_network_body_value_from_object(
+        scope,
+        response,
+        NetworkBodyConsumptionKind::ArrayBuffer,
+    ) {
+        NetworkBodyConsumption::Ready(value) => Some(value),
+        NetworkBodyConsumption::Pending(promise) => Some(promise.into()),
+        NetworkBodyConsumption::Rejected(error) => {
+            scope.throw_exception(error);
+            None
+        }
+        NetworkBodyConsumption::Failed => {
+            throw_type_error(scope, "Failed to materialize response body");
+            None
+        }
+    }
+}
+
+fn webassembly_streaming_response_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'s, v8::Value>,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let object = v8::Local::<v8::Object>::try_from(value).ok()?;
+    is_branded_response_object(scope, object).then_some(object)
+}
+
+fn response_ok<'s>(scope: &mut v8::PinScope<'s, '_>, response: v8::Local<'s, v8::Object>) -> bool {
+    response_slot_bool(scope, response, RESPONSE_OK_SLOT)
+}
+
+fn response_content_type<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    response: v8::Local<'s, v8::Object>,
+) -> Option<String> {
+    let headers = response_slot_object(scope, response, RESPONSE_HEADERS_SLOT)?;
+    moli_web_mime::response_header_value(
+        &moli_fetch::headers_from_byte_strings(&headers_entries(scope, headers))
+            .expect("Headers contain ByteStrings"),
+        "content-type",
+    )
+}
+
+fn request_slot_attribute_getter_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(this) = require_request_receiver(scope, args.this()) else {
+        return;
+    };
+    let Some(slot) = callback_data_item(scope, &args, SLOT_ACCESSOR_SLOTS, "slot accessor slots")
+    else {
+        rv.set_undefined();
+        return;
+    };
+    if slot == REQUEST_BODY_USED_SLOT {
+        let body_used = request_slot_bool(scope, this, slot)
+            || body_stream_is_disturbed(scope, this, REQUEST_BODY_SLOT, false);
+        rv.set(v8::Boolean::new(scope, body_used).into());
+        return;
+    }
+    let value =
+        request_slot_value(scope, this, slot).unwrap_or_else(|| v8::undefined(scope).into());
+    rv.set(value);
+}
+
+fn response_slot_attribute_getter_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(this) = require_response_receiver(scope, args.this()) else {
+        return;
+    };
+    let Some(slot) = callback_data_item(scope, &args, SLOT_ACCESSOR_SLOTS, "slot accessor slots")
+    else {
+        rv.set_undefined();
+        return;
+    };
+    if slot == RESPONSE_BODY_USED_SLOT {
+        let body_used = response_slot_bool(scope, this, slot)
+            || body_stream_is_disturbed(scope, this, RESPONSE_BODY_SLOT, true);
+        rv.set(v8::Boolean::new(scope, body_used).into());
+        return;
+    }
+    let value =
+        response_value_attribute(scope, this, slot).unwrap_or_else(|| v8::undefined(scope).into());
+    rv.set(value);
+}
+
+const SLOT_ACCESSOR_SLOTS: &[&str] = &[
+    REQUEST_METHOD_SLOT,
+    REQUEST_URL_SLOT,
+    REQUEST_HEADERS_SLOT,
+    REQUEST_DESTINATION_SLOT,
+    REQUEST_REFERRER_SLOT,
+    REQUEST_REFERRER_POLICY_SLOT,
+    REQUEST_MODE_SLOT,
+    REQUEST_CREDENTIALS_SLOT,
+    REQUEST_CACHE_SLOT,
+    REQUEST_REDIRECT_SLOT,
+    REQUEST_INTEGRITY_SLOT,
+    REQUEST_KEEPALIVE_SLOT,
+    REQUEST_SIGNAL_SLOT,
+    REQUEST_DUPLEX_SLOT,
+    REQUEST_IS_HISTORY_NAVIGATION_SLOT,
+    REQUEST_IS_RELOAD_NAVIGATION_SLOT,
+    REQUEST_BODY_SLOT,
+    REQUEST_BODY_USED_SLOT,
+    RESPONSE_TYPE_SLOT,
+    RESPONSE_URL_SLOT,
+    RESPONSE_REDIRECTED_SLOT,
+    RESPONSE_STATUS_SLOT,
+    RESPONSE_OK_SLOT,
+    RESPONSE_STATUS_TEXT_SLOT,
+    RESPONSE_HEADERS_SLOT,
+    RESPONSE_BODY_SLOT,
+    RESPONSE_BODY_USED_SLOT,
+];
+
+#[derive(webidl::WebIdlArgs)]
+#[webidl(prefix = "Response.redirect")]
+struct ResponseRedirectArgs {
+    #[webidl(required, converter = "usv_string")]
+    url: String,
+    #[webidl(default = 302)]
+    status: u16,
+}
+
+#[derive(webidl::WebIdlArgs)]
+#[webidl(prefix = "Response.json")]
+struct ResponseJsonArgs<'s> {
+    #[webidl(required, converter = "raw")]
+    data: v8::Local<'s, v8::Value>,
+    #[webidl(dictionary)]
+    init: ParsedResponseInit,
+}
+
+fn response_static_error_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    _args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(response) = new_error_response(scope) else {
+        rv.set_undefined();
+        return;
+    };
+    rv.set(response.into());
+}
+
+pub(crate) fn response_static_redirect_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(parsed) = webidl::parse_args::<ResponseRedirectArgs>(scope, &args) else {
+        return;
+    };
+    let data = args.data();
+    let child_handle = callback_child_handle(scope, data);
+    let base_url = callback_base_url(scope, data);
+    let location_result = if let Some(base_url) = base_url {
+        try_resolve_request_constructor_url_for_base(scope, &parsed.url, Some(base_url))
+    } else {
+        try_resolve_request_constructor_url_for_child(scope, &parsed.url, child_handle)
+    };
+    let Ok(location) = location_result else {
+        throw_type_error(
+            scope,
+            "Failed to execute 'redirect' on 'Response': Invalid URL",
+        );
+        return;
+    };
+    if !matches!(parsed.status, 301 | 302 | 303 | 307 | 308) {
+        throw_range_error(
+            scope,
+            "Failed to execute 'redirect' on 'Response': Invalid status code",
+        );
+        return;
+    }
+    let init = ParsedResponseInit {
+        status: parsed.status,
+        headers: vec![("location".to_owned(), location.as_str().to_owned())],
+        ..ParsedResponseInit::default()
+    };
+    let Some(response) = new_response_with_init(scope, v8::null(scope).into(), init) else {
+        rv.set_undefined();
+        return;
+    };
+    rv.set(response.into());
+}
+
+pub(super) fn callback_base_url(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+) -> Option<url::Url> {
+    if !value.is_string() {
+        return None;
+    }
+    value
+        .to_string(scope)
+        .map(|value| value.to_rust_string_lossy(scope))
+        .and_then(|value| url::Url::parse(&value).ok())
+}
+
+fn response_static_json_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(parsed) = webidl::parse_args::<ResponseJsonArgs>(scope, &args) else {
+        return;
+    };
+    let body = match response_json_body(scope, parsed.data) {
+        Some(body) => body,
+        None => return,
+    };
+    let mut init = parsed.init;
+    init.append_default_header("content-type", "application/json");
+    let Some(response) = new_response_with_init(scope, body, init) else {
+        rv.set_undefined();
+        return;
+    };
+    rv.set(response.into());
+}
+
+fn response_json_body<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'s, v8::Value>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let result: Result<Option<v8::Global<v8::Value>>, Option<v8::Global<v8::Value>>> = {
+        let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+        let scope = try_catch.init();
+        match v8::json::stringify(&scope, value) {
+            Some(body) => {
+                if body.to_rust_string_lossy(&scope) == "undefined" {
+                    Ok(None)
+                } else {
+                    let body: v8::Local<'_, v8::Value> = body.into();
+                    Ok(Some(v8::Global::new(&scope, body)))
+                }
+            }
+            None if scope.has_caught() => Err(scope
+                .exception()
+                .map(|value| v8::Global::new(&scope, value))),
+            None => Ok(None),
+        }
+    };
+    match result {
+        Ok(Some(body)) => {
+            let body = v8::Local::new(scope, body);
+            Some(body)
+        }
+        Ok(None) => {
+            throw_type_error(
+                scope,
+                "Failed to execute 'json' on 'Response': Value is not JSON serializable.",
+            );
+            None
+        }
+        Err(Some(exception)) => {
+            scope.throw_exception(v8::Local::new(scope, exception));
+            None
+        }
+        Err(None) => {
+            throw_type_error(
+                scope,
+                "Failed to execute 'json' on 'Response': Value is not JSON serializable.",
+            );
+            None
+        }
+    }
+}
+
+fn request_clone_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(this) = require_request_receiver(scope, args.this()) else {
+        return;
+    };
+    if body_already_used(scope, this, REQUEST_BODY_USED_SLOT)
+        || body_stream_object(scope, this)
+            .is_some_and(|stream| readable_body_stream_unusable(scope, stream))
+    {
+        throw_type_error(
+            scope,
+            "Failed to execute 'clone' on 'Request': body stream already used",
+        );
+        return;
+    }
+    let Some(realm) = this.get_creation_context(scope) else {
+        return;
+    };
+    let scope = &mut v8::ContextScope::new(scope, realm);
+    let clone = RequestCloneShellDeclaration::new()
+        .bind(scope)
+        .expect("Request clone shell declaration should bind");
+    for slot in [
+        REQUEST_METHOD_SLOT,
+        REQUEST_URL_SLOT,
+        REQUEST_DESTINATION_SLOT,
+        REQUEST_REFERRER_SLOT,
+        REQUEST_REFERRER_POLICY_SLOT,
+        REQUEST_MODE_SLOT,
+        REQUEST_CREDENTIALS_SLOT,
+        REQUEST_CACHE_SLOT,
+        REQUEST_REDIRECT_SLOT,
+        REQUEST_INTEGRITY_SLOT,
+        REQUEST_KEEPALIVE_SLOT,
+        REQUEST_PRIORITY_SLOT,
+        REQUEST_DUPLEX_SLOT,
+        REQUEST_IS_HISTORY_NAVIGATION_SLOT,
+        REQUEST_IS_RELOAD_NAVIGATION_SLOT,
+    ] {
+        if let Some(value) = request_slot_value(scope, this, slot) {
+            set_request_slot_value(scope, clone, slot, value);
+        }
+    }
+    let headers = request_slot_object(scope, this, REQUEST_HEADERS_SLOT)
+        .map(|headers| super::headers::clone_headers_object(scope, headers))
+        .unwrap_or_else(|| super::headers::build_headers_object(scope, &[]));
+    set_request_slot_value(scope, clone, REQUEST_HEADERS_SLOT, headers.into());
+    let signal_source = request_slot_object(scope, this, REQUEST_SIGNAL_SLOT);
+    let Some(signal) = new_abort_signal_for_request_with_source(scope, signal_source) else {
+        return;
+    };
+    set_request_slot_value(scope, clone, REQUEST_SIGNAL_SLOT, signal);
+    let null_body = v8::null(scope).into();
+    set_request_slot_value(scope, clone, REQUEST_BODY_SLOT, null_body);
+    if let Some(stream) = body_stream_object(scope, this) {
+        let Some(branches) = crate::context_bootstrap::tee_fetch_body_stream(scope, stream) else {
+            return;
+        };
+        let Some(original_body) = branches.get_index(scope, 0) else {
+            return;
+        };
+        let Some(clone_body) = branches.get_index(scope, 1) else {
+            return;
+        };
+        set_request_slot_value(scope, this, REQUEST_BODY_SLOT, original_body);
+        set_request_slot_value(scope, clone, REQUEST_BODY_SLOT, clone_body);
+        if let Some(source) = network_body_source_from_object(scope, this) {
+            body_source::set_network_body_stream_source(scope, this, source);
+            body_source::set_network_body_stream_source(scope, clone, source);
+        }
+    }
+    mark_request_object(scope, clone);
+    rv.set(clone.into());
+}
+
+fn response_clone_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(response) = require_response_receiver(scope, args.this()) else {
+        return;
+    };
+    if body_already_used(scope, response, RESPONSE_BODY_USED_SLOT)
+        || body_stream_object(scope, response)
+            .is_some_and(|stream| readable_body_stream_unusable(scope, stream))
+    {
+        throw_type_error(
+            scope,
+            "Failed to execute 'clone' on 'Response': body stream already used",
+        );
+        return;
+    }
+    let Some(realm) = response.get_creation_context(scope) else {
+        return;
+    };
+    let scope = &mut v8::ContextScope::new(scope, realm);
+    let clone = clone_response_surface(scope, response);
+    if response_slot_number(scope, response, RESPONSE_STATUS_SLOT) == Some(0.0) {
+        clone_filtered_response_internal_body_source(scope, response, clone);
+    } else {
+        match clone_response_readable_stream_body(scope, response) {
+            Ok(Some(body)) => set_response_slot_value(scope, clone, RESPONSE_BODY_SLOT, body),
+            Ok(None) => {}
+            Err(()) => return,
+        }
+        if let Some(source) = network_body_source_from_object(scope, response) {
+            body_source::set_network_body_stream_source(scope, response, source);
+            body_source::set_network_body_stream_source(scope, clone, source);
+        }
+    }
+    mark_response_object(scope, clone);
+    rv.set(clone.into());
+}
+
+fn clone_response_readable_stream_body<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    response: v8::Local<'s, v8::Object>,
+) -> Result<Option<v8::Local<'s, v8::Value>>, ()> {
+    let Some(stream) = body_stream_object(scope, response) else {
+        return Ok(None);
+    };
+    let branches = crate::context_bootstrap::tee_fetch_body_stream(scope, stream).ok_or(())?;
+    let original = branches.get_index(scope, 0).ok_or(())?;
+    let clone = branches.get_index(scope, 1).ok_or(())?;
+    set_response_slot_value(scope, response, RESPONSE_BODY_SLOT, original);
+    Ok(Some(clone))
+}
+
+pub(in crate::network_host) fn new_abort_signal_for_request<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let ctor =
+        crate::context_bootstrap::ensure_intrinsic_interface_constructor(scope, "AbortController")
+            .ok()?;
+    let controller = ctor.new_instance(scope, &[])?;
+    controller.get(scope, v8str(scope, "signal").into())
+}
+
+pub(in crate::network_host) fn new_abort_signal_for_request_with_source<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    source: Option<v8::Local<'s, v8::Object>>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let Some(source) = source else {
+        return new_abort_signal_for_request(scope);
+    };
+    let abort_signal_ctor =
+        crate::context_bootstrap::ensure_intrinsic_interface_constructor(scope, "AbortSignal")
+            .ok()?;
+    let any = abort_signal_ctor
+        .get(scope, v8str(scope, "any").into())
+        .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())?;
+    let signals = v8::Array::new(scope, 1);
+    let _ = signals.set_index(scope, 0, source.into());
+    any.call(scope, abort_signal_ctor.into(), &[signals.into()])
+}
+
+pub(crate) fn install_request_bindings(
+    scope: &mut v8::PinScope<'_, '_, ()>,
+    template: v8::Local<'_, v8::FunctionTemplate>,
+) {
+    let prototype = template.prototype_template(scope);
+    RequestTemplateMethodsDeclaration::initialize_prototype_template(scope, prototype);
+    RequestSlotAccessorsDeclaration::initialize_prototype_template(scope, prototype);
+    install_response_body_methods(scope, prototype);
+}
+
+pub(crate) fn install_response_bindings<'s>(
+    scope: &mut v8::PinScope<'s, '_, ()>,
+    template: v8::Local<'s, v8::FunctionTemplate>,
+) {
+    ResponseTemplateMethodsDeclaration::initialize_template(scope, template);
+    let prototype = template.prototype_template(scope);
+    ResponseTemplateMethodsDeclaration::initialize_prototype_template(scope, prototype);
+    ResponseSlotAccessorsDeclaration::initialize_prototype_template(scope, prototype);
+    install_response_body_methods(scope, prototype);
+}
+
+pub(in crate::network_host) fn body_already_used<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    slot: &str,
+) -> bool {
+    if is_response_slot(slot) {
+        return response_slot_bool(scope, object, slot)
+            || body_stream_is_disturbed(scope, object, RESPONSE_BODY_SLOT, true);
+    }
+    request_slot_bool(scope, object, slot)
+        || body_stream_is_disturbed(scope, object, REQUEST_BODY_SLOT, false)
+}
+
+fn body_stream_is_disturbed<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    body_slot: &'static str,
+    response: bool,
+) -> bool {
+    let body = if response {
+        response_slot_object(scope, object, body_slot)
+    } else {
+        request_slot_object(scope, object, body_slot)
+    };
+    body.is_some_and(|stream| readable_stream_disturbed(scope, stream))
+}
+
+fn is_response_slot(slot: &str) -> bool {
+    matches!(
+        slot,
+        RESPONSE_TYPE_SLOT
+            | RESPONSE_URL_SLOT
+            | RESPONSE_REDIRECTED_SLOT
+            | RESPONSE_STATUS_SLOT
+            | RESPONSE_OK_SLOT
+            | RESPONSE_STATUS_TEXT_SLOT
+            | RESPONSE_HEADERS_SLOT
+            | RESPONSE_BODY_SLOT
+            | RESPONSE_BODY_USED_SLOT
+    )
+}

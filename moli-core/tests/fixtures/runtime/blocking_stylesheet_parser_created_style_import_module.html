@@ -1,0 +1,31 @@
+<!doctype html>
+<html>
+  <head>
+    <script>
+      window.blockingStyleImportModuleOrder = [];
+      document.addEventListener("DOMContentLoaded", () => {
+        window.blockingStyleImportModuleOrder.push("dcl");
+        window.blockingStyleImportModuleDclOrder =
+          window.blockingStyleImportModuleOrder.join(",");
+      });
+    </script>
+    <style>
+      @import url("/assets/blocking_stylesheet_slow.css");
+    </style>
+    <script type="module">
+      window.blockingStyleImportModuleSawStylesheet =
+        getComputedStyle(document.documentElement).color === "rgb(1, 2, 3)";
+      window.blockingStyleImportModuleSawLate =
+        !!document.getElementById("late");
+      window.blockingStyleImportModuleSawDcl =
+        window.blockingStyleImportModuleOrder.includes("dcl");
+      window.blockingStyleImportModuleOrder.push("module");
+      Promise.resolve().then(() =>
+        window.blockingStyleImportModuleOrder.push("module-microtask")
+      );
+    </script>
+  </head>
+  <body>
+    <div id="late">late</div>
+  </body>
+</html>

@@ -1,0 +1,263 @@
+use super::super::{PageScriptHost, security_policy::DocumentCspOutcome};
+use super::WebSocketConnectionState;
+use crate::document_runtime::document_content_security_policy_error_message;
+use crate::network_host::BLOCKED_BY_CLIENT_ERROR_TEXT;
+use crate::types::{
+    PendingSubresourceContinueEvent, PendingSubresourceFetchInfo, PendingSubresourceResponseInfo,
+    PendingWebSocketConnection, PendingWebSocketResponseState, SubresourceResourceType,
+    SubresourceResponseBody,
+};
+use moli_websocket::{
+    ConnectOptions as WebSocketConnectOptions, spawn_connection, spawn_failed_connection,
+    spawn_standalone_connection, websocket_cookie_url,
+};
+use url::Url;
+
+#[cfg(any(test, feature = "devtools"))]
+mod interception;
+
+impl PageScriptHost {
+    pub(crate) fn register_websocket_for_document(
+        &mut self,
+        scope: &mut v8::PinScope<'_, '_>,
+        wrapper: v8::Local<'_, v8::Object>,
+        owner: super::super::WindowExecutionContextBinding,
+        environment: crate::network::context::SubresourceRequestEnvironment,
+        url: Url,
+        protocols: Vec<String>,
+        csp_outcome: DocumentCspOutcome,
+    ) -> u64 {
+        let crate::network::context::SubresourceRequestEnvironment {
+            document_url,
+            request_origin,
+            frame_id,
+            ..
+        } = environment;
+        let origin = request_origin.ascii_serialization().to_owned();
+        let origin_is_opaque = request_origin.is_opaque();
+        let socket_id = self.next_websocket_id;
+        self.next_websocket_id += 1;
+        let resource_loader =
+            self.document_resource_loader_for_dispatch_scope(owner.dispatch_scope());
+        let loader = resource_loader
+            .as_ref()
+            .map(crate::network::context::DocumentResourceLoader::request_client);
+        let cookie_url = websocket_cookie_url(&url);
+        let mut cookie_request = moli_fetch::Request::new_browser(
+            "GET",
+            cookie_url.clone(),
+            None,
+            Vec::new(),
+            request_origin,
+        )
+        .with_credentials_mode(moli_fetch::RequestCredentialsMode::Include);
+        // The cookie adapter takes its initiator from the native origin;
+        // about:blank and mutable <base> URLs cannot supply that identity.
+        if origin_is_opaque {
+            cookie_request = cookie_request.with_cross_site_cookie_context();
+        }
+        if let Some(browser_context) = loader.and_then(|loader| loader.browser_site_context()) {
+            cookie_request = cookie_request.with_browser_site_context(browser_context.clone());
+        }
+        let cookie_context = cookie_request.network_cookie_context();
+        let cookie_header = if let Some(loader) = loader {
+            moli_fetch::cookie_header_for_request(
+                &loader.cookie_store(),
+                &cookie_url,
+                cookie_context,
+            )
+        } else {
+            Ok(None)
+        };
+        let cookie_header_for_context = cookie_header
+            .as_ref()
+            .ok()
+            .and_then(|header| header.clone());
+        let connector = loader.map(|loader| loader.websocket_connector());
+        let context = WebSocketConnectOptions {
+            origin,
+            user_agent: loader
+                .map(|loader| loader.user_agent().to_owned())
+                .unwrap_or_else(|| moli_fetch::FetchConfig::DEFAULT_USER_AGENT.to_owned()),
+            extra_headers: self.extra_http_headers.clone(),
+            http_proxy: loader.and_then(|loader| loader.http_proxy().map(ToOwned::to_owned)),
+            http_no_proxy: loader.and_then(|loader| loader.http_no_proxy().map(ToOwned::to_owned)),
+            http_host_resolve: loader
+                .map(|loader| loader.http_host_resolve().to_vec())
+                .unwrap_or_default(),
+            proxy_bearer_token: loader
+                .and_then(|loader| loader.proxy_bearer_token().map(ToOwned::to_owned)),
+            tls: loader
+                .map(|loader| loader.tls_config().clone())
+                .unwrap_or_default(),
+            cookie_header: cookie_header_for_context,
+        };
+        let dispatch_scope = owner.dispatch_scope();
+        let csp_failure_message = csp_outcome.into_blocking_violation().map(|violation| {
+            document_content_security_policy_error_message(&violation, "WebSocket")
+        });
+        let (connection, fetch_internal_id) = if let Some(message) = csp_failure_message {
+            let connection = spawn_failed_connection(
+                socket_id,
+                message,
+                self.page_websocket_sender().event_sender(),
+            );
+            (Some(connection), None)
+        } else if self.is_url_blocked(&url) {
+            let connection = spawn_failed_connection(
+                socket_id,
+                BLOCKED_BY_CLIENT_ERROR_TEXT.to_owned(),
+                self.page_websocket_sender().event_sender(),
+            );
+            (Some(connection), None)
+        } else if cookie_header.is_ok()
+            && self.should_intercept_subresource(SubresourceResourceType::WebSocket)
+        {
+            let request_headers = websocket_interception_request_headers(&context);
+            let internal_id = self.record_pending_websocket_fetch(
+                v8::Global::new(scope, scope.get_current_context()),
+                dispatch_scope,
+                PendingWebSocketConnection {
+                    #[cfg(any(test, feature = "devtools"))]
+                    connector,
+                    #[cfg(any(test, feature = "devtools"))]
+                    socket_id,
+                    #[cfg(any(test, feature = "devtools"))]
+                    protocols,
+                    #[cfg(any(test, feature = "devtools"))]
+                    connect_options: context,
+                },
+                PendingSubresourceFetchInfo {
+                    internal_id: 0,
+                    network_request_handle: None,
+                    frame_id: frame_id.clone(),
+                    document_url: document_url.clone(),
+                    url: url.clone(),
+                    websocket_socket_id: Some(socket_id),
+                    method: "GET".to_owned(),
+                    request_headers,
+                    request_body: None,
+                    request_body_bytes: None,
+                    resource_type: SubresourceResourceType::WebSocket,
+                    request_cookie_report: None,
+                },
+            );
+            (None, Some(internal_id))
+        } else {
+            let connection = match cookie_header {
+                Ok(_) => match connector {
+                    Some(connector) => spawn_connection(
+                        connector,
+                        socket_id,
+                        url.to_string(),
+                        protocols,
+                        context,
+                        self.page_websocket_sender().event_sender(),
+                    ),
+                    None => spawn_standalone_connection(
+                        socket_id,
+                        url.to_string(),
+                        protocols,
+                        context,
+                        self.page_websocket_sender().event_sender(),
+                    ),
+                },
+                Err(error) => spawn_failed_connection(
+                    socket_id,
+                    format!("failed to build WebSocket cookie header: {error}"),
+                    self.page_websocket_sender().event_sender(),
+                ),
+            };
+            (Some(connection), None)
+        };
+        self.websockets.insert(
+            socket_id,
+            WebSocketConnectionState {
+                owner,
+                resource_loader,
+                wrapper: v8::Global::new(scope, wrapper),
+                connection,
+                url,
+                frame_id,
+                document_url,
+                opened: false,
+                #[cfg(any(test, feature = "devtools"))]
+                synthetic_peer: None,
+                #[cfg(any(test, feature = "devtools"))]
+                handshake_controller: None,
+                fetch_internal_id,
+                response_interception_pending: None,
+            },
+        );
+        socket_id
+    }
+
+    pub(crate) fn pause_websocket_handshake_response(
+        &mut self,
+        socket_id: u64,
+        request_headers: moli_fetch::RequestHeaders,
+        response_status: u16,
+        response_headers: moli_fetch::ResponseHeaders,
+    ) -> bool {
+        let Some((internal_id, url)) = self.websockets.get_mut(&socket_id).and_then(|state| {
+            state
+                .response_interception_pending
+                .take()
+                .map(|internal_id| (internal_id, state.url.clone()))
+        }) else {
+            return false;
+        };
+        self.record_pending_websocket_response(PendingWebSocketResponseState {
+            internal_id,
+            socket_id,
+        });
+        self.record_pending_subresource_continue_event(
+            PendingSubresourceContinueEvent::ResponsePaused(PendingSubresourceResponseInfo {
+                internal_id,
+                url: url.clone(),
+                final_url: url,
+                method: "GET".to_owned(),
+                request_headers,
+                request_body: None,
+                resource_type: SubresourceResourceType::WebSocket,
+                request_cookie_report: None,
+                network_request_headers: None,
+                response_status,
+                response_headers: response_headers.into_iter().collect(),
+                response_body: SubresourceResponseBody::from_bytes(Vec::new()),
+                from_cache: false,
+                cache_state: Default::default(),
+            }),
+        );
+        true
+    }
+}
+
+fn websocket_interception_request_headers(
+    context: &WebSocketConnectOptions,
+) -> moli_fetch::RequestHeaders {
+    let mut headers = context.extra_headers.clone();
+    if !headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("origin"))
+    {
+        headers.push(("Origin".to_owned(), context.origin.as_bytes().to_vec()));
+    }
+    if !headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+    {
+        headers.push((
+            "User-Agent".to_owned(),
+            context.user_agent.as_bytes().to_vec(),
+        ));
+    }
+    if let Some(cookie) = context.cookie_header.as_ref()
+        && !headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+    {
+        headers.push(("Cookie".to_owned(), cookie.as_bytes().to_vec()));
+    }
+    headers
+}

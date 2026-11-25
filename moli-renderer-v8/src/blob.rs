@@ -1,0 +1,183 @@
+use moli_file_api::{BlobData, BlobId, BlobStore};
+pub(super) use moli_v8_util::buffer_source_bytes_from_value;
+pub(crate) use moli_webapi::blob::world_wrapper;
+use moli_webapi::blob::{BlobReadMode, BlobRuntime, blob_id_from_object};
+pub(super) use moli_webapi::blob::{
+    blob_constructor_callback, blob_data_from_object, blob_mime_type_from_object,
+    blob_size_from_object, build_blob_object, build_blob_object_from_data,
+    build_blob_object_unpublished, install_blob_template_bindings, is_blob_object,
+};
+use std::sync::{Arc, OnceLock};
+
+use super::{
+    resource_owner::{ResourceOwnerId, current_resource_owner_id},
+    runtime::RendererStoragePartitionIdentity,
+};
+
+pub(crate) mod read;
+mod reading;
+mod stream;
+pub(crate) use reading::{BlobReadTask, stream_blob};
+
+#[derive(Debug, PartialEq, Eq)]
+struct ObjectUrlAccessKey {
+    partition: RendererStoragePartitionIdentity,
+    storage_key: moli_storage_key::MoliStorageKey,
+}
+
+type RendererBlobStore =
+    BlobStore<ResourceOwnerId, RendererStoragePartitionIdentity, ObjectUrlAccessKey>;
+
+static BLOB_STORE: OnceLock<RendererBlobStore> = OnceLock::new();
+
+fn blob_store() -> &'static RendererBlobStore {
+    BLOB_STORE.get_or_init(BlobStore::default)
+}
+
+pub(crate) const RUNTIME: BlobRuntime = BlobRuntime {
+    allocate: |scope, bytes, mime_type| {
+        let owner_id = current_resource_owner_id(scope);
+        let partition_id = current_blob_storage_partition_identity(scope);
+        blob_store().create_blob_from_data(owner_id, partition_id, bytes, mime_type)
+    },
+    data: |id| blob_store().blob_data(id),
+    size: |id| blob_store().blob_size(id),
+    mime_type: |id| blob_store().blob_mime_type(id),
+    release_wrapper: release_blob_wrapper_ref,
+    track_wrapper: |scope, blob, id| {
+        crate::v8_finalizer::track_context_owned_v8_finalizer(scope, blob, move || {
+            release_blob_wrapper_ref(id);
+        });
+    },
+    read: reading::read_blob,
+    stream: reading::stream_blob,
+};
+
+fn current_blob_storage_partition_identity(
+    scope: &mut v8::PinScope<'_, '_>,
+) -> Option<RendererStoragePartitionIdentity> {
+    if let Some(host_ptr) = crate::util::context_host_ptr_from_global_bridge(scope) {
+        return Some(
+            unsafe { &*host_ptr }
+                .browser_context_runtime()
+                .storage_partition_identity(),
+        );
+    }
+    crate::worker::worker_storage_partition_identity(scope)
+}
+
+#[cfg(test)]
+pub(crate) fn live_blob_count_for_test() -> usize {
+    blob_store().live_blob_count()
+}
+
+#[cfg(feature = "devtools")]
+pub(super) fn blob_uuid_from_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) -> Option<String> {
+    blob_id_from_object(scope, object).and_then(blob_uuid)
+}
+
+pub(super) fn blob_bytes_for_uuid(
+    partition_id: &RendererStoragePartitionIdentity,
+    uuid: &str,
+) -> Option<Arc<[u8]>> {
+    blob_store().blob_shared_bytes_by_uuid_in_partition(uuid, partition_id)
+}
+
+pub(super) fn create_object_url_for_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    storage_key: moli_storage_key::MoliStorageKey,
+) -> Option<String> {
+    let blob_id = blob_id_from_object(scope, object)?;
+    let partition = current_blob_storage_partition_identity(scope)?;
+    let owner_id = current_resource_owner_id(scope);
+    let origin = storage_key.origin().to_owned();
+    blob_store().create_object_url_with_access_key(
+        owner_id,
+        blob_id,
+        &origin,
+        Some(ObjectUrlAccessKey {
+            partition,
+            storage_key,
+        }),
+    )
+}
+
+pub(super) fn revoke_object_url(
+    scope: &mut v8::PinScope<'_, '_>,
+    url: &str,
+    storage_key: moli_storage_key::MoliStorageKey,
+) {
+    let Some(partition) = current_blob_storage_partition_identity(scope) else {
+        return;
+    };
+    blob_store().revoke_object_url_with_access_key(
+        url,
+        &ObjectUrlAccessKey {
+            partition,
+            storage_key,
+        },
+    );
+}
+
+pub(crate) fn object_url_download_data(
+    host: &mut crate::native_bridge::PageScriptHost,
+    handle: crate::document_runtime::DomHandle,
+    url: &str,
+) -> Option<(BlobData, String)> {
+    use crate::native_bridge::OwnerDispatchScope;
+
+    // The link's Document owns the request, even when click() is called from
+    // another realm. Never authorize through the ambient JS context.
+    let context = match host.owner_dispatch_scope_for_node(handle)? {
+        OwnerDispatchScope::Top => host.top_document_storage_context(),
+        OwnerDispatchScope::Child(handle) => {
+            host.storage_context_for_child_browsing_context(handle)?
+        }
+        OwnerDispatchScope::LightweightPopup(id) => {
+            host.storage_context_for_lightweight_popup(id)?
+        }
+    };
+    let key = ObjectUrlAccessKey {
+        partition: host.browser_context_runtime().storage_partition_identity(),
+        storage_key: context.storage_key().clone(),
+    };
+    blob_store().object_url_data_with_access_key(url, &key)
+}
+
+pub(super) fn object_url_body_and_type(url: &str) -> Option<(String, String)> {
+    blob_store().object_url_body_and_type(url)
+}
+
+pub(super) fn object_url_bytes_and_type(url: &str) -> Option<(Vec<u8>, String)> {
+    blob_store().object_url_bytes_and_type(url)
+}
+
+#[cfg(feature = "devtools")]
+fn blob_uuid(blob_id: BlobId) -> Option<String> {
+    blob_store().blob_uuid(blob_id)
+}
+
+pub(crate) fn cleanup_owner_resources(owner_id: ResourceOwnerId) {
+    blob_store().retire_owner_resources(owner_id);
+}
+
+pub(super) fn release_blob_wrapper_ref(blob_id: BlobId) {
+    blob_store().release_blob_wrapper_ref(blob_id);
+}
+
+pub(super) use moli_v8_util::{
+    array_buffer_from_bytes, buffer_source_has_shared_or_resizable_backing_store,
+};
+
+fn new_uint8_array_from_bytes<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    bytes: Vec<u8>,
+) -> Option<v8::Local<'s, v8::Uint8Array>> {
+    let len = bytes.len();
+    let buffer = array_buffer_from_bytes(scope, bytes)?;
+    v8::Uint8Array::new(scope, buffer, 0, len)
+}

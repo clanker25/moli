@@ -1,0 +1,248 @@
+use super::NativeDom;
+use super::element::Element;
+use super::node::{NativeNodeId, Node};
+use crate::forms::{
+    OptionNearestSelectStep, OptionNearestSelectTraversal, parse_non_negative_integer_prefix,
+};
+use selectors::attr::CaseSensitivity;
+
+impl NativeDom {
+    pub fn is_html_element_named(&self, node_id: NativeNodeId, local_name: &str) -> bool {
+        self.node(node_id)
+            .is_some_and(|node| node.is_html_element_named(local_name))
+    }
+
+    pub fn option_value(&self, node_id: NativeNodeId) -> Option<String> {
+        let element = self.node(node_id).and_then(Node::as_element)?;
+        if !element.is_html_option() {
+            return None;
+        }
+        Some(element.option_value(self, node_id))
+    }
+
+    pub fn child_element_nodes(&self, root: NativeNodeId) -> Vec<NativeNodeId> {
+        self.child_ids(root)
+            .filter(|handle| self.node(*handle).and_then(Node::as_element).is_some())
+            .collect()
+    }
+
+    pub fn elements_by_tag_name(
+        &self,
+        root: NativeNodeId,
+        tag_name: &str,
+        include_root: bool,
+    ) -> Vec<NativeNodeId> {
+        let is_html_document = self.node_document_is_html_document(root).unwrap_or(false);
+        self.elements_by_tag_name_in_html_document(root, tag_name, include_root, is_html_document)
+    }
+
+    pub fn option_effectively_selected(&self, option_id: NativeNodeId) -> bool {
+        let Some(option) = self.node(option_id).and_then(Node::as_element) else {
+            return false;
+        };
+        if !option.is_html_option() {
+            return false;
+        }
+        if let Some(select_id) = self.option_nearest_ancestor_select(option_id) {
+            return self
+                .select_selected_option_elements(select_id)
+                .contains(&option_id);
+        }
+        option.selected()
+    }
+
+    pub fn select_option_elements(&self, select_id: NativeNodeId) -> Vec<NativeNodeId> {
+        if !self
+            .node(select_id)
+            .and_then(Node::as_element)
+            .is_some_and(Element::is_html_select)
+        {
+            return Vec::new();
+        }
+        self.elements_by_tag_name(select_id, "option", false)
+            .into_iter()
+            .filter(|option_id| self.option_nearest_ancestor_select(*option_id) == Some(select_id))
+            .collect()
+    }
+
+    pub fn option_nearest_ancestor_select(&self, option_id: NativeNodeId) -> Option<NativeNodeId> {
+        if !self
+            .node(option_id)
+            .and_then(Node::as_element)
+            .is_some_and(Element::is_html_option)
+        {
+            return None;
+        }
+
+        let mut traversal = OptionNearestSelectTraversal::default();
+        let mut current = self.parent_node(option_id);
+        while let Some(parent) = current {
+            let Some(element) = self.node(parent).and_then(Node::as_element) else {
+                current = self.parent_node(parent);
+                continue;
+            };
+            match traversal.visit_ancestor(element.namespace(), element.local_name()) {
+                OptionNearestSelectStep::Continue => {}
+                OptionNearestSelectStep::Select => return Some(parent),
+                OptionNearestSelectStep::Blocked => return None,
+            }
+            current = self.parent_node(parent);
+        }
+        None
+    }
+
+    pub fn select_selected_option_elements(&self, select_id: NativeNodeId) -> Vec<NativeNodeId> {
+        let options = self.select_option_elements(select_id);
+        let Some(select) = self.node(select_id).and_then(Node::as_element) else {
+            return Vec::new();
+        };
+        if select.has_attribute_ns("", "multiple") {
+            return options
+                .into_iter()
+                .filter(|option_id| {
+                    self.node(*option_id)
+                        .and_then(Node::as_element)
+                        .is_some_and(Element::selected)
+                })
+                .collect();
+        }
+
+        if let Some(selected) = options.iter().rev().copied().find(|option_id| {
+            self.node(*option_id)
+                .and_then(Node::as_element)
+                .is_some_and(Element::selected)
+        }) {
+            return vec![selected];
+        }
+
+        if select.select_explicit_none() || select_display_size(select) != 1 {
+            return Vec::new();
+        }
+
+        options
+            .into_iter()
+            .find(|option_id| !self.option_is_disabled(*option_id))
+            .into_iter()
+            .collect()
+    }
+
+    pub fn elements_by_tag_name_in_html_document(
+        &self,
+        root: NativeNodeId,
+        tag_name: &str,
+        include_root: bool,
+        is_html_document: bool,
+    ) -> Vec<NativeNodeId> {
+        self.collect_matching_elements(root, include_root, |element, _| {
+            element.matches_tag_name_in_html_document(tag_name, is_html_document)
+        })
+    }
+
+    pub fn elements_by_tag_name_ns(
+        &self,
+        root: NativeNodeId,
+        namespace: Option<&str>,
+        local_name: &str,
+        include_root: bool,
+    ) -> Vec<NativeNodeId> {
+        self.collect_matching_elements(root, include_root, |element, _| {
+            element.matches_tag_name_ns(namespace, local_name)
+        })
+    }
+
+    pub fn elements_by_class_name(
+        &self,
+        root: NativeNodeId,
+        class_name: &str,
+        include_root: bool,
+    ) -> Vec<NativeNodeId> {
+        let document = self.node(root).and_then(|node| {
+            node.as_document().or_else(|| {
+                self.node(node.owner_document()?)
+                    .and_then(Node::as_document)
+            })
+        });
+        let case_sensitivity = if document.is_some_and(|document| {
+            document.quirks_mode() == selectors::matching::QuirksMode::Quirks
+        }) {
+            CaseSensitivity::AsciiCaseInsensitive
+        } else {
+            CaseSensitivity::CaseSensitive
+        };
+        self.collect_matching_elements(root, include_root, |element, _| {
+            element.matches_class_names_with_case_sensitivity(class_name, case_sensitivity)
+        })
+    }
+
+    pub fn elements_by_name(
+        &self,
+        root: NativeNodeId,
+        name: &str,
+        include_root: bool,
+    ) -> Vec<NativeNodeId> {
+        self.collect_matching_elements(root, include_root, |element, _| element.matches_name(name))
+    }
+
+    pub fn node_document_is_html_document(&self, node_id: NativeNodeId) -> Option<bool> {
+        let node = self.node(node_id)?;
+        if let Some(document) = node.as_document() {
+            return Some(document.is_html_document());
+        }
+        let owner_document = node.owner_document()?;
+        self.node(owner_document)
+            .and_then(Node::as_document)
+            .map(|document| document.is_html_document())
+    }
+
+    pub(crate) fn light_subtree_handles(
+        &self,
+        root: NativeNodeId,
+        include_root: bool,
+    ) -> impl Iterator<Item = NativeNodeId> + '_ {
+        let first = self.node(root).and_then(|node| {
+            if include_root {
+                Some(root)
+            } else {
+                node.first_child()
+            }
+        });
+        std::iter::successors(first, move |&handle| {
+            if let Some(child) = self.first_child(handle) {
+                return Some(child);
+            }
+            let mut current = handle;
+            while current != root {
+                if let Some(sibling) = self.next_sibling(current) {
+                    return Some(sibling);
+                }
+                current = self.parent_node(current)?;
+            }
+            None
+        })
+    }
+
+    fn collect_matching_elements(
+        &self,
+        root: NativeNodeId,
+        include_root: bool,
+        mut predicate: impl FnMut(&Element, NativeNodeId) -> bool,
+    ) -> Vec<NativeNodeId> {
+        let mut out = Vec::new();
+        for handle in self.light_subtree_handles(root, include_root) {
+            if let Some(element) = self.node(handle).and_then(Node::as_element)
+                && predicate(element, handle)
+            {
+                out.push(handle);
+            }
+        }
+        out
+    }
+}
+
+pub(crate) fn select_display_size(select: &Element) -> i32 {
+    select
+        .attribute_ns("", "size")
+        .map(parse_non_negative_integer_prefix)
+        .unwrap_or(0)
+        .max(1)
+}

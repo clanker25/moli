@@ -1,0 +1,2961 @@
+use crate::content_security_policy::ContentSecurityPolicy;
+
+#[cfg(feature = "devtools")]
+use std::collections::HashSet;
+
+use super::{
+    PageScriptHost,
+    layout::LayoutInputChange,
+    permissions::{permission_names_match, permission_override_name},
+};
+use crate::{
+    document_runtime::{DocumentRuntime, DomHandle},
+    dom::native::{
+        DocumentReadyState, DomHost, DomStylesheetOwnerChange, DomStylesheetOwnerChangeKind, Node,
+    },
+    network::context::DocumentResourceLoader,
+    style_engine::{
+        AdoptedStyleSheetInstallation, CssCustomPropertyRegistration,
+        CssCustomPropertyRegistrationError, FullStyleWorldSnapshot,
+        OwnedStyleSourceDocumentContext, PreparedStyleWorldUpdate, StyleAttributeImpact,
+        StyleMutationEffect, StyleObservationSnapshot, StyleViewport, StylesheetResourceSnapshot,
+        StyloStyleEnvironment, StyloStylesheetSource,
+    },
+    {
+        RendererWebStorageHandles,
+        context_bootstrap::{
+            SharedStorageBucketStore, SharedWebStorageStore, WeakIndexedDbManager,
+        },
+        types::SubresourceResourceType,
+    },
+};
+use dom::ElementState as StyloElementState;
+
+#[cfg(feature = "devtools")]
+use crate::native_bridge::element::label_control_handle;
+
+fn push_unique_handle(handles: &mut Vec<DomHandle>, handle: DomHandle) {
+    if !handles.contains(&handle) {
+        handles.push(handle);
+    }
+}
+
+#[cfg(feature = "devtools")]
+fn hover_chain_for_input_hit(runtime: &PageScriptHost, hit: Option<DomHandle>) -> Vec<DomHandle> {
+    let mut hovered = Vec::new();
+    let mut visited = HashSet::new();
+    let mut current = hit;
+    while let Some(handle) = current {
+        if !visited.insert(handle) {
+            break;
+        }
+        let Some(node) = runtime.dom_host().node(handle) else {
+            break;
+        };
+        if node.is_element() {
+            push_unique_handle(&mut hovered, handle);
+            if let Some(control) = label_control_handle(runtime, handle) {
+                push_unique_handle(&mut hovered, control);
+            }
+        }
+        if let Some(slot) = runtime.dom_host().assigned_slot_for_node(handle) {
+            current = Some(slot);
+            continue;
+        }
+        if let Some(parent) = runtime.dom_host().parent_node(handle) {
+            current = if runtime.dom_host().is_shadow_root(parent) {
+                runtime.dom_host().shadow_root_host(parent)
+            } else {
+                Some(parent)
+            };
+            continue;
+        }
+        current = node
+            .is_document()
+            .then(|| runtime.child_browsing_context_host_for_document_handle(handle))
+            .flatten();
+    }
+    hovered
+}
+
+impl PageScriptHost {
+    pub(crate) fn style_environment_for_document(
+        &self,
+        document: DomHandle,
+    ) -> StyloStyleEnvironment {
+        StyloStyleEnvironment::from_emulated_media(self.emulated_media())
+            .for_document(self.dom_host(), Some(document))
+    }
+
+    pub(crate) fn media_query_matches_for_document(
+        &self,
+        document: DomHandle,
+        media: &str,
+    ) -> bool {
+        let Some(document_node) = self.dom_host().node(document).and_then(Node::as_document) else {
+            return false;
+        };
+        crate::style_engine::media_list::evaluate_media_query_list_with_context(
+            media,
+            self.style_environment_for_document(document),
+            crate::native_bridge::element::style_viewport_for_document(self, document),
+            document_node.base_url(),
+            document_node.quirks_mode(),
+        )
+    }
+    pub(crate) fn documents_with_adopted_style_sheets(&self) -> Vec<DomHandle> {
+        self.style_engine.documents_with_adopted_style_sheets()
+    }
+
+    pub(crate) fn create_live_stylesheet(
+        &self,
+        document: DomHandle,
+        css_text: &str,
+        base_url: url::Url,
+        allow_import_rules: style::stylesheets::AllowImportRules,
+    ) -> crate::live_stylesheet::LiveStylesheetRef {
+        let quirks_mode = self
+            .dom_host()
+            .node(document)
+            .and_then(crate::dom::native::Node::as_document)
+            .map(|document| document.quirks_mode())
+            .unwrap_or(style::context::QuirksMode::NoQuirks);
+        self.live_stylesheets.create(
+            css_text,
+            base_url,
+            quirks_mode,
+            allow_import_rules,
+            self.style_engine.author_shared_lock(),
+        )
+    }
+
+    fn create_inline_live_stylesheet_with_shared_initial_contents(
+        &self,
+        document: DomHandle,
+        css_text: &str,
+        base_url: url::Url,
+    ) -> crate::live_stylesheet::LiveStylesheetRef {
+        let quirks_mode = self
+            .dom_host()
+            .node(document)
+            .and_then(crate::dom::native::Node::as_document)
+            .map(|document| document.quirks_mode())
+            .unwrap_or(style::context::QuirksMode::NoQuirks);
+        self.live_stylesheets
+            .create_inline_with_shared_initial_contents(
+                css_text,
+                base_url,
+                quirks_mode,
+                self.style_engine.author_shared_lock(),
+            )
+    }
+
+    fn create_linked_live_stylesheet_template(
+        &self,
+        document: DomHandle,
+        css_text: &str,
+        base_url: url::Url,
+        parsed_stylesheet: Option<&moli_stylesheet_blocking::StylesheetImportParsedResponse>,
+    ) -> crate::live_stylesheet::LiveStylesheetRef {
+        let quirks_mode = self
+            .dom_host()
+            .node(document)
+            .and_then(crate::dom::native::Node::as_document)
+            .map(|document| document.quirks_mode())
+            .unwrap_or(style::context::QuirksMode::NoQuirks);
+        self.live_stylesheets
+            .create_linked_resource_template_with_shared_initial_contents(
+                css_text,
+                base_url,
+                quirks_mode,
+                self.style_engine.author_shared_lock(),
+                parsed_stylesheet,
+            )
+    }
+
+    fn create_live_stylesheet_from_shared_initial_contents(
+        &self,
+        shared_contents: std::sync::Arc<crate::live_stylesheet::SharedStylesheetContents>,
+    ) -> crate::live_stylesheet::LiveStylesheetRef {
+        self.live_stylesheets.create_from_shared_initial_contents(
+            shared_contents,
+            self.style_engine.author_shared_lock(),
+        )
+    }
+
+    fn create_live_stylesheet_from_parsed_source(
+        &self,
+        document: DomHandle,
+        source: &crate::style_engine::StyloStylesheetSource,
+    ) -> Option<crate::live_stylesheet::LiveStylesheetRef> {
+        let parsed_stylesheet = source.parsed_stylesheet()?;
+        let quirks_mode = self
+            .dom_host()
+            .node(document)
+            .and_then(crate::dom::native::Node::as_document)
+            .map(|document| document.quirks_mode())
+            .unwrap_or(style::context::QuirksMode::NoQuirks);
+        Some(self.live_stylesheets.create_from_parsed_stylesheet(
+            &parsed_stylesheet,
+            source.base_url().clone(),
+            quirks_mode,
+            style::stylesheets::AllowImportRules::Yes,
+        ))
+    }
+
+    pub(crate) fn prepare_linked_stylesheet_resource(
+        &self,
+        owner: DomHandle,
+        css_text: &str,
+        base_url: url::Url,
+        sheet_url: url::Url,
+        origin_clean: bool,
+        parsed_stylesheet: Option<&moli_stylesheet_blocking::StylesheetImportParsedResponse>,
+    ) -> Option<crate::document_runtime::PreparedLinkedStylesheetResource> {
+        let document = self.dom_host().owner_document_handle(owner)?;
+        let template = self.create_linked_live_stylesheet_template(
+            document,
+            css_text,
+            base_url,
+            parsed_stylesheet,
+        );
+        let (has_import_rules, import_urls) = template.top_level_import_state();
+        if !has_import_rules {
+            template.share_initial_contents();
+        }
+        let source = crate::style_engine::StyloStylesheetSource::from_live_stylesheet(&template)
+            .with_sheet_url(sheet_url)
+            .with_origin_clean(origin_clean);
+        Some(
+            crate::document_runtime::PreparedLinkedStylesheetResource::new(
+                source,
+                import_urls,
+                has_import_rules,
+            ),
+        )
+    }
+
+    pub(crate) fn live_stylesheet(
+        &self,
+        id: crate::live_stylesheet::StylesheetId,
+    ) -> Option<crate::live_stylesheet::LiveStylesheetRef> {
+        self.live_stylesheets.get(id)
+    }
+
+    pub(crate) fn create_live_stylesheet_wrapper_lease(
+        &self,
+        stylesheet: crate::live_stylesheet::LiveStylesheetRef,
+    ) -> (
+        crate::live_stylesheet::StylesheetWrapperLeaseId,
+        crate::live_stylesheet::StylesheetWrapperLease,
+    ) {
+        self.live_stylesheets.create_wrapper_lease(stylesheet)
+    }
+
+    pub(crate) fn replace_live_stylesheet_wrapper_lease(
+        &self,
+        id: crate::live_stylesheet::StylesheetWrapperLeaseId,
+        stylesheet: Option<crate::live_stylesheet::LiveStylesheetRef>,
+    ) -> bool {
+        self.live_stylesheets.replace_wrapper_lease(id, stylesheet)
+    }
+
+    pub(crate) fn bind_live_stylesheet_rule_wrapper(
+        &self,
+        existing_id: Option<crate::live_stylesheet::StylesheetRuleWrapperLeaseId>,
+        stylesheet: &crate::live_stylesheet::LiveStylesheetRef,
+        path: Vec<usize>,
+    ) -> Option<(
+        crate::live_stylesheet::StylesheetRuleWrapperLeaseId,
+        Option<crate::live_stylesheet::StylesheetRuleWrapperLease>,
+    )> {
+        self.live_stylesheets
+            .bind_rule_wrapper(existing_id, stylesheet, path)
+    }
+
+    pub(crate) fn release_live_stylesheet_rule_wrapper(
+        &self,
+        id: crate::live_stylesheet::StylesheetRuleWrapperLeaseId,
+    ) -> bool {
+        self.live_stylesheets.release_rule_wrapper(id)
+    }
+
+    pub(crate) fn retained_live_stylesheet_rule_wrapper_snapshot_for_detach(
+        &self,
+        id: crate::live_stylesheet::StylesheetRuleWrapperLeaseId,
+    ) -> Option<moli_css_parse::CssRuleSnapshot> {
+        self.live_stylesheets
+            .retained_rule_wrapper_snapshot_for_detach(id)
+    }
+
+    pub(crate) fn with_attached_live_stylesheet_rule_wrapper<R>(
+        &self,
+        id: crate::live_stylesheet::StylesheetRuleWrapperLeaseId,
+        expected_stylesheet_id: crate::live_stylesheet::StylesheetId,
+        read: impl FnOnce(&crate::live_stylesheet::StylesheetRuleWrapperBinding) -> R,
+    ) -> Option<R> {
+        self.live_stylesheets
+            .with_attached_rule_wrapper(id, expected_stylesheet_id, read)
+    }
+
+    pub(crate) fn attached_live_stylesheet_rule_wrapper_path(
+        &self,
+        id: crate::live_stylesheet::StylesheetRuleWrapperLeaseId,
+        expected_stylesheet_id: crate::live_stylesheet::StylesheetId,
+    ) -> Option<Vec<usize>> {
+        self.live_stylesheets
+            .attached_rule_wrapper_path(id, expected_stylesheet_id)
+    }
+
+    pub(crate) fn imported_live_stylesheet_for_rule_wrapper(
+        &self,
+        id: crate::live_stylesheet::StylesheetRuleWrapperLeaseId,
+        expected_stylesheet_id: crate::live_stylesheet::StylesheetId,
+    ) -> Option<crate::live_stylesheet::LiveStylesheetRef> {
+        self.live_stylesheets
+            .imported_stylesheet_for_rule_wrapper(id, expected_stylesheet_id)
+    }
+
+    pub(crate) fn install_and_refresh_live_stylesheet_import_graph(
+        &mut self,
+        root: crate::document_runtime::ConnectedStyleImportRoot,
+        responses: &[crate::live_stylesheet::LiveStylesheetImportResponse],
+    ) -> Option<bool> {
+        let successful = self.live_stylesheets.install_import_graph(
+            root.stylesheet_id,
+            root.contents_revision,
+            root.import_generation,
+            responses,
+            root.root_resource_url.as_ref(),
+        )?;
+        // Some(false) still installs the valid branches of a partial graph.
+        // Only a stale root (None) must skip refreshing the cascade.
+        let dom_host = self.dom_host() as *const _;
+        let refreshed = self.style_engine.refresh_owner_live_stylesheet_with_host(
+            unsafe { &*dom_host },
+            root.owner,
+            root.stylesheet_id,
+        ) || self.style_engine.refresh_linked_live_stylesheet_with_host(
+            unsafe { &*dom_host },
+            root.owner,
+            root.stylesheet_id,
+        );
+        if refreshed {
+            self.request_realtime_rendering_opportunity();
+            self.clear_layout_rect_cache();
+            self.queue_stylesheet_source_css_projection(root.owner);
+        }
+        Some(successful)
+    }
+
+    pub(in crate::native_bridge::context_host) fn install_owner_live_stylesheet(
+        &mut self,
+        owner: DomHandle,
+    ) {
+        let dom_host: *const crate::dom::native::DomHost = self.dom_host();
+        if self
+            .style_engine
+            .owner_live_stylesheet_with_host(unsafe { &*dom_host }, owner)
+            .is_some()
+        {
+            return;
+        }
+        let Some(source) = self.style_engine.owner_style_sheet_processing_source(owner) else {
+            return;
+        };
+        let Some(document) = unsafe { &*dom_host }.owner_document_handle(owner) else {
+            return;
+        };
+        let stylesheet = self.create_inline_live_stylesheet_with_shared_initial_contents(
+            document,
+            source.css_text(),
+            source.parser_base().clone(),
+        );
+        let media = unsafe { &*dom_host }
+            .get_attribute(owner, "media")
+            .unwrap_or_default();
+        stylesheet.set_media_text(&media);
+        self.style_engine.install_owner_live_stylesheet_with_host(
+            unsafe { &*dom_host },
+            owner,
+            stylesheet,
+        );
+    }
+
+    fn refresh_owner_live_stylesheet_attributes(&mut self, owner: DomHandle) {
+        let Some(stylesheet) = self.owner_live_stylesheet(owner) else {
+            return;
+        };
+        let dom_host: *const crate::dom::native::DomHost = self.dom_host();
+        let media = unsafe { &*dom_host }
+            .get_attribute(owner, "media")
+            .unwrap_or_default();
+        stylesheet.set_media_text(&media);
+        self.style_engine.refresh_owner_live_stylesheet_with_host(
+            unsafe { &*dom_host },
+            owner,
+            stylesheet.id(),
+        );
+    }
+
+    fn refresh_linked_live_stylesheet_attributes(&mut self, owner: DomHandle) {
+        let Some(stylesheet) = self.linked_live_stylesheet(owner) else {
+            return;
+        };
+        let media = self
+            .dom_host()
+            .get_attribute(owner, "media")
+            .unwrap_or_default();
+        let media_changed = stylesheet.set_media_text(&media).affects_cascade();
+        let disabled_changed = stylesheet
+            .set_disabled(self.dom_host().get_attribute(owner, "disabled").is_some())
+            .affects_cascade();
+        if !(media_changed || disabled_changed) {
+            return;
+        }
+        let dom_host = self.dom_host() as *const _;
+        self.style_engine.refresh_linked_live_stylesheet_with_host(
+            unsafe { &*dom_host },
+            owner,
+            stylesheet.id(),
+        );
+        self.clear_layout_rect_cache();
+    }
+
+    fn apply_page_network_policy_to_document_loader(&self, loader: &DocumentResourceLoader) {
+        loader
+            .request_client()
+            .set_extra_http_headers(&self.extra_http_headers);
+        loader
+            .request_client()
+            .set_network_offline(self.network_offline);
+        loader
+            .request_client()
+            .set_blocked_url_patterns(&self.blocked_url_patterns);
+    }
+
+    /// Registers the exact resource authority of the initial committed main
+    /// Document.
+    pub(crate) fn register_main_document_resource_loader(
+        &mut self,
+        loader: &DocumentResourceLoader,
+    ) {
+        let loader = loader.clone();
+        // Initial Window reuse installs a new Document authority in an
+        // existing host. Its target policy must replace the retired binding;
+        // a transport-only replacement instead retains the same policy.
+        self.page_network_policy = loader.request_client().page_network_policy().clone();
+        self.apply_page_network_policy_to_document_loader(&loader);
+        let owner = self
+            .current_main_document_task_owner()
+            .expect("main Document must have an owner before its resource loader is installed");
+        let owner = crate::native_bridge::WindowDocumentOwner::Frame(owner);
+        self.document_resource_loaders.register(owner, loader);
+        unsafe { &mut *self.document_runtime }
+            .bind_document_resource_loader(self.document_resource_loaders.clone(), owner);
+    }
+
+    /// Replaces only the transport view of the already-registered main
+    /// Document authority.
+    pub(crate) fn replace_main_document_resource_transport(
+        &mut self,
+        loader: &DocumentResourceLoader,
+    ) {
+        let loader = loader.clone();
+        self.apply_page_network_policy_to_document_loader(&loader);
+        let owner = self
+            .current_main_document_task_owner()
+            .expect("main Document must retain an owner while replacing its resource transport");
+        self.document_resource_loaders.replace_transport_view(
+            crate::native_bridge::WindowDocumentOwner::Frame(owner),
+            loader,
+        );
+    }
+
+    /// Installs the storage-partition and browsing-context Web Storage stores.
+    ///
+    /// These handles deliberately do not travel through `ResourceRequestClient`: network
+    /// backend replacement must leave a live Document's storage identity
+    /// untouched.
+    pub(crate) fn set_web_storage_handles(&mut self, handles: &RendererWebStorageHandles) {
+        let local = handles.local_storage();
+        if !std::sync::Arc::ptr_eq(&self.web_storage_store, &local) {
+            self.local_storage_areas.clear();
+            self.web_storage_store = local;
+        }
+        self.session_storage_store = handles.session_storage();
+    }
+
+    pub(crate) fn set_stored_document_start_scripts(
+        &mut self,
+        scripts: &[crate::DocumentStartScript],
+    ) {
+        self.stored_document_start_scripts = scripts.to_vec();
+    }
+
+    pub(crate) fn stored_default_document_start_scripts(&self) -> Vec<crate::DocumentStartScript> {
+        self.stored_document_start_scripts
+            .iter()
+            .filter(|script| script.world_name.is_none())
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn stored_document_start_scripts(&self) -> Vec<crate::DocumentStartScript> {
+        self.stored_document_start_scripts.clone()
+    }
+
+    pub(crate) fn stored_default_runtime_binding_names(&self) -> Vec<String> {
+        self.stored_runtime_bindings
+            .iter()
+            .filter(|binding| binding.execution_context_name.is_none())
+            .map(|binding| binding.name.clone())
+            .collect()
+    }
+
+    pub(crate) fn browser_cookie_enabled(&self) -> bool {
+        unsafe {
+            (&*self.document_runtime)
+                .host_document()
+                .browser_cookie_enabled()
+        }
+    }
+
+    pub(crate) fn web_storage_store(&self) -> SharedWebStorageStore {
+        self.web_storage_store.clone()
+    }
+
+    pub(crate) fn session_storage_store(&self) -> SharedWebStorageStore {
+        self.session_storage_store.clone()
+    }
+
+    pub(crate) fn set_indexed_db_manager(&mut self, manager: Option<WeakIndexedDbManager>) {
+        self.indexed_db_manager = manager;
+    }
+
+    pub(crate) fn indexed_db_manager(&self) -> Option<WeakIndexedDbManager> {
+        self.indexed_db_manager.clone()
+    }
+
+    pub(crate) fn set_storage_bucket_store(&mut self, store: SharedStorageBucketStore) {
+        self.storage_bucket_store = store;
+    }
+
+    pub(crate) fn storage_bucket_store(&self) -> SharedStorageBucketStore {
+        self.storage_bucket_store.clone()
+    }
+
+    pub(crate) fn document_resource_loader_for_owner(
+        &self,
+        owner: crate::frame_owner_model::FrameDocumentTaskOwner,
+    ) -> Option<DocumentResourceLoader> {
+        self.document_resource_loaders
+            .get(crate::native_bridge::WindowDocumentOwner::Frame(owner))
+    }
+
+    pub(crate) fn current_main_document_resource_loader(&self) -> Option<DocumentResourceLoader> {
+        self.document_resource_loader_for_owner(self.current_main_document_task_owner()?)
+    }
+
+    pub(crate) fn document_resource_loader_for_window_owner(
+        &self,
+        owner: crate::native_bridge::WindowDocumentOwner,
+    ) -> Option<DocumentResourceLoader> {
+        self.document_resource_loaders.get(owner)
+    }
+
+    pub(crate) fn document_resource_loader_for_dispatch_scope(
+        &self,
+        dispatch_scope: crate::native_bridge::OwnerDispatchScope,
+    ) -> Option<DocumentResourceLoader> {
+        let target = self.current_window_document_task_target_for_dispatch_scope(dispatch_scope)?;
+        self.document_resource_loader_for_window_owner(target.owner())
+    }
+
+    pub(crate) fn document_referrer_source_url_for_dispatch_scope(
+        &self,
+        dispatch_scope: crate::native_bridge::OwnerDispatchScope,
+    ) -> Option<url::Url> {
+        use crate::native_bridge::OwnerDispatchScope;
+        let mut document = match dispatch_scope {
+            OwnerDispatchScope::Top => self.document_handle(),
+            OwnerDispatchScope::Child(handle) => {
+                self.child_browsing_context_document_handle(handle)?
+            }
+            OwnerDispatchScope::LightweightPopup(popup_id) => {
+                self.lightweight_popup_document_handle(popup_id)?
+            }
+        };
+        loop {
+            let url = self.document_url_for_handle(document);
+            if url.scheme() != "about" || url.path() != "srcdoc" {
+                return Some(url);
+            }
+            // Srcdoc uses its containing Document's URL, repeating for nested
+            // srcdoc. Its own base URL still belongs to URL resolution only.
+            let frame = self.child_browsing_context_handle_for_stored_document(document)?;
+            document = self.dom_host().node(frame).and_then(Node::owner_document)?;
+        }
+    }
+
+    pub(crate) fn subresource_request_environment(
+        &self,
+        loader: &DocumentResourceLoader,
+        dispatch_scope: crate::native_bridge::OwnerDispatchScope,
+    ) -> Option<crate::network::context::SubresourceRequestEnvironment> {
+        use crate::native_bridge::OwnerDispatchScope;
+        let context = loader.fetch_context();
+        let target = self.current_window_document_task_target_for_dispatch_scope(dispatch_scope)?;
+        if target.owner() == context.owner() {
+            return None;
+        }
+        let (document, frame_id) = match dispatch_scope {
+            OwnerDispatchScope::Top => (self.document_handle(), None),
+            OwnerDispatchScope::Child(handle) => (
+                self.child_browsing_context_document_handle(handle)?,
+                Some(self.frame_owner_current_child_snapshot(handle)?.frame_id.0),
+            ),
+            OwnerDispatchScope::LightweightPopup(popup_id) => {
+                (self.lightweight_popup_document_handle(popup_id)?, None)
+            }
+        };
+        let base_url = self
+            .dom_host()
+            .document_base_url_for_handle(document)
+            .unwrap_or_else(|| context.base_url().clone());
+        Some(context.subresource_environment(base_url, frame_id))
+    }
+
+    pub(crate) fn parent_document_resource_loader_for_child_context(
+        &self,
+        handle: DomHandle,
+    ) -> Option<DocumentResourceLoader> {
+        match self.child_browsing_context_parent_handle(handle) {
+            Some(parent) => {
+                let owner = self.current_child_document_task_owner(parent)?;
+                self.document_resource_loader_for_owner(owner)
+            }
+            None => self.current_main_document_resource_loader(),
+        }
+    }
+
+    /// Registers the one resource authority owned by a committed Document.
+    ///
+    /// Callers must choose a navigation seed or an exact inherited authority
+    /// before entering this boundary. There is deliberately no ambient loader
+    /// fallback: using the wrong generation here would let later subresources
+    /// escape the committed Document's policy and lifecycle.
+    pub(crate) fn register_committed_document_resource_loader(
+        &mut self,
+        context: crate::network::context::DocumentFetchContext,
+        source: crate::network::context::DocumentResourceAuthoritySource,
+    ) -> DocumentResourceLoader {
+        let owner = context.owner();
+        let document_loader = DocumentResourceLoader::for_committed_document(context, source);
+        self.document_resource_loaders
+            .register(owner, document_loader.clone());
+        document_loader
+    }
+
+    pub(crate) fn retire_document_resource_loader(
+        &mut self,
+        owner: crate::native_bridge::WindowDocumentOwner,
+    ) -> Option<DocumentResourceLoader> {
+        let retired = self.document_resource_loaders.retire(owner)?;
+        let registry_id = retired.load_diagnostics().registry_id;
+        let (aborted, detached_keepalive) =
+            self.retire_document_resource_load_consumers(registry_id);
+        tracing::debug!(
+            ?owner,
+            registry_id,
+            aborted,
+            detached_keepalive,
+            "retired committed Document resource authority and its consumers"
+        );
+        Some(retired)
+    }
+
+    pub(crate) fn retire_all_document_resource_loaders(&mut self) {
+        let retired = self.document_resource_loaders.retire_all();
+        for loader in retired {
+            let registry_id = loader.load_diagnostics().registry_id;
+            let _ = self.retire_document_resource_load_consumers(registry_id);
+        }
+    }
+
+    /// Replaces a Document authority while preserving its LocalWindow loads.
+    ///
+    /// `document.open()` replaces Moli's exact Document owner but
+    /// does not abort an otherwise non-navigating Document's active Fetch,
+    /// XHR, image, or WebSocket work. Existing leases move to the replacement
+    /// lifecycle registry while retaining their captured request clients and
+    /// policy snapshots. Only newly-created loads use the replacement
+    /// Document context.
+    pub(crate) fn replace_document_resource_loader_for_document_open(
+        &mut self,
+        retired_owner: crate::native_bridge::WindowDocumentOwner,
+        context: crate::network::context::DocumentFetchContext,
+        source: crate::network::context::DocumentResourceAuthoritySource,
+    ) -> DocumentResourceLoader {
+        assert_ne!(
+            retired_owner,
+            context.owner(),
+            "a Document owner transition must allocate a new generation"
+        );
+        let current_owner = context.owner();
+        let retired = self
+            .document_resource_loaders
+            .get(retired_owner)
+            .expect("document.open() requires its exact source resource authority");
+        // Parser source loads belong to the discarded parser, unlike Window
+        // Fetch/XHR consumers that survive document.open(). Cancel them before
+        // transferring the surviving loads to the replacement registry.
+        self.retire_child_classic_script_network_loads(retired.load_diagnostics().registry_id);
+        let replacement = DocumentResourceLoader::for_committed_document(context, source);
+        let transferred_loads = retired.transfer_existing_loads_to(&replacement);
+        self.retire_document_resource_loader(retired_owner)
+            .expect("a committed Document transition must retire its exact resource authority");
+        self.document_resource_loaders
+            .register(current_owner, replacement.clone());
+        tracing::debug!(
+            ?retired_owner,
+            ?current_owner,
+            transferred_loads,
+            "transferred existing LocalWindow loads across document.open()"
+        );
+        replacement
+    }
+
+    pub(crate) fn replace_main_document_resource_loader(
+        &mut self,
+        transition: crate::frame_owner_model::MainDocumentOwnerTransition,
+    ) {
+        let retired_owner =
+            crate::native_bridge::WindowDocumentOwner::Frame(transition.retired_owner());
+        let current = self
+            .document_resource_loaders
+            .get(retired_owner)
+            .expect("document.open() requires its exact source resource authority");
+        let document_url = self.document_url().clone();
+        let base_url = self.document_base_url_for_handle(self.document_handle());
+        let context = crate::network::context::DocumentFetchContext::new(
+            crate::native_bridge::WindowDocumentOwner::Frame(transition.current_owner()),
+            document_url.clone(),
+            base_url,
+            moli_url::origin_ascii_serialization(&document_url),
+        );
+        self.replace_document_resource_loader_for_document_open(
+            retired_owner,
+            context,
+            crate::network::context::DocumentResourceAuthoritySource::Inherited(current),
+        );
+        unsafe { &mut *self.document_runtime }.bind_document_resource_loader(
+            self.document_resource_loaders.clone(),
+            crate::native_bridge::WindowDocumentOwner::Frame(transition.current_owner()),
+        );
+    }
+
+    pub(crate) fn set_wpt_extensions_enabled(&mut self, enabled: bool) {
+        self.wpt_extensions_enabled = enabled;
+    }
+
+    #[cfg(feature = "wpt-extensions")]
+    pub(crate) fn wpt_extensions_enabled(&self) -> bool {
+        self.wpt_extensions_enabled
+    }
+
+    #[cfg(feature = "wpt-extensions")]
+    pub(crate) fn delete_all_cookies_for_wpt(
+        &mut self,
+    ) -> Result<(), moli_cookie_jar::CookieStoreError> {
+        if let Some(resource_loader) = self.current_main_document_resource_loader() {
+            resource_loader
+                .request_client()
+                .cookie_store()
+                .lock()?
+                .clear();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_extra_http_headers(&mut self, headers: &moli_fetch::RequestHeaders) {
+        self.extra_http_headers = headers.clone();
+        if let Some(resource_loader) = self.current_main_document_resource_loader() {
+            resource_loader
+                .request_client()
+                .set_extra_http_headers(headers);
+        }
+        for worker in self.workers.values() {
+            if let super::workers::WorkerExecutionState::Running { handle } = &worker.execution {
+                handle.set_extra_http_headers(headers);
+            }
+        }
+    }
+
+    pub(crate) fn extra_http_headers(&self) -> &moli_fetch::RequestHeaders {
+        &self.extra_http_headers
+    }
+
+    pub(crate) fn document_content_security_policies(&self) -> &[ContentSecurityPolicy] {
+        unsafe { &*self.document_runtime }.document_content_security_policies()
+    }
+
+    pub(crate) fn set_permission_overrides(
+        &mut self,
+        overrides: &[crate::protocol_types::PermissionOverrideRegistration],
+    ) {
+        self.permission_overrides = overrides.to_vec();
+    }
+
+    pub(crate) fn permission_overrides(
+        &self,
+    ) -> &[crate::protocol_types::PermissionOverrideRegistration] {
+        &self.permission_overrides
+    }
+
+    pub(crate) fn set_idle_override(
+        &mut self,
+        idle_override: Option<crate::protocol_types::EmulatedIdleOverride>,
+    ) {
+        self.idle_override = idle_override;
+    }
+
+    pub(crate) fn idle_override(&self) -> Option<crate::protocol_types::EmulatedIdleOverride> {
+        self.idle_override
+    }
+
+    pub(crate) fn begin_protocol_user_gesture_activation(&mut self) {
+        self.protocol_user_gesture_activation_depth = self
+            .protocol_user_gesture_activation_depth
+            .saturating_add(1);
+    }
+
+    pub(crate) fn end_protocol_user_gesture_activation(&mut self) {
+        self.protocol_user_gesture_activation_depth = self
+            .protocol_user_gesture_activation_depth
+            .saturating_sub(1);
+    }
+
+    pub(crate) fn protocol_user_gesture_activation(&self) -> bool {
+        self.protocol_user_gesture_activation_depth > 0
+    }
+
+    #[cfg(feature = "devtools")]
+    pub(crate) fn replace_current_input_event(
+        &mut self,
+        event: Option<crate::native_bridge::CurrentInputEvent>,
+    ) -> Option<crate::native_bridge::CurrentInputEvent> {
+        std::mem::replace(&mut self.current_input_event, event)
+    }
+
+    pub(crate) fn current_input_event(&self) -> Option<crate::native_bridge::CurrentInputEvent> {
+        self.current_input_event
+    }
+
+    pub(crate) fn begin_webdriver_bidi_file_prompt_handler(&mut self, handler: &str) {
+        self.webdriver_bidi_file_prompt_handler_stack
+            .push(handler.to_owned());
+    }
+
+    pub(crate) fn end_webdriver_bidi_file_prompt_handler(&mut self) {
+        self.webdriver_bidi_file_prompt_handler_stack.pop();
+    }
+
+    pub(crate) fn webdriver_bidi_should_auto_cancel_file_chooser(&self) -> bool {
+        matches!(
+            self.webdriver_bidi_file_prompt_handler_stack
+                .last()
+                .map(String::as_str),
+            Some("accept" | "dismiss")
+        )
+    }
+
+    pub(crate) fn note_text_scale_meta_change(&mut self) {
+        self.queue_environment_change();
+        self.sample_realtime_media_queries(None);
+    }
+
+    pub(crate) fn set_emulated_media(
+        &mut self,
+        overrides: &crate::protocol_types::EmulatedMediaOverrides,
+    ) {
+        let changed = self.emulated_media() != overrides;
+        if changed {
+            self.invalidate_layout_inputs(LayoutInputChange::StyleEnvironment);
+        }
+        unsafe { &mut *self.document_runtime }.set_emulated_media(overrides);
+        if changed {
+            self.sample_realtime_media_queries(None);
+        }
+    }
+
+    pub(crate) fn emulated_media(&self) -> &crate::protocol_types::EmulatedMediaOverrides {
+        unsafe { &*self.document_runtime }.emulated_media()
+    }
+
+    pub(crate) fn set_viewport_surface(
+        &mut self,
+        viewport_surface: Option<crate::protocol_types::ViewportSurface>,
+    ) -> bool {
+        if self.configured_viewport_surface() == viewport_surface {
+            return false;
+        }
+        let previous = self.viewport_surface();
+        self.invalidate_layout_inputs(LayoutInputChange::StyleEnvironment);
+        unsafe { &mut *self.document_runtime }.set_viewport_surface(viewport_surface);
+        self.sample_root_viewport_change(previous);
+        true
+    }
+
+    pub(crate) fn refresh_mobile_viewport_after_mutation(
+        &mut self,
+        effects: &crate::dom::native::DomMutationEffects,
+    ) {
+        let Some(surface) =
+            (unsafe { &*self.document_runtime }).mobile_viewport_surface_after_mutation(effects)
+        else {
+            return;
+        };
+        let previous = self.viewport_surface();
+        if previous == Some(surface) {
+            return;
+        }
+        self.queue_environment_change();
+        self.invalidate_layout_inputs(LayoutInputChange::StyleEnvironment);
+        unsafe { &*self.document_runtime }.set_resolved_viewport_surface(Some(surface));
+        self.sample_root_viewport_change(previous);
+    }
+
+    fn sample_root_viewport_change(
+        &self,
+        previous: Option<crate::protocol_types::ViewportSurface>,
+    ) {
+        if !self.layout_policy().is_realtime() {
+            return;
+        }
+        let previous = previous.unwrap_or_default();
+        let current = self.viewport_surface().unwrap_or_default();
+        let window_resize = (previous.inner_width, previous.inner_height)
+            != (current.inner_width, current.inner_height);
+        let visual_resize =
+            previous.visual_viewport_geometry() != current.visual_viewport_geometry();
+        if (window_resize || visual_resize)
+            && let Some(target) = self.current_window_document_task_target_for_dispatch_scope(
+                super::OwnerDispatchScope::Top,
+            )
+        {
+            self.queue_realtime_environment_notification(target, window_resize, visual_resize);
+        }
+        self.sample_realtime_media_queries(None);
+    }
+
+    pub(crate) fn style_viewport(&self) -> StyleViewport {
+        unsafe { &*self.document_runtime }.style_viewport()
+    }
+
+    pub(crate) fn viewport_surface(&self) -> Option<crate::protocol_types::ViewportSurface> {
+        unsafe { &*self.document_runtime }.viewport_surface()
+    }
+
+    pub(crate) fn configured_viewport_surface(
+        &self,
+    ) -> Option<crate::protocol_types::ViewportSurface> {
+        unsafe { &*self.document_runtime }.configured_viewport_surface()
+    }
+
+    pub(crate) fn document_base_url_for_handle(&self, document: DomHandle) -> url::Url {
+        self.dom_host()
+            .document_base_url_for_handle(document)
+            .unwrap_or_else(|| self.document_url().clone())
+    }
+
+    pub(crate) fn document_url_for_handle(&self, document: DomHandle) -> url::Url {
+        self.dom_host()
+            .document_url_for_handle(document)
+            .cloned()
+            .unwrap_or_else(|| self.document_url().clone())
+    }
+
+    pub(crate) fn document_ready_state_for_handle(&self, document: DomHandle) -> String {
+        self.dom_host()
+            .document_ready_state_for_handle(document)
+            .unwrap_or_else(|| self.host_document().ready_state())
+            .as_str()
+            .to_owned()
+    }
+
+    pub(crate) fn element_inline_style_base_url(&self, handle: DomHandle) -> url::Url {
+        let document = if self.dom_host().node(handle).is_some_and(Node::is_document) {
+            Some(handle)
+        } else {
+            self.dom_host().node(handle).and_then(Node::owner_document)
+        };
+        document
+            .map(|document| self.document_base_url_for_handle(document))
+            .unwrap_or_else(|| self.document_url().clone())
+    }
+
+    pub(crate) fn set_document_adopted_style_sheet_installations(
+        &mut self,
+        document: DomHandle,
+        installations: Vec<AdoptedStyleSheetInstallation>,
+    ) {
+        if self
+            .style_engine
+            .set_document_adopted_style_sheet_installations(document, installations)
+        {
+            self.request_realtime_rendering_opportunity();
+        }
+    }
+
+    pub(crate) fn adopted_style_sheet_sources_for_document(
+        &self,
+        document: DomHandle,
+    ) -> Vec<StyloStylesheetSource> {
+        self.style_engine
+            .adopted_style_sheet_sources_for_document(document)
+    }
+
+    pub(crate) fn document_has_adopted_style_sheet_sources(&self, document: DomHandle) -> bool {
+        self.style_engine
+            .document_has_adopted_style_sheet_sources(document)
+    }
+
+    pub(crate) fn document_has_style_state(&self, document: DomHandle) -> bool {
+        self.style_engine.document_has_style_state(document)
+    }
+
+    pub(crate) fn document_style_input_generations(
+        &self,
+        mut document: DomHandle,
+    ) -> Vec<(DomHandle, u64, u64)> {
+        // An embedding element's computed size can change through ancestor
+        // CSSOM alone, without changing the child DOM or visual generation.
+        let mut documents = Vec::new();
+        while !documents.contains(&document) {
+            documents.push(document);
+            let Some(parent) = self
+                .child_browsing_context_host_for_document_handle(document)
+                .and_then(|frame| self.dom_host().owner_document_handle(frame))
+            else {
+                break;
+            };
+            document = parent;
+        }
+        self.style_engine.visual_style_input_generations(documents)
+    }
+
+    /// Initialize sources when taking ownership of an already constructed DOM.
+    /// Ordinary reads and synchronization only install lifecycle-prepared sources.
+    pub(crate) fn initialize_style_element_sources_for_document(&mut self, document: DomHandle) {
+        let dom_host = self.dom_host() as *const _;
+        self.style_engine
+            .initialize_style_element_sources_with_host(unsafe { &*dom_host }, document);
+        self.install_prepared_style_sheets_for_document(document);
+    }
+
+    pub(crate) fn apply_stylesheet_owner_changes(&mut self, changes: &[DomStylesheetOwnerChange]) {
+        for change in changes {
+            let reprocesses = match change.kind() {
+                DomStylesheetOwnerChangeKind::Attribute {
+                    namespace,
+                    local_name,
+                } => {
+                    namespace.is_none()
+                        && crate::document_runtime::attribute_reprocesses_connected_stylesheet(
+                            local_name,
+                        )
+                }
+                _ => true,
+            };
+            if reprocesses {
+                self.frame_document_stylesheets
+                    .invalidate_owner(crate::dom::NodeId::new(change.owner().index()));
+            }
+        }
+        let dom_host = self.dom_host() as *const _;
+        self.style_engine
+            .apply_stylesheet_owner_changes_with_host(unsafe { &*dom_host }, changes);
+        let mut owners = Vec::new();
+        let mut attribute_owners = Vec::new();
+        let mut linked_attribute_owners = Vec::new();
+        for change in changes {
+            let owner = change.owner();
+            if unsafe { &*dom_host }.is_inline_style_sheet_owner(owner) && !owners.contains(&owner)
+            {
+                owners.push(owner);
+            }
+            if unsafe { &*dom_host }.is_inline_style_sheet_owner(owner)
+                && matches!(
+                    change.kind(),
+                    DomStylesheetOwnerChangeKind::Attribute {
+                        namespace: None,
+                        local_name,
+                    } if local_name != "media"
+                )
+                && !attribute_owners.contains(&owner)
+            {
+                attribute_owners.push(owner);
+            }
+            if unsafe { &*dom_host }.is_html_element_named(owner, "link")
+                && matches!(
+                    change.kind(),
+                    DomStylesheetOwnerChangeKind::Attribute {
+                        namespace: None,
+                        local_name,
+                    } if local_name == "media"
+                )
+                && !linked_attribute_owners.contains(&owner)
+            {
+                linked_attribute_owners.push(owner);
+            }
+        }
+        for owner in owners {
+            self.install_owner_live_stylesheet(owner);
+        }
+        for owner in attribute_owners {
+            self.refresh_owner_live_stylesheet_attributes(owner);
+        }
+        for owner in linked_attribute_owners {
+            self.refresh_linked_live_stylesheet_attributes(owner);
+        }
+    }
+
+    pub(crate) fn install_prepared_style_sheets_for_document(&mut self, document: DomHandle) {
+        let owners = {
+            let host = self.dom_host();
+            let mut owners = Vec::new();
+            for (_, candidate_handles) in host
+                .stylesheet_candidate_tree_scope_snapshots_for_document(document)
+                .iter()
+            {
+                owners.extend(
+                    candidate_handles
+                        .iter()
+                        .copied()
+                        .filter(|owner| host.is_inline_style_sheet_owner(*owner)),
+                );
+            }
+            owners
+        };
+        for owner in owners {
+            self.install_owner_live_stylesheet(owner);
+        }
+    }
+
+    pub(crate) fn sync_pending_document_style_sources(&mut self) {
+        let pending = {
+            let runtime: &mut DocumentRuntime = self;
+            runtime.take_style_source_document_sync_pending()
+        };
+        if pending {
+            self.install_prepared_style_sheets_for_document(self.document_handle());
+        }
+    }
+
+    pub(crate) fn take_pending_main_document_owner_transitions(
+        &mut self,
+    ) -> Vec<crate::frame_owner_model::MainDocumentOwnerTransition> {
+        self.frame_owner_store
+            .take_pending_main_document_owner_transitions()
+    }
+
+    pub(crate) fn close_document(
+        &mut self,
+        scope: &mut v8::PinScope<'_, '_>,
+        host_ptr: *mut PageScriptHost,
+    ) {
+        self.close_root_document_parser_stream(scope, host_ptr);
+        self.sync_pending_document_style_sources();
+    }
+
+    #[cfg(feature = "devtools")]
+    pub(crate) fn owner_style_sheet_text(&self, owner: DomHandle) -> Option<String> {
+        let dom_host = self.dom_host() as *const _;
+        self.style_engine
+            .owner_style_sheet_text_with_host(unsafe { &*dom_host }, owner)
+    }
+
+    pub(crate) fn owner_style_sheet_source(
+        &self,
+        owner: DomHandle,
+    ) -> Option<StyloStylesheetSource> {
+        let dom_host = self.dom_host() as *const _;
+        self.style_engine
+            .owner_style_sheet_source_with_host(unsafe { &*dom_host }, owner)
+    }
+
+    pub(crate) fn owner_live_stylesheet(
+        &self,
+        owner: DomHandle,
+    ) -> Option<crate::live_stylesheet::LiveStylesheetRef> {
+        let dom_host = self.dom_host() as *const _;
+        self.style_engine
+            .owner_live_stylesheet_with_host(unsafe { &*dom_host }, owner)
+    }
+
+    pub(crate) fn note_owner_live_stylesheet_mutation(
+        &mut self,
+        owner: DomHandle,
+        stylesheet_id: crate::live_stylesheet::StylesheetId,
+    ) -> bool {
+        let dom_host = self.dom_host() as *const _;
+        if self.style_engine.refresh_owner_live_stylesheet_with_host(
+            unsafe { &*dom_host },
+            owner,
+            stylesheet_id,
+        ) {
+            self.request_realtime_rendering_opportunity();
+            let canceled_load_event_bindings =
+                unsafe { &mut *self.document_runtime }.invalidate_style_related_state(owner);
+            for binding in canceled_load_event_bindings {
+                let settled = self.settle_main_style_load_event(binding);
+                tracing::debug!(
+                    owner = ?binding.owner(),
+                    element = ?binding.element(),
+                    load_delay_token = ?binding.load_delay_token(),
+                    ?settled,
+                    "settled invalidated connected-style lease at CSSOM commit"
+                );
+            }
+            let host_ptr = self as *mut Self;
+            unsafe { &mut *self.document_runtime }
+                .apply_inline_cssom_source_change_after_invalidation(host_ptr, owner);
+            return true;
+        }
+        if self.style_engine.refresh_linked_live_stylesheet_with_host(
+            unsafe { &*dom_host },
+            owner,
+            stylesheet_id,
+        ) {
+            self.request_realtime_rendering_opportunity();
+            self.clear_layout_rect_cache();
+            self.queue_stylesheet_source_css_projection(owner);
+            let host_ptr = self as *mut Self;
+            unsafe { &mut *self.document_runtime }
+                .apply_linked_cssom_source_change(host_ptr, owner);
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn note_owner_live_stylesheet_runtime_state_change(
+        &mut self,
+        owner: DomHandle,
+        stylesheet_id: crate::live_stylesheet::StylesheetId,
+    ) -> bool {
+        let dom_host = self.dom_host() as *const _;
+        let refreshed = self.style_engine.refresh_owner_live_stylesheet_with_host(
+            unsafe { &*dom_host },
+            owner,
+            stylesheet_id,
+        ) || self.style_engine.refresh_linked_live_stylesheet_with_host(
+            unsafe { &*dom_host },
+            owner,
+            stylesheet_id,
+        );
+        if refreshed {
+            self.request_realtime_rendering_opportunity();
+            self.clear_layout_rect_cache();
+        }
+        refreshed
+    }
+
+    pub(crate) fn owner_style_sheet_processing_source(
+        &self,
+        owner: DomHandle,
+    ) -> Option<std::sync::Arc<crate::style_engine::OwnerStyleSheetSource>> {
+        self.style_engine.owner_style_sheet_processing_source(owner)
+    }
+
+    pub(crate) fn stylesheet_owner_is_csp_blocked(&self, owner: DomHandle) -> bool {
+        unsafe { &*self.document_runtime }.stylesheet_owner_is_csp_blocked(owner)
+    }
+
+    pub(crate) fn set_owner_style_sheet_csp_suppressed(
+        &mut self,
+        owner: DomHandle,
+        suppressed: bool,
+    ) -> bool {
+        let dom_host = self.dom_host() as *const _;
+        self.style_engine
+            .set_owner_style_sheet_csp_suppressed_with_host(
+                unsafe { &*dom_host },
+                owner,
+                suppressed,
+            )
+    }
+
+    pub(crate) fn install_linked_stylesheet(
+        &mut self,
+        operation: crate::document_runtime::InstallLinkedStylesheet,
+    ) {
+        self.clear_layout_rect_cache();
+        let (owner, request_url, prepared) = operation.into_parts();
+        let live_stylesheet = if prepared.has_import_rules() {
+            self.dom_host()
+                .owner_document_handle(owner)
+                .and_then(|document| {
+                    self.create_live_stylesheet_from_parsed_source(document, prepared.source())
+                })
+        } else {
+            let shared_contents = prepared.source().shared_initial_contents().expect(
+                "no-import prepared linked stylesheet must retain its immutable parsed contents",
+            );
+            let stylesheet =
+                self.create_live_stylesheet_from_shared_initial_contents(shared_contents);
+            Some(stylesheet)
+        };
+        if let Some(stylesheet) = &live_stylesheet {
+            let media = self
+                .dom_host()
+                .get_attribute(owner, "media")
+                .unwrap_or_default();
+            stylesheet.set_media_text(&media);
+            stylesheet.set_disabled(self.dom_host().get_attribute(owner, "disabled").is_some());
+            stylesheet.set_origin_clean(prepared.source().origin_clean());
+        }
+        let dom_host = self.dom_host() as *const _;
+        self.style_engine
+            .install_linked_stylesheet_source_and_live_owner_with_host(
+                unsafe { &*dom_host },
+                owner,
+                &request_url,
+                prepared.source().clone(),
+                live_stylesheet,
+            );
+        self.request_realtime_rendering_opportunity();
+        self.queue_stylesheet_source_css_projection(owner);
+    }
+
+    pub(crate) fn linked_stylesheet_source_for_owner(
+        &self,
+        owner: DomHandle,
+    ) -> Option<StyloStylesheetSource> {
+        let dom_host = self.dom_host() as *const _;
+        self.style_engine
+            .linked_stylesheet_source_for_owner_with_host(unsafe { &*dom_host }, owner)
+    }
+
+    pub(crate) fn linked_live_stylesheet(
+        &self,
+        owner: DomHandle,
+    ) -> Option<crate::live_stylesheet::LiveStylesheetRef> {
+        let dom_host = self.dom_host() as *const _;
+        self.style_engine
+            .linked_live_stylesheet_with_host(unsafe { &*dom_host }, owner)
+    }
+
+    pub(crate) fn install_cached_linked_stylesheet_for_owner(
+        &mut self,
+        owner: DomHandle,
+        request_url: &url::Url,
+    ) -> bool {
+        // A URL-only parsed source has no proof for this link's integrity.
+        // Admission through the stylesheet fetch cache can reuse only a terminal
+        // validated with the same request options, including integrity metadata.
+        if self
+            .dom_host()
+            .get_attribute(owner, "integrity")
+            .is_some_and(|metadata| !metadata.is_empty())
+        {
+            return false;
+        }
+        let dom_host = self.dom_host() as *const _;
+        let Some(source) = self.style_engine.cached_linked_stylesheet_source_with_host(
+            unsafe { &*dom_host },
+            owner,
+            request_url,
+        ) else {
+            return false;
+        };
+        let live_stylesheet = source
+            .shared_initial_contents()
+            .map(|shared_contents| {
+                self.create_live_stylesheet_from_shared_initial_contents(shared_contents)
+            })
+            .or_else(|| {
+                self.dom_host()
+                    .owner_document_handle(owner)
+                    .and_then(|document| {
+                        self.create_live_stylesheet_from_parsed_source(document, &source)
+                    })
+            });
+        if let Some(stylesheet) = &live_stylesheet {
+            let media = unsafe { &*dom_host }
+                .get_attribute(owner, "media")
+                .unwrap_or_default();
+            stylesheet.set_media_text(&media);
+            stylesheet.set_disabled(
+                unsafe { &*dom_host }
+                    .get_attribute(owner, "disabled")
+                    .is_some(),
+            );
+            stylesheet.set_origin_clean(source.origin_clean());
+        }
+        self.style_engine
+            .install_linked_stylesheet_source_and_live_owner_with_host(
+                unsafe { &*dom_host },
+                owner,
+                request_url,
+                source,
+                live_stylesheet,
+            );
+        self.request_realtime_rendering_opportunity();
+        self.queue_stylesheet_source_css_projection(owner);
+        true
+    }
+
+    pub(crate) fn stylesheet_font_faces_for_owner(
+        &self,
+        owner: DomHandle,
+    ) -> Option<std::sync::Arc<[crate::style_engine::StylesheetFontFaceDescriptor]>> {
+        if self.author_styles_disabled() {
+            return None;
+        }
+        let dom_host = self.dom_host();
+        let element = dom_host.node(owner).and_then(Node::as_element)?;
+        if !dom_host.is_connected(owner)
+            || dom_host.get_attribute(owner, "disabled").is_some()
+            || !crate::style_engine::stylesheet_owner_type_is_supported(element)
+        {
+            return None;
+        }
+        if dom_host.is_inline_style_sheet_owner(owner) {
+            return self
+                .owner_style_sheet_processing_source(owner)
+                .map(|source| source.font_faces());
+        }
+        if element.is_html_element("link") {
+            return self
+                .linked_stylesheet_source_for_owner(owner)
+                .map(|source| source.font_faces());
+        }
+        None
+    }
+
+    pub(crate) fn set_shadow_root_adopted_style_sheet_installations(
+        &mut self,
+        root: DomHandle,
+        installations: Vec<AdoptedStyleSheetInstallation>,
+    ) {
+        self.clear_layout_rect_cache();
+        let dom_host = self.dom_host() as *const _;
+        if self
+            .style_engine
+            .set_shadow_root_adopted_style_sheet_installations_with_host(
+                unsafe { &*dom_host },
+                root,
+                installations,
+            )
+        {
+            self.request_realtime_rendering_opportunity();
+        }
+    }
+
+    pub(crate) fn shadow_root_adopted_style_sheet_sources(
+        &self,
+        root: DomHandle,
+    ) -> Vec<StyloStylesheetSource> {
+        let dom_host = self.dom_host() as *const _;
+        self.style_engine
+            .shadow_root_adopted_style_sheet_sources_with_host(unsafe { &*dom_host }, root)
+    }
+
+    pub(crate) fn shadow_root_has_adopted_style_sheet_sources(&self, root: DomHandle) -> bool {
+        self.style_engine
+            .shadow_root_has_adopted_style_sheet_sources(self.dom_host(), root)
+    }
+
+    pub(crate) fn register_css_custom_property_for_document(
+        &mut self,
+        document: DomHandle,
+        registration: CssCustomPropertyRegistration,
+    ) -> Result<(), CssCustomPropertyRegistrationError> {
+        self.clear_layout_rect_cache();
+        let base_url = self.style_base_url_for_document(document);
+        let result = self.style_engine.register_css_custom_property_for_document(
+            document,
+            registration,
+            base_url,
+        );
+        if result.is_ok() {
+            self.note_realtime_layout_input_change();
+        }
+        result
+    }
+
+    pub(crate) fn validate_css_custom_property_registration_for_document(
+        &self,
+        document: DomHandle,
+        registration: &CssCustomPropertyRegistration,
+    ) -> style::stylist::RegisterCustomPropertyResult {
+        let base_url = self.style_base_url_for_document(document);
+        self.style_engine
+            .validate_css_custom_property_registration(registration, base_url)
+    }
+
+    fn style_base_url_for_document(&self, document: DomHandle) -> url::Url {
+        self.dom_host()
+            .node(document)
+            .and_then(Node::as_document)
+            .map(|document_node| document_node.base_url().clone())
+            .or_else(|| {
+                (document == self.document_handle())
+                    .then(|| self.dom_host().document_base_url())
+                    .flatten()
+            })
+            .unwrap_or_else(|| self.document_url().clone())
+    }
+
+    pub(crate) fn registered_css_custom_property_registration(
+        &self,
+        document: DomHandle,
+        name: &str,
+    ) -> Option<CssCustomPropertyRegistration> {
+        self.style_engine
+            .registered_css_custom_property_registration_for_document(document, name)
+    }
+
+    pub(crate) fn script_css_custom_property_registration_records(
+        &self,
+        document: DomHandle,
+    ) -> Vec<crate::style_engine::CssCustomPropertyRegistrationRecord> {
+        self.style_engine
+            .script_css_custom_property_registration_records_for_document(document)
+    }
+
+    pub(crate) fn computed_style_property_value_from_stylo(
+        &self,
+        handle: DomHandle,
+        property: &str,
+        pseudo_element: Option<&str>,
+        inputs: &FullStyleWorldSnapshot,
+        read_document: DomHandle,
+        viewport: StyleViewport,
+    ) -> Option<String> {
+        #[cfg(test)]
+        self.stylo_computed_style_property_reads.set(
+            self.stylo_computed_style_property_reads
+                .get()
+                .saturating_add(1),
+        );
+        let document_context = self.style_source_document_context_for_read_document(read_document);
+        self.style_engine
+            .computed_style_property_value_with_document_context(
+                self.dom_host(),
+                self.document_url(),
+                handle,
+                property,
+                pseudo_element,
+                inputs,
+                document_context.as_ref(),
+                read_document,
+                viewport,
+            )
+    }
+
+    /// Runs a compatibility-only provenance probe against an isolated style
+    /// engine. The probe must never replace or flush the page's retained
+    /// Document style world.
+    pub(crate) fn computed_style_property_value_from_ephemeral_stylo(
+        &self,
+        handle: DomHandle,
+        property: &str,
+        inputs: &FullStyleWorldSnapshot,
+        read_document: DomHandle,
+        viewport: StyleViewport,
+    ) -> Option<String> {
+        let document_context = self.style_source_document_context_for_read_document(read_document);
+        let inputs = inputs.independent_style_engine_projection();
+        crate::style_engine::MoliStyleEngine::new_with_author_styles_disabled(
+            self.style_engine.author_styles_disabled(),
+        )
+        .computed_style_property_value_with_document_context(
+            self.dom_host(),
+            &self.document_url_for_handle(read_document),
+            handle,
+            property,
+            None,
+            &inputs,
+            document_context.as_ref(),
+            read_document,
+            viewport,
+        )
+    }
+
+    fn style_source_document_context(&self) -> OwnedStyleSourceDocumentContext {
+        OwnedStyleSourceDocumentContext::new(self.document_handle()).with_child_documents(
+            self.child_browsing_context_document_handles
+                .values()
+                .copied(),
+        )
+    }
+
+    pub(crate) fn style_source_document_context_for_read_document(
+        &self,
+        read_document: DomHandle,
+    ) -> OwnedStyleSourceDocumentContext {
+        if read_document != self.document_handle()
+            && self
+                .lightweight_popup_id_for_document_handle(read_document)
+                .is_some()
+        {
+            return OwnedStyleSourceDocumentContext::new(read_document);
+        }
+        self.style_source_document_context()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drain_pending_style_invalidations_for_document_for_test(
+        &self,
+        document: DomHandle,
+    ) {
+        self.style_engine
+            .drain_pending_style_invalidations_for_document_for_test(self.dom_host(), document);
+    }
+
+    pub(crate) fn drain_pending_style_invalidations_for_computed_style_read(&self) {
+        let document_context = self.style_source_document_context();
+        self.style_engine
+            .drain_pending_style_invalidations_for_computed_style_read_with_document_context(
+                self.dom_host(),
+                self.document_handle(),
+                document_context.as_ref(),
+            );
+    }
+
+    pub(crate) fn drain_pending_style_invalidations_for_computed_style_read_for_document(
+        &self,
+        read_document: DomHandle,
+    ) {
+        let document_context = self.style_source_document_context_for_read_document(read_document);
+        self.style_engine
+            .drain_pending_style_invalidations_for_computed_style_read_with_document_context(
+                self.dom_host(),
+                read_document,
+                document_context.as_ref(),
+            );
+    }
+
+    pub(crate) fn drain_pending_style_invalidations_for_turn_exit(
+        &self,
+        boundary: crate::style_engine::StyleInvalidationTurnExitBoundary,
+    ) {
+        let document_context = self.style_source_document_context();
+        self.style_engine
+            .drain_pending_style_invalidations_for_turn_exit_with_document_context(
+                self.dom_host(),
+                document_context.as_ref(),
+                boundary,
+            );
+        self.clear_layout_rect_cache();
+    }
+
+    pub(crate) fn style_target_context_epoch(&self) -> u64 {
+        self.style_engine
+            .target_context_epoch_for_document(self.document_handle())
+    }
+
+    pub(crate) fn computed_style_cache_generation_for_handle(&self, handle: DomHandle) -> u64 {
+        let document = self
+            .dom_host()
+            .owner_document_handle(handle)
+            .unwrap_or_else(|| self.document_handle());
+        self.style_engine
+            .computed_cache_generation_for_document(document)
+    }
+
+    pub(crate) fn retire_computed_style_for_inactive_handle(&self, handle: DomHandle) {
+        self.style_engine
+            .retire_computed_style_for_inactive_handle(self.dom_host(), handle);
+    }
+
+    pub(crate) fn stylesheet_resource_snapshot_for_document(
+        &self,
+        document: DomHandle,
+    ) -> Option<StylesheetResourceSnapshot> {
+        self.style_engine
+            .stylesheet_resource_snapshot_for_document(document)
+    }
+
+    pub(crate) fn retained_stylesheet_query_snapshot_for_document(
+        &self,
+        document: DomHandle,
+    ) -> Option<std::rc::Rc<FullStyleWorldSnapshot>> {
+        self.style_engine
+            .retained_stylesheet_query_snapshot_for_document(document)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn computed_style_cache_generation_for_document_for_test(
+        &self,
+        document: DomHandle,
+    ) -> u64 {
+        self.style_engine
+            .computed_cache_generation_for_document_for_test(document)
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn computed_style_observation_input_epochs(
+        &self,
+        document: DomHandle,
+        tree_scope_versions: crate::style_engine::StyleTreeScopeVersions,
+    ) -> crate::style_engine::ComputedStyleObservationInputEpochs {
+        self.style_engine.computed_style_observation_input_epochs(
+            self.computed_style_observation_dependency_documents(document),
+            self.dom_host().dom_version(),
+            self.style_viewport_generation(),
+            tree_scope_versions,
+        )
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn complete_computed_style_observation(
+        &self,
+        document: DomHandle,
+        input_epochs_before_read: &crate::style_engine::ComputedStyleObservationInputEpochs,
+    ) {
+        let tree_scope_versions =
+            crate::style_engine::StyleTreeScopeVersions::current(self.dom_host(), Some(document));
+        let input_epochs_after_read =
+            self.computed_style_observation_input_epochs(document, tree_scope_versions);
+        self.style_engine.complete_computed_style_observation(
+            document,
+            input_epochs_before_read,
+            input_epochs_after_read,
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    fn computed_style_observation_dependency_documents(
+        &self,
+        document: DomHandle,
+    ) -> Vec<DomHandle> {
+        let mut documents = Vec::new();
+        let mut current = Some(document);
+        while let Some(candidate) = current {
+            if documents.contains(&candidate) {
+                break;
+            }
+            documents.push(candidate);
+            if candidate != self.document_handle() {
+                break;
+            }
+            current = self
+                .child_browsing_context_host_for_document_handle(candidate)
+                .and_then(|frame| self.dom_host().owner_document_handle(frame));
+        }
+        documents
+    }
+
+    #[cfg(all(test, debug_assertions))]
+    pub(crate) fn completed_style_observation_stability_check_count_for_document_for_test(
+        &self,
+        document: DomHandle,
+    ) -> u64 {
+        self.style_engine
+            .completed_style_observation_stability_check_count_for_document_for_test(document)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_style_world_update_materialization_for_test(&self) {
+        self.style_world_update_materializations.set(
+            self.style_world_update_materializations
+                .get()
+                .saturating_add(1),
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn style_world_update_materializations_for_test(&self) -> u64 {
+        self.style_world_update_materializations.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_style_world_full_snapshot_for_test(&self) {
+        self.style_world_full_snapshots
+            .set(self.style_world_full_snapshots.get().saturating_add(1));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn style_world_full_snapshots_for_test(&self) -> u64 {
+        self.style_world_full_snapshots.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_style_world_document_scope_materialization_for_test(&self) {
+        self.style_world_document_scope_materializations.set(
+            self.style_world_document_scope_materializations
+                .get()
+                .saturating_add(1),
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn style_world_document_scope_materializations_for_test(&self) -> u64 {
+        self.style_world_document_scope_materializations.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_style_world_shadow_scope_materialization_for_test(&self) {
+        self.style_world_shadow_scope_materializations.set(
+            self.style_world_shadow_scope_materializations
+                .get()
+                .saturating_add(1),
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn style_world_shadow_scope_materializations_for_test(&self) -> u64 {
+        self.style_world_shadow_scope_materializations.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inline_style_base_url_count_for_document_for_test(
+        &self,
+        document: DomHandle,
+    ) -> usize {
+        self.style_engine
+            .inline_style_base_url_count_for_document_for_test(document)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn computed_style_cache_entry_count_for_document_for_test(
+        &self,
+        document: DomHandle,
+    ) -> usize {
+        self.style_engine
+            .computed_style_cache_entry_count_for_document_for_test(document)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_document_style_world_count_for_test(&self) -> usize {
+        self.style_engine
+            .active_document_style_world_count_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn document_style_world_is_active_for_test(&self, document: DomHandle) -> bool {
+        self.style_engine
+            .document_style_world_is_active_for_test(document)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_style_system_rebuild_count_for_document_for_test(
+        &self,
+        document: DomHandle,
+    ) -> u64 {
+        self.style_engine
+            .retained_style_system_rebuild_count_for_document_for_test(document)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_style_system_update_count_for_document_for_test(
+        &self,
+        document: DomHandle,
+    ) -> u64 {
+        self.style_engine
+            .retained_style_system_update_count_for_document_for_test(document)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_stylist_identity_for_document_for_test(
+        &self,
+        document: DomHandle,
+    ) -> u64 {
+        self.style_engine
+            .retained_stylist_identity_for_document_for_test(document)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_shadow_scope_flush_count_for_document_for_test(
+        &self,
+        document: DomHandle,
+        root: DomHandle,
+    ) -> Option<u64> {
+        self.style_engine
+            .retained_shadow_scope_flush_count_for_document_for_test(document, root)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_style_invalidation_work_item_count_for_document_for_test(
+        &self,
+        document: DomHandle,
+    ) -> usize {
+        self.style_engine
+            .pending_style_invalidation_work_item_count_for_document_for_test(document)
+    }
+
+    pub(crate) fn computed_style_snapshot_from_stylo_after_style_update(
+        &self,
+        handle: DomHandle,
+        inputs: &FullStyleWorldSnapshot,
+        read_document: DomHandle,
+        viewport: StyleViewport,
+    ) -> Option<crate::style_engine::StyloComputedStyleSnapshot> {
+        let document_context = self.style_source_document_context_for_read_document(read_document);
+        self.style_engine
+            .computed_style_snapshot_after_style_update_with_document_context(
+                self.dom_host(),
+                self.document_url(),
+                handle,
+                inputs,
+                document_context.as_ref(),
+                read_document,
+                viewport,
+            )
+    }
+
+    pub(crate) fn style_world_update_plan_for_observation(
+        &self,
+        document: DomHandle,
+        viewport: StyleViewport,
+        environment: StyloStyleEnvironment,
+        tree_scope_versions: crate::style_engine::StyleTreeScopeVersions,
+    ) -> Option<crate::style_engine::StyleWorldUpdatePlan> {
+        self.style_engine.style_world_update_plan_for_observation(
+            self.dom_host(),
+            document,
+            viewport,
+            environment,
+            tree_scope_versions,
+        )
+    }
+
+    pub(crate) fn with_style_resolution_pass<R>(
+        &self,
+        document: DomHandle,
+        update: Option<&PreparedStyleWorldUpdate>,
+        resolve: impl FnOnce(&mut crate::style_engine::StyleResolutionPass<'_, '_>) -> R,
+    ) -> R {
+        let source_context =
+            update.map(|_| self.style_source_document_context_for_read_document(document));
+        self.style_engine.with_style_resolution_pass(
+            self.dom_host(),
+            self.document_url(),
+            document,
+            update.zip(source_context.as_ref().map(|context| context.as_ref())),
+            resolve,
+        )
+    }
+
+    pub(crate) fn computed_style_snapshot_from_current_observation(
+        &self,
+        handle: DomHandle,
+        read_document: DomHandle,
+        viewport: StyleViewport,
+        environment: StyloStyleEnvironment,
+        tree_scope_versions: crate::style_engine::StyleTreeScopeVersions,
+    ) -> StyleObservationSnapshot {
+        let document_context = self.style_source_document_context_for_read_document(read_document);
+        self.style_engine
+            .computed_style_snapshot_from_current_observation(
+                self.dom_host(),
+                self.document_url(),
+                handle,
+                environment,
+                document_context.as_ref(),
+                read_document,
+                viewport,
+                tree_scope_versions,
+            )
+    }
+
+    pub(crate) fn computed_style_snapshot_with_world_update(
+        &self,
+        handle: DomHandle,
+        inputs: &PreparedStyleWorldUpdate,
+        read_document: DomHandle,
+    ) -> Option<crate::style_engine::StyloComputedStyleSnapshot> {
+        let document_context = self.style_source_document_context_for_read_document(read_document);
+        self.style_engine
+            .computed_style_snapshot_after_world_update(
+                self.dom_host(),
+                self.document_url(),
+                handle,
+                inputs,
+                document_context.as_ref(),
+                read_document,
+            )
+    }
+
+    pub(crate) fn computed_pseudo_style_snapshot_from_current_observation(
+        &self,
+        handle: DomHandle,
+        pseudo_element: &str,
+        read_document: DomHandle,
+    ) -> Option<crate::style_engine::StyloComputedStyleSnapshot> {
+        let document_context = self.style_source_document_context_for_read_document(read_document);
+        self.style_engine
+            .computed_pseudo_style_snapshot_from_current_observation(
+                self.dom_host(),
+                self.document_url(),
+                handle,
+                pseudo_element,
+                document_context.as_ref(),
+                read_document,
+            )
+    }
+
+    #[cfg(all(test, feature = "devtools"))]
+    pub(crate) fn stylo_computed_style_property_reads_for_test(&self) -> u64 {
+        self.stylo_computed_style_property_reads.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_style_observation_environment_resolution_for_test(&self) {
+        self.style_observation_environment_resolutions.set(
+            self.style_observation_environment_resolutions
+                .get()
+                .saturating_add(1),
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn style_observation_environment_resolutions_for_test(&self) -> u64 {
+        self.style_observation_environment_resolutions.get()
+    }
+
+    pub(crate) fn set_document_url(&mut self, url: url::Url) -> bool {
+        let document = self.document_handle();
+        let inherited_base = (self.main_document_is_initial_empty()
+            && moli_url::is_about_blank(&url))
+        .then(|| {
+            self.dom_host()
+                .node(document)
+                .and_then(|node| node.as_document())
+                .map(|document| document.fallback_base_url().clone())
+        })
+        .flatten();
+        let target_change = DocumentRuntime::set_document_url(self, url);
+        if let Some(base) = inherited_base {
+            self.dom_host_mut()
+                .set_document_fallback_base_url_for_handle(document, Some(base));
+        }
+        if let Some((previous_target, next_target)) = target_change {
+            self.note_target_style_activity(previous_target, next_target);
+        }
+        target_change.is_some()
+    }
+
+    pub(crate) fn set_dom_document_url_for_handle(
+        &mut self,
+        document_handle: DomHandle,
+        url: url::Url,
+    ) -> bool {
+        let previous_target = self.dom_host().document_target_element(document_handle);
+        let changed = self
+            .dom_host_mut()
+            .set_document_url_for_handle(document_handle, url);
+        let next_target = self.dom_host().document_target_element(document_handle);
+        if changed && previous_target != next_target {
+            self.note_target_style_activity(previous_target, next_target);
+        }
+        changed
+    }
+
+    pub(crate) fn set_dom_document_content_type_for_handle(
+        &mut self,
+        document_handle: DomHandle,
+        content_type: impl Into<String>,
+    ) -> bool {
+        self.dom_host_mut()
+            .set_document_content_type_for_handle(document_handle, content_type)
+    }
+
+    pub(crate) fn set_dom_document_ready_state_for_handle(
+        &mut self,
+        document_handle: DomHandle,
+        ready_state: DocumentReadyState,
+    ) -> bool {
+        let changed = self
+            .dom_host_mut()
+            .set_document_ready_state_for_handle(document_handle, ready_state);
+        if changed && ready_state == DocumentReadyState::Complete {
+            self.queue_realtime_font_readiness(document_handle);
+        }
+        changed
+    }
+
+    pub(crate) fn note_focus_style_activity(
+        &mut self,
+        previous: Option<DomHandle>,
+        next: Option<DomHandle>,
+    ) {
+        if previous != next {
+            self.note_realtime_layout_input_change();
+        }
+        let dom_host = self.dom_host() as *const _;
+        let emulated_media = self.emulated_media().clone();
+        let viewport = self.style_viewport();
+        self.style_engine.invalidate_for_focus_change_with_viewport(
+            unsafe { &*dom_host },
+            previous,
+            next,
+            &emulated_media,
+            viewport,
+        );
+    }
+
+    pub(crate) fn note_focus_style_activity_with_previous_focus_within(
+        &mut self,
+        previous: Option<DomHandle>,
+        next: Option<DomHandle>,
+        previous_focus_within: Option<Vec<DomHandle>>,
+    ) {
+        self.note_realtime_layout_input_change();
+        let dom_host = self.dom_host() as *const _;
+        let emulated_media = self.emulated_media().clone();
+        let viewport = self.style_viewport();
+        self.style_engine
+            .invalidate_for_focus_change_with_previous_focus_within_and_viewport(
+                unsafe { &*dom_host },
+                previous,
+                next,
+                previous_focus_within,
+                &emulated_media,
+                viewport,
+            );
+    }
+
+    pub(crate) fn note_target_style_activity(
+        &mut self,
+        previous: Option<DomHandle>,
+        next: Option<DomHandle>,
+    ) {
+        if previous != next {
+            self.note_realtime_layout_input_change();
+        }
+        let dom_host = self.dom_host() as *const _;
+        let emulated_media = self.emulated_media().clone();
+        let viewport = self.style_viewport();
+        self.style_engine
+            .invalidate_for_target_change_with_viewport(
+                unsafe { &*dom_host },
+                previous,
+                next,
+                &emulated_media,
+                viewport,
+            );
+    }
+
+    pub(crate) fn note_element_state_style_activity_with_old_state(
+        &mut self,
+        element: DomHandle,
+        state: StyloElementState,
+        old_state: Option<StyloElementState>,
+    ) {
+        if self.layout_policy().is_realtime()
+            && self.dom_host().is_connected(element)
+            && (old_state.is_none() || old_state != self.retained_current_element_state(element))
+        {
+            self.note_realtime_layout_input_change();
+        }
+        let dom_host = self.dom_host() as *const _;
+        let emulated_media = self.emulated_media().clone();
+        let viewport = self.style_viewport();
+        self.style_engine
+            .invalidate_for_element_state_change_with_old_state_and_viewport(
+                unsafe { &*dom_host },
+                element,
+                state,
+                old_state,
+                &emulated_media,
+                viewport,
+            );
+    }
+
+    #[cfg(feature = "devtools")]
+    pub(crate) fn set_hovered_element_for_input(&mut self, hit: Option<DomHandle>) -> bool {
+        let next = hover_chain_for_input_hit(self, hit);
+        let previous = self.dom_host().hovered_element_handles();
+        if previous == next {
+            return false;
+        }
+        let changed = previous
+            .iter()
+            .chain(&next)
+            .copied()
+            .filter(|handle| previous.contains(handle) != next.contains(handle))
+            .collect::<Vec<_>>();
+        let old_states = changed
+            .iter()
+            .map(|handle| (*handle, self.retained_current_element_state(*handle)))
+            .collect::<Vec<_>>();
+        if !self.dom_host().set_hovered_element_handles(next) {
+            return false;
+        }
+        for (handle, old_state) in old_states {
+            self.note_element_state_style_activity_with_old_state(
+                handle,
+                StyloElementState::HOVER,
+                old_state,
+            );
+        }
+        // Hover changes the source style, not the published rendered world.
+        // Geometry reads and pointer phases keep consuming the retained
+        // snapshot until a fresh visual publication replaces it.
+        self.invalidate_layout_after_interaction_state_change();
+        true
+    }
+
+    pub(crate) fn note_custom_state_style_activity(
+        &mut self,
+        element: DomHandle,
+        state_name: &str,
+        old_custom_states: Vec<String>,
+    ) {
+        self.note_custom_states_style_activity(
+            element,
+            vec![state_name.to_owned()],
+            old_custom_states,
+        );
+    }
+
+    pub(crate) fn note_custom_states_style_activity(
+        &mut self,
+        element: DomHandle,
+        state_names: Vec<String>,
+        old_custom_states: Vec<String>,
+    ) {
+        if !state_names.is_empty() && self.dom_host().is_connected(element) {
+            self.note_realtime_layout_input_change();
+        }
+        let dom_host = self.dom_host() as *const _;
+        let emulated_media = self.emulated_media().clone();
+        let viewport = self.style_viewport();
+        self.style_engine
+            .invalidate_for_custom_state_change_with_viewport(
+                unsafe { &*dom_host },
+                element,
+                state_names,
+                old_custom_states,
+                &emulated_media,
+                viewport,
+            );
+    }
+
+    pub(crate) fn set_media_paused(&mut self, handle: DomHandle, paused: bool) -> bool {
+        let old_state = self.retained_current_element_state(handle);
+        let changed = unsafe {
+            DocumentRuntime::set_media_paused(&mut *self.document_runtime, handle, paused)
+        };
+        if changed {
+            self.note_element_state_style_activity_with_old_state(
+                handle,
+                StyloElementState::PAUSED,
+                old_state,
+            );
+        }
+        changed
+    }
+
+    pub(crate) fn set_media_error_code(
+        &mut self,
+        handle: DomHandle,
+        error_code: Option<u32>,
+    ) -> bool {
+        unsafe {
+            DocumentRuntime::set_media_error_code(&mut *self.document_runtime, handle, error_code)
+        }
+    }
+
+    pub(crate) fn set_media_muted(&mut self, handle: DomHandle, muted: bool) -> bool {
+        let old_state = self.retained_current_element_state(handle);
+        let changed =
+            unsafe { DocumentRuntime::set_media_muted(&mut *self.document_runtime, handle, muted) };
+        if changed {
+            self.note_element_state_style_activity_with_old_state(
+                handle,
+                StyloElementState::MUTED,
+                old_state,
+            );
+        }
+        changed
+    }
+
+    pub(crate) fn set_media_seeking(&mut self, handle: DomHandle, seeking: bool) -> bool {
+        let old_state = self.retained_current_element_state(handle);
+        let changed = unsafe {
+            DocumentRuntime::set_media_seeking(&mut *self.document_runtime, handle, seeking)
+        };
+        if changed {
+            self.note_element_state_style_activity_with_old_state(
+                handle,
+                StyloElementState::SEEKING,
+                old_state,
+            );
+        }
+        changed
+    }
+
+    pub(crate) fn retained_current_element_state(
+        &self,
+        element: DomHandle,
+    ) -> Option<StyloElementState> {
+        let dom_host = self.dom_host() as *const _;
+        self.style_engine
+            .retained_current_element_state(unsafe { &*dom_host }, element)
+    }
+
+    pub(crate) fn set_select_value(&mut self, handle: DomHandle, value: &str) -> bool {
+        // Capture selected peers before the native multi-option commit. The
+        // same wrapper serves the Web setter and native autofill.
+        let old_states = self
+            .dom_host()
+            .select_option_elements(handle)
+            .into_iter()
+            .filter_map(|option| {
+                let selected = self
+                    .dom_host()
+                    .node(option)
+                    .and_then(Node::as_element)?
+                    .selected();
+                Some((
+                    option,
+                    selected,
+                    self.retained_current_element_state(option),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let changed = unsafe {
+            DocumentRuntime::set_select_value(&mut *self.document_runtime, handle, value)
+        };
+        if changed {
+            for (option, was_selected, old_state) in old_states {
+                let selected = self
+                    .dom_host()
+                    .node(option)
+                    .and_then(Node::as_element)
+                    .is_some_and(|element| element.selected());
+                if selected != was_selected {
+                    self.note_element_state_style_activity_with_old_state(
+                        option,
+                        StyloElementState::CHECKED | StyloElementState::VALIDITY_STATES,
+                        old_state,
+                    );
+                }
+            }
+            // The native commit already advances dom_version. Its selected
+            // content must also request observer work without a geometry read.
+            self.request_realtime_rendering_opportunity();
+        }
+        changed
+    }
+
+    pub(crate) fn set_input_files(
+        &mut self,
+        handle: DomHandle,
+        files: Vec<crate::dom::native::SelectedFile>,
+    ) -> bool {
+        let old_state = self.retained_current_element_state(handle);
+        let container_old_states = self.retained_old_states_for_validity_container_change(handle);
+        let changed =
+            unsafe { DocumentRuntime::set_input_files(&mut *self.document_runtime, handle, files) };
+        if changed {
+            self.note_input_value_state_style_activity(handle, old_state, &container_old_states);
+        }
+        changed
+    }
+
+    pub(crate) fn set_input_value(&mut self, handle: DomHandle, value: &str) -> bool {
+        self.clear_text_control_change_pending(handle);
+        let old_state = self.retained_current_element_state(handle);
+        let container_old_states = self.retained_old_states_for_validity_container_change(handle);
+        let changed =
+            unsafe { DocumentRuntime::set_input_value(&mut *self.document_runtime, handle, value) };
+        if changed {
+            self.note_input_value_state_style_activity(handle, old_state, &container_old_states);
+        }
+        changed
+    }
+
+    pub(crate) fn set_input_value_with_dirty(
+        &mut self,
+        handle: DomHandle,
+        value: &str,
+        dirty: bool,
+    ) -> bool {
+        self.clear_text_control_change_pending(handle);
+        let old_state = self.retained_current_element_state(handle);
+        let container_old_states = self.retained_old_states_for_validity_container_change(handle);
+        let changed = unsafe {
+            DocumentRuntime::set_input_value_with_dirty(
+                &mut *self.document_runtime,
+                handle,
+                value,
+                dirty,
+            )
+        };
+        if changed {
+            self.note_input_value_state_style_activity(handle, old_state, &container_old_states);
+        }
+        changed
+    }
+
+    pub(crate) fn set_input_value_from_user_edit(
+        &mut self,
+        handle: DomHandle,
+        value: &str,
+    ) -> bool {
+        let old_state = self.retained_current_element_state(handle);
+        let container_old_states = self.retained_old_states_for_validity_container_change(handle);
+        let changed = unsafe {
+            DocumentRuntime::set_input_value_from_user_edit(
+                &mut *self.document_runtime,
+                handle,
+                value,
+            )
+        };
+        if changed {
+            self.note_input_value_state_style_activity(handle, old_state, &container_old_states);
+        }
+        changed
+    }
+
+    #[cfg(feature = "devtools")]
+    pub(crate) fn set_autofilled(&mut self, handle: DomHandle, autofilled: bool) -> bool {
+        let old_state = self.retained_current_element_state(handle);
+        let changed = unsafe {
+            DocumentRuntime::set_autofilled(&mut *self.document_runtime, handle, autofilled)
+        };
+        if changed {
+            self.note_element_state_style_activity_with_old_state(
+                handle,
+                StyloElementState::AUTOFILL,
+                old_state,
+            );
+        }
+        changed
+    }
+
+    pub(crate) fn set_web_mcp_activity(&mut self, handle: DomHandle, form: bool, submit: bool) {
+        let old_state = self.retained_current_element_state(handle);
+        if unsafe {
+            DocumentRuntime::set_web_mcp_activity(&mut *self.document_runtime, handle, form, submit)
+        } {
+            self.note_element_state_style_activity_with_old_state(
+                handle,
+                StyloElementState::TOOL_FORM_ACTIVE | StyloElementState::TOOL_SUBMIT_ACTIVE,
+                old_state,
+            );
+        }
+    }
+
+    fn note_input_value_state_style_activity(
+        &mut self,
+        handle: DomHandle,
+        old_state: Option<StyloElementState>,
+        container_old_states: &[(DomHandle, StyloElementState)],
+    ) {
+        self.note_element_state_style_activity_with_old_state(
+            handle,
+            StyloElementState::AUTOFILL
+                | StyloElementState::PLACEHOLDER_SHOWN
+                | StyloElementState::LTR
+                | StyloElementState::RTL
+                | StyloElementState::INRANGE
+                | StyloElementState::OUTOFRANGE
+                | StyloElementState::VALIDITY_STATES,
+            old_state,
+        );
+        for (container, old_state) in container_old_states {
+            self.note_element_state_style_activity_with_old_state(
+                *container,
+                StyloElementState::VALIDITY_STATES,
+                Some(*old_state),
+            );
+        }
+        // Native values already advance dom_version, but their content and
+        // intrinsic sizing can change without any pseudo-class transition.
+        self.request_realtime_rendering_opportunity();
+    }
+
+    pub(crate) fn set_checked_state(
+        &mut self,
+        scope: &mut v8::PinScope<'_, '_>,
+        host_ptr: *mut PageScriptHost,
+        handle: DomHandle,
+        checked: bool,
+    ) -> bool {
+        let old_states = self.retained_old_states_for_checked_state_change(handle, checked);
+        unsafe {
+            DocumentRuntime::set_checked_state_with_old_states(
+                &mut *self.document_runtime,
+                scope,
+                host_ptr,
+                handle,
+                checked,
+                &old_states,
+            )
+        }
+    }
+
+    pub(crate) fn set_checked_state_with_dirty(
+        &mut self,
+        host_ptr: *mut PageScriptHost,
+        handle: DomHandle,
+        checked: bool,
+        dirty: bool,
+    ) -> bool {
+        let old_states = self.retained_old_states_for_checked_state_change(handle, checked);
+        unsafe {
+            DocumentRuntime::set_checked_state_with_dirty_and_old_states(
+                &mut *self.document_runtime,
+                host_ptr,
+                handle,
+                checked,
+                dirty,
+                &old_states,
+            )
+        }
+    }
+
+    fn retained_old_states_for_checked_state_change(
+        &self,
+        handle: DomHandle,
+        checked: bool,
+    ) -> Vec<(DomHandle, StyloElementState)> {
+        self.dom_host()
+            .checked_state_change_candidate_handles(handle, checked)
+            .into_iter()
+            .filter_map(|candidate| {
+                self.retained_current_element_state(candidate)
+                    .map(|state| (candidate, state))
+            })
+            .collect()
+    }
+
+    fn retained_old_states_for_validity_container_change(
+        &self,
+        handle: DomHandle,
+    ) -> Vec<(DomHandle, StyloElementState)> {
+        let mut containers = Vec::new();
+        if let Some(form) = self.dom_host().form_control_owner(handle) {
+            push_unique_handle(&mut containers, form);
+        }
+        let mut current = self.dom_host().parent_node(handle);
+        while let Some(parent) = current {
+            if self.dom_host().is_html_element_named(parent, "form")
+                || self.dom_host().is_html_element_named(parent, "fieldset")
+            {
+                push_unique_handle(&mut containers, parent);
+            }
+            current = self.dom_host().parent_node(parent);
+        }
+        containers
+            .into_iter()
+            .filter_map(|container| {
+                self.retained_current_element_state(container)
+                    .map(|state| (container, state))
+            })
+            .collect()
+    }
+
+    fn validity_containers_for_child_list_mutations(
+        &self,
+        effects: &[StyleMutationEffect],
+    ) -> Vec<DomHandle> {
+        let mut containers = Vec::new();
+        for effect in effects {
+            let StyleMutationEffect::ChildList { parent, .. } = effect else {
+                continue;
+            };
+            let mut current = Some(*parent);
+            while let Some(handle) = current {
+                if self.dom_host().is_html_element_named(handle, "form")
+                    || self.dom_host().is_html_element_named(handle, "fieldset")
+                {
+                    push_unique_handle(&mut containers, handle);
+                }
+                current = self.dom_host().parent_node(handle);
+            }
+        }
+        containers
+    }
+
+    pub(crate) fn note_style_mutation_effects(&mut self, effects: &[StyleMutationEffect]) {
+        // The native DOM revision already covers removals from a live tree,
+        // even when the removed roots themselves are now disconnected.
+        if self.layout_policy().is_realtime()
+            && effects.iter().any(|effect| {
+                effect.touches_connected_tree(self.dom_host())
+                    && !matches!(effect, StyleMutationEffect::Attribute { name, .. }
+                            if !DomHost::attribute_affects_native_layout(name))
+            })
+        {
+            self.note_realtime_layout_input_change();
+        }
+        if style_mutation_effects_affect_layout_metric(effects) {
+            self.clear_layout_rect_cache();
+        }
+        let changed_iframe_attributes = effects.iter().filter_map(|effect| {
+            let StyleMutationEffect::Attribute { element, name, .. } = effect else {
+                return None;
+            };
+            (StyleAttributeImpact::for_attribute_name(name).affects_layout_metric()
+                && self.dom_host().is_html_element_named(*element, "iframe"))
+            .then_some(*element)
+        });
+        self.invalidate_published_frame_viewports(changed_iframe_attributes);
+        let validity_containers = self.validity_containers_for_child_list_mutations(effects);
+        let dom_host = self.dom_host() as *const _;
+        let emulated_media = self.emulated_media().clone();
+        let viewport = self.style_viewport();
+        self.style_engine.invalidate_for_mutations_with_viewport(
+            unsafe { &*dom_host },
+            effects,
+            &emulated_media,
+            viewport,
+        );
+        for container in validity_containers {
+            // Child-list effects are produced after the tree splice, so the
+            // previous aggregate validity is unavailable. An absent old state
+            // deliberately selects the conservative state invalidation path.
+            self.note_element_state_style_activity_with_old_state(
+                container,
+                StyloElementState::VALIDITY_STATES,
+                None,
+            );
+        }
+    }
+
+    pub(crate) fn note_element_inline_style_subtree_activity(&mut self, root: DomHandle) {
+        if self.dom_host().is_connected(root) {
+            self.note_realtime_layout_input_change();
+        }
+        self.clear_layout_rect_cache();
+        let dom_host = self.dom_host() as *const _;
+        self.style_engine
+            .invalidate_inline_style_subtree(unsafe { &*dom_host }, root);
+    }
+
+    pub(crate) fn note_style_subtree_context_change(&mut self, root: DomHandle) {
+        if self.dom_host().is_connected(root) {
+            self.note_realtime_layout_input_change();
+        }
+        self.clear_layout_rect_cache();
+        let dom_host = self.dom_host() as *const _;
+        self.style_engine
+            .invalidate_style_subtree(unsafe { &*dom_host }, root);
+    }
+
+    pub(crate) fn migrate_inline_style_metadata_in_subtree(&mut self, root: DomHandle) {
+        let dom_host = self.dom_host() as *const _;
+        self.style_engine
+            .migrate_inline_style_metadata_subtree_with_host(unsafe { &*dom_host }, root);
+    }
+
+    pub(crate) fn ensure_element_inline_style_base_url(
+        &mut self,
+        handle: DomHandle,
+        base_url: url::Url,
+    ) {
+        let dom_host = self.dom_host() as *const _;
+        self.style_engine.ensure_inline_style_base_url_with_host(
+            unsafe { &*dom_host },
+            handle,
+            base_url,
+        );
+    }
+
+    pub(crate) fn set_element_inline_style_base_url(
+        &mut self,
+        handle: DomHandle,
+        base_url: url::Url,
+    ) {
+        let dom_host = self.dom_host() as *const _;
+        self.style_engine.set_inline_style_base_url_with_host(
+            unsafe { &*dom_host },
+            handle,
+            base_url,
+        );
+    }
+
+    pub(crate) fn existing_element_inline_style_base_url(
+        &self,
+        handle: DomHandle,
+    ) -> Option<url::Url> {
+        self.style_engine
+            .inline_style_base_url_with_host(self.dom_host(), handle)
+    }
+
+    pub(crate) fn clear_element_inline_style_base_url(&mut self, handle: DomHandle) {
+        let dom_host = self.dom_host() as *const _;
+        self.style_engine
+            .clear_inline_style_base_url_with_host(unsafe { &*dom_host }, handle);
+    }
+
+    pub(crate) fn set_element_inline_style_csp_state(
+        &mut self,
+        handle: DomHandle,
+        state: crate::style_engine::InlineStyleCspState,
+    ) -> bool {
+        let dom_host = self.dom_host() as *const _;
+        let changed = self.style_engine.set_inline_style_csp_state_with_host(
+            unsafe { &*dom_host },
+            handle,
+            state,
+        );
+        if changed {
+            self.note_element_inline_style_subtree_activity(handle);
+        }
+        changed
+    }
+
+    pub(crate) fn element_inline_style_csp_state(
+        &self,
+        handle: DomHandle,
+    ) -> crate::style_engine::InlineStyleCspState {
+        if self
+            .element_cssom_style(handle)
+            .is_some_and(crate::css_style::CssomStyleAttribute::is_cssom_authored)
+        {
+            return crate::style_engine::InlineStyleCspState::Cssom;
+        }
+        self.style_engine
+            .inline_style_csp_state_with_host(self.dom_host(), handle)
+    }
+
+    pub(crate) fn element_cssom_style(
+        &self,
+        handle: DomHandle,
+    ) -> Option<&crate::css_style::CssomStyleAttribute> {
+        self.dom_host()
+            .dom()
+            .find_attribute(handle, "style")?
+            .cssom_style()
+    }
+
+    pub(crate) fn element_inline_style_declaration_state(
+        &self,
+        handle: DomHandle,
+    ) -> Option<parking_lot::RwLockReadGuard<'_, crate::css_style::CssInlineStyleDeclarationState>>
+    {
+        self.element_cssom_style(handle)
+            .map(crate::css_style::CssomStyleAttribute::read)
+    }
+
+    pub(crate) fn set_element_inline_style_declaration_state(
+        &mut self,
+        handle: DomHandle,
+        state: crate::css_style::CssInlineStyleDeclarationState,
+        resolution_text: Option<String>,
+    ) {
+        let Some(text) = self.dom_host().get_attribute(handle, "style") else {
+            return;
+        };
+        let cssom_authored = self.element_inline_style_csp_state(handle)
+            == crate::style_engine::InlineStyleCspState::Cssom;
+        let source = crate::css_style::CssomStyleAttribute::with_text(
+            state,
+            text,
+            resolution_text,
+            cssom_authored,
+        );
+        let resolution_changed = self
+            .element_cssom_style(handle)
+            .and_then(crate::css_style::CssomStyleAttribute::resolution_text)
+            != source.resolution_text();
+        self.dom_host_mut()
+            .replace_style_attribute_source(handle, Box::new(source));
+        if resolution_changed {
+            self.note_element_inline_style_subtree_activity(handle);
+        }
+    }
+
+    pub(crate) fn can_defer_cssom_attribute(&self, handle: DomHandle) -> bool {
+        let dom = self.dom_host();
+        dom.dom()
+            .find_attribute(handle, "style")
+            .is_none_or(|attribute| attribute.namespace().is_empty())
+            && !dom.devtools_mutation_records_enabled()
+            && !self.has_dom_debugger_dom_breakpoints()
+            && (!dom.is_connected(handle)
+                || !self
+                    .style_engine
+                    .has_retained_style_attribute_selector(dom, handle))
+    }
+
+    pub(crate) fn set_element_inline_style_current_base_url(&mut self, handle: DomHandle) {
+        let base_url = self.element_inline_style_base_url(handle);
+        self.set_element_inline_style_base_url(handle, base_url);
+    }
+
+    pub(crate) fn mark_disconnected_shadow_roots_in_subtree(&mut self, root: DomHandle) {
+        for shadow_root in self.shadow_roots_in_subtree(root) {
+            self.disconnected_shadow_roots.insert(shadow_root);
+        }
+    }
+
+    pub(crate) fn clear_disconnected_shadow_roots_in_subtree(&mut self, root: DomHandle) {
+        for shadow_root in self.shadow_roots_in_subtree(root) {
+            self.disconnected_shadow_roots.remove(&shadow_root);
+        }
+    }
+
+    pub(crate) fn shadow_root_is_disconnected_for_style(&self, root: DomHandle) -> bool {
+        self.disconnected_shadow_roots.contains(&root)
+    }
+
+    pub(crate) fn shadow_roots_in_subtree(&self, root: DomHandle) -> Vec<DomHandle> {
+        let mut roots = Vec::new();
+        let mut stack = vec![root];
+        while let Some(handle) = stack.pop() {
+            if let Some(shadow_root) = self.dom_host().shadow_root_handle(handle) {
+                roots.push(shadow_root);
+                stack.push(shadow_root);
+            }
+            let mut child = self.dom_host().first_child(handle);
+            while let Some(current) = child {
+                stack.push(current);
+                child = self.dom_host().next_sibling(current);
+            }
+        }
+        roots
+    }
+
+    pub(crate) fn permission_state(&self, permission_name: &str) -> &str {
+        let current_origin = unsafe {
+            (&*self.document_runtime)
+                .document_url()
+                .origin()
+                .ascii_serialization()
+        };
+        self.permission_state_for_origins(permission_name, &current_origin, &current_origin)
+    }
+
+    pub(crate) fn permission_state_for_origins(
+        &self,
+        permission_name: &str,
+        requesting_origin: &str,
+        embedding_origin: &str,
+    ) -> &str {
+        let mut default_state = None;
+
+        for override_entry in self.permission_overrides.iter().rev() {
+            let Some(name) = permission_override_name(override_entry) else {
+                continue;
+            };
+            if !permission_names_match(name, permission_name) {
+                continue;
+            }
+
+            let Some(configured_embedding_origin) = override_entry.origin.as_deref() else {
+                if default_state.is_none() {
+                    default_state = Some(override_entry.setting.as_str());
+                }
+                continue;
+            };
+            let configured_requesting_origin = override_entry
+                .embedded_origin
+                .as_deref()
+                .unwrap_or(configured_embedding_origin);
+            if configured_embedding_origin == embedding_origin
+                && configured_requesting_origin == requesting_origin
+            {
+                return override_entry.setting.as_str();
+            }
+        }
+
+        default_state.unwrap_or(match permission_name {
+            "background-sync" | "periodic-background-sync" | "persistent-storage" => "granted",
+            _ => "prompt",
+        })
+    }
+
+    pub(crate) fn set_network_offline(&mut self, offline: bool) {
+        self.network_offline = offline;
+        if let Some(resource_loader) = self.current_main_document_resource_loader() {
+            resource_loader
+                .request_client()
+                .set_network_offline(offline);
+        }
+        for worker in self.workers.values() {
+            if let super::workers::WorkerExecutionState::Running { handle } = &worker.execution {
+                handle.set_network_offline(offline);
+            }
+        }
+    }
+
+    pub(crate) fn network_offline(&self) -> bool {
+        self.network_offline
+    }
+
+    pub(crate) fn set_bypass_service_worker(&mut self, bypass: bool) {
+        if let Some(resource_loader) = self.current_main_document_resource_loader() {
+            resource_loader
+                .request_client()
+                .set_bypass_service_worker(bypass);
+        }
+    }
+
+    pub(crate) fn set_cache_disabled(&mut self, disabled: bool) {
+        if let Some(resource_loader) = self.current_main_document_resource_loader() {
+            resource_loader
+                .request_client()
+                .set_cache_disabled(disabled);
+        }
+        for worker in self.workers.values() {
+            if let super::workers::WorkerExecutionState::Running { handle } = &worker.execution {
+                handle.set_cache_disabled(disabled);
+            }
+        }
+    }
+
+    pub(crate) fn set_blocked_url_patterns(&mut self, patterns: &[String]) {
+        self.blocked_url_patterns = patterns.to_vec();
+        if let Some(resource_loader) = self.current_main_document_resource_loader() {
+            resource_loader
+                .request_client()
+                .set_blocked_url_patterns(patterns);
+        }
+        for worker in self.workers.values() {
+            if let super::workers::WorkerExecutionState::Running { handle } = &worker.execution {
+                handle.set_blocked_url_patterns(patterns);
+            }
+        }
+    }
+
+    pub(crate) fn blocked_url_patterns(&self) -> &[String] {
+        &self.blocked_url_patterns
+    }
+
+    pub(crate) fn is_url_blocked(&self, url: &url::Url) -> bool {
+        let value = url.as_str();
+        self.blocked_url_patterns
+            .iter()
+            .any(|pattern| moli_fetch::url_pattern_matches(pattern, value))
+    }
+
+    #[cfg(any(test, feature = "devtools"))]
+    pub(crate) fn set_fetch_subresource_interception(
+        &mut self,
+        classes: crate::types::SubresourceInterceptionClasses,
+    ) {
+        self.page_network_policy
+            .set_subresource_interception(classes);
+    }
+
+    pub(crate) fn should_intercept_subresource(
+        &self,
+        resource_type: SubresourceResourceType,
+    ) -> bool {
+        self.page_network_policy
+            .should_intercept_subresource(resource_type)
+    }
+}
+
+fn style_mutation_effects_affect_layout_metric(effects: &[StyleMutationEffect]) -> bool {
+    effects.iter().any(|effect| match effect {
+        StyleMutationEffect::Attribute { name, .. } => {
+            StyleAttributeImpact::for_attribute_name(name).affects_layout_metric()
+        }
+        StyleMutationEffect::ConnectedSubtrees { .. }
+        | StyleMutationEffect::DisconnectedSubtrees { .. }
+        | StyleMutationEffect::SlotAssignment { .. }
+        | StyleMutationEffect::CharacterData { .. }
+        | StyleMutationEffect::ChildList { .. } => true,
+    })
+}

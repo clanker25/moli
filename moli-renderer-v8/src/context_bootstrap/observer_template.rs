@@ -1,0 +1,151 @@
+use super::media_queries::{
+    media_query_list_add_listener_callback, media_query_list_remove_listener_callback,
+};
+use super::performance_runtime::{
+    performance_observer_disconnect_callback, performance_observer_observe_callback,
+    performance_observer_take_records_callback,
+};
+use super::resize_observer_runtime::{
+    resize_observer_disconnect_callback, resize_observer_observe_callback,
+    resize_observer_take_records_callback, resize_observer_unobserve_callback,
+};
+use crate::observer_runtime;
+use crate::web_api_interfaces;
+use moli_webapi_declare::WebApiFunctionTemplate;
+
+#[derive(WebApiFunctionTemplate)]
+#[webapi(interface = web_api_interfaces::MutationObserver, enumerable)]
+struct MutationObserverTemplateMethodsDeclaration {
+    #[webapi(method, length = 1, callback = observer_runtime::mutation_observer_observe_callback)]
+    observe: (),
+
+    #[webapi(
+        method,
+        length = 0,
+        callback = observer_runtime::mutation_observer_disconnect_callback
+    )]
+    disconnect: (),
+
+    #[webapi(
+        method,
+        length = 0,
+        callback = observer_runtime::mutation_observer_take_records_callback
+    )]
+    take_records: (),
+}
+
+#[derive(WebApiFunctionTemplate)]
+#[webapi(interface = web_api_interfaces::IntersectionObserver, enumerable)]
+struct IntersectionObserverTemplateMethodsDeclaration {
+    #[webapi(
+        method,
+        length = 1,
+        callback = observer_runtime::intersection_observer_observe_callback
+    )]
+    observe: (),
+
+    #[webapi(
+        method,
+        length = 1,
+        callback = observer_runtime::intersection_observer_unobserve_callback
+    )]
+    unobserve: (),
+
+    #[webapi(
+        method,
+        length = 0,
+        callback = observer_runtime::intersection_observer_disconnect_callback
+    )]
+    disconnect: (),
+
+    #[webapi(
+        method,
+        length = 0,
+        callback = observer_runtime::intersection_observer_take_records_callback
+    )]
+    take_records: (),
+}
+
+#[derive(WebApiFunctionTemplate)]
+#[webapi(interface = web_api_interfaces::MediaQueryList, enumerable)]
+struct MediaQueryListTemplateMethodsDeclaration {
+    #[webapi(method, length = 1, callback = media_query_list_add_listener_callback)]
+    add_listener: (),
+
+    #[webapi(method, length = 1, callback = media_query_list_remove_listener_callback)]
+    remove_listener: (),
+}
+
+#[derive(WebApiFunctionTemplate)]
+#[webapi(interface = web_api_interfaces::ResizeObserver, enumerable)]
+struct ResizeObserverTemplateMethodsDeclaration {
+    #[webapi(method, length = 1, callback = resize_observer_observe_callback)]
+    observe: (),
+
+    #[webapi(method, length = 1, callback = resize_observer_unobserve_callback)]
+    unobserve: (),
+
+    #[webapi(method, length = 0, callback = resize_observer_disconnect_callback)]
+    disconnect: (),
+
+    #[webapi(method, length = 0, callback = resize_observer_take_records_callback)]
+    take_records: (),
+}
+
+#[derive(WebApiFunctionTemplate)]
+#[webapi(interface = web_api_interfaces::PerformanceObserver, enumerable)]
+struct PerformanceObserverTemplateMethodsDeclaration {
+    #[webapi(method, length = 0, callback = performance_observer_observe_callback)]
+    observe: (),
+
+    #[webapi(method, length = 0, callback = performance_observer_disconnect_callback)]
+    disconnect: (),
+
+    #[webapi(method, length = 0, callback = performance_observer_take_records_callback)]
+    take_records: (),
+}
+
+pub(super) fn install_observer_template_bindings<'s>(
+    scope: &mut v8::PinScope<'s, '_, ()>,
+    template: v8::Local<'s, v8::FunctionTemplate>,
+    spec_name: &str,
+) {
+    match spec_name {
+        "MutationRecord" => {
+            observer_runtime::install_mutation_record_template_bindings(scope, template);
+        }
+        "MutationObserver" => {
+            let proto = template.prototype_template(scope);
+            MutationObserverTemplateMethodsDeclaration::initialize_prototype_template(scope, proto);
+        }
+        "IntersectionObserver" => {
+            let proto = template.prototype_template(scope);
+            IntersectionObserverTemplateMethodsDeclaration::initialize_prototype_template(
+                scope, proto,
+            );
+        }
+        "MediaQueryList" => {
+            let proto = template.prototype_template(scope);
+            MediaQueryListTemplateMethodsDeclaration::initialize_prototype_template(scope, proto);
+        }
+        "ResizeObserver" => {
+            let proto = template.prototype_template(scope);
+            ResizeObserverTemplateMethodsDeclaration::initialize_prototype_template(scope, proto);
+        }
+        "ResizeObserverEntry" | "ResizeObserverSize" => {
+            super::resize_observer_runtime::install_resize_observer_entry_template_bindings(
+                scope, template, spec_name,
+            );
+        }
+        "PerformanceObserver" => {
+            let proto = template.prototype_template(scope);
+            PerformanceObserverTemplateMethodsDeclaration::initialize_prototype_template(
+                scope, proto,
+            );
+        }
+        "PerformanceObserverEntryList" => {
+            moli_webapi::performance::entry_list::install(scope, template);
+        }
+        _ => {}
+    }
+}

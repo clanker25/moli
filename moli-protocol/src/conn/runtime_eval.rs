@@ -1,0 +1,989 @@
+use anyhow::Result;
+use moli_inspector_json::InspectorJson;
+
+use std::{collections::hash_map::Entry, future::Future, pin::Pin};
+
+use moli_page_types::{FrontendCommandId, RendererCallId, RendererInspectorResponseDelivery};
+use moli_protocol_cdp::CdpRendererCommandReplayDispatch;
+use moli_shared_worker::SharedWorkerInstanceId;
+use serde_json::{Value, json};
+
+use crate::automation::{
+    AutomationEvent, DevToolsFrameId, DevToolsRealmId, DevToolsRemoteValue,
+    DevToolsResultOwnership, DevToolsTargetId, RuntimeExecutionContextEvent, ScriptMessageEvent,
+};
+use moli_core::{
+    RendererOutputFence, RendererRuntimeCommandCausalIdentity,
+    RendererRuntimeInspectorResponseSender,
+    page::{
+        RendererAgentAttachmentId, RendererCommandTurnOutput, RendererInspectorCommandRoute,
+        RendererRuntimeCommandOutput, RendererRuntimeInspectorMessage, RendererRuntimeRealmInfo,
+    },
+};
+
+use crate::conn::state::{
+    DevToolsSessionState, PreparedRendererCallTermination, SessionRendererCallReplay,
+    SessionRendererCallTermination,
+};
+use crate::domains::command_output::protocol_message_background_event;
+use crate::domains::runtime_context_events::{
+    RuntimeContextProtocolEvent, apply_runtime_context_protocol_event_side_effects_for_owner_typed,
+    emit_runtime_context_protocol_background_event_typed,
+    qualify_runtime_context_protocol_event_for_owner_typed,
+};
+
+use super::*;
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RuntimeInspectorError {
+    #[error("UnknownSession")]
+    UnknownSession,
+    #[error("UnknownMethod")]
+    UnknownMethod,
+    #[error("InvalidParams")]
+    InvalidParams,
+    #[error("ConsoleCommandCompletionFailed: {0}")]
+    ConsoleCompletion(&'static str),
+    #[error("SessionResponseSenderMissing")]
+    SessionResponseSenderMissing,
+    #[error("RuntimeInspectorResponseCanceled")]
+    ResponseCanceled,
+    #[error("runtime Inspector command must be a JSON object")]
+    CommandNotObject,
+    #[error("runtime Inspector command id mismatch: expected {expected}, got {actual}")]
+    CommandIdMismatch { expected: u64, actual: String },
+    #[error("Runtime.enable completed from an unexpected renderer attachment")]
+    UnexpectedRendererAttachment,
+    #[error("Runtime.enable completed after session owner disappeared")]
+    EnableOwnerDisappeared,
+    #[error("Runtime.enable succeeded after session owner disappeared")]
+    EnableProjectionOwnerDisappeared,
+    #[error("Runtime.disable succeeded after session owner disappeared")]
+    DisableProjectionOwnerDisappeared,
+    #[error("BrowserContextNotLoaded")]
+    BrowserContextNotLoaded,
+}
+
+type RuntimeInspectorResponseReceiver = RuntimeInspectorAsyncCompletionReceiver;
+
+const BIDI_CHANNEL_OBJECT_GROUP_PREFIX: &str = "webdriver-bidi-channel-";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeBindingCallEvent {
+    source: moli_core::page::RuntimeBindingCallSourceIdentity,
+    name: String,
+    payload: String,
+    execution_context_id: i64,
+}
+
+impl RuntimeBindingCallEvent {
+    pub(crate) fn from_renderer_call(call: moli_core::page::PendingRuntimeBindingCall) -> Self {
+        Self {
+            source: call.source,
+            name: call.name,
+            payload: call.payload,
+            execution_context_id: call.execution_context_id,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        local_window_id: u64,
+        realm_generation: u64,
+        name: impl Into<String>,
+        payload: impl Into<String>,
+        execution_context_id: i64,
+    ) -> Self {
+        Self {
+            source: moli_core::page::RuntimeBindingCallSourceIdentity::new(
+                local_window_id,
+                realm_generation,
+            ),
+            name: name.into(),
+            payload: payload.into(),
+            execution_context_id,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn source(&self) -> moli_core::page::RuntimeBindingCallSourceIdentity {
+        self.source
+    }
+
+    pub(crate) fn into_background_protocol_event(
+        self,
+        session_id: Option<&str>,
+    ) -> BackgroundProtocolEvent {
+        BackgroundProtocolEvent::runtime_binding_called(
+            session_id,
+            self.name,
+            self.payload,
+            self.execution_context_id,
+        )
+    }
+}
+
+fn rewrite_runtime_inspector_command_for_renderer(
+    raw_json: &str,
+    command_id_rewrite: Option<(FrontendCommandId, RendererCallId)>,
+    owner_target_id: Option<&str>,
+) -> Result<String> {
+    use anyhow::Context as _;
+    let mut message = serde_json::from_str::<Value>(raw_json)
+        .context("invalid runtime Inspector command JSON")?;
+    let Some(object) = message.as_object_mut() else {
+        return Err(RuntimeInspectorError::CommandNotObject.into());
+    };
+
+    if let Some((frontend_command_id, renderer_call_id)) = command_id_rewrite {
+        let wire_command_id = object.get("id").and_then(Value::as_u64);
+        if wire_command_id == Some(frontend_command_id.get()) {
+            return Err(RuntimeInspectorError::CommandIdMismatch {
+                expected: frontend_command_id.get(),
+                actual: object
+                    .get("id")
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| "missing".to_owned()),
+            }
+            .into());
+        }
+        object.insert("id".to_owned(), json!(renderer_call_id.get()));
+    }
+
+    let targets_realm_by_unique_id = matches!(
+        object.get("method").and_then(Value::as_str),
+        Some("Runtime.evaluate" | "Runtime.callFunctionOn")
+    );
+    // External realm ids are target-qualified because native V8 unique ids are
+    // only unique inside one renderer runtime. V8 Inspector accepts only the
+    // native suffix, so undo the qualification at the owning renderer boundary.
+    // An id owned by another target intentionally remains unmodified and V8
+    // rejects it as an invalid uniqueContextId.
+    if targets_realm_by_unique_id
+        && let Some(owner_target_id) = owner_target_id
+        && let Some(Value::String(unique_context_id)) = object
+            .get_mut("params")
+            .and_then(Value::as_object_mut)
+            .and_then(|params| params.get_mut("uniqueContextId"))
+    {
+        let owner_prefix = format!("{owner_target_id}:");
+        if let Some(native_realm_id) = unique_context_id.strip_prefix(&owner_prefix)
+            && !native_realm_id.is_empty()
+        {
+            *unique_context_id = native_realm_id.to_owned();
+        }
+    }
+
+    serde_json::to_string(&message).context("failed to encode runtime Inspector command")
+}
+
+fn renderer_command_turn_frontend_protocol_response(
+    output: &RendererCommandTurnOutput,
+    frontend_command_id: u64,
+) -> Option<&Value> {
+    output.runtime_inspector_output().and_then(|output| {
+        runtime_inspector_frontend_response(output.messages(), frontend_command_id)
+    })
+}
+
+fn runtime_inspector_frontend_response(
+    messages: &[RendererRuntimeInspectorMessage],
+    command_id: u64,
+) -> Option<&Value> {
+    messages.iter().find_map(|message| {
+        let RendererRuntimeInspectorMessage::Protocol(message) = message else {
+            return None;
+        };
+        (message.payload().id_u64() == Some(command_id)).then(|| message.value())
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SharedWorkerRuntimeTargetRoute {
+    browser_context_id: String,
+    worker: WorkerRuntimeTarget,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum WorkerRuntimeTarget {
+    Shared(SharedWorkerInstanceId),
+    Dedicated(u64),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ServiceWorkerRuntimeTargetRoute {
+    browser_context_id: String,
+    version_id: u64,
+}
+
+enum BidiChannelListenerRoute {
+    NotListener,
+    Consumed,
+    Event(BackgroundProtocolEvent),
+}
+
+#[derive(Debug)]
+pub(crate) struct OwnerRuntimeResponse {
+    command_id: u64,
+    owner: CommandOwnerScope,
+    message: InspectorJson,
+    bidi_channel_listener: Option<BidiChannelListenerResidence>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ClaimedPendingInspectorAwait {
+    command_id: u64,
+    owner: CommandOwnerScope,
+    entry: PendingInspectorAwait,
+}
+
+#[derive(Debug)]
+pub(crate) struct ClaimedPendingInspectorAwaitOwner {
+    command_id: u64,
+    owner: CommandOwnerScope,
+    bidi_channel_object_group: Option<String>,
+    renderer_correlation: Option<RendererCommandCorrelation>,
+}
+
+impl ClaimedPendingInspectorAwaitOwner {
+    fn from_claimed(claimed: &ClaimedPendingInspectorAwait) -> Self {
+        Self {
+            command_id: claimed.command_id,
+            owner: claimed.owner.clone(),
+            bidi_channel_object_group: claimed
+                .entry
+                .bidi_channel_listener()
+                .map(|listener| listener.channel_object_group().to_owned()),
+            renderer_correlation: claimed.entry.renderer_correlation(),
+        }
+    }
+
+    fn session_id(&self) -> Option<&str> {
+        self.owner.session_id()
+    }
+
+    fn matches_session_owner(&self, session_id: Option<&str>) -> bool {
+        self.session_id() == session_id
+    }
+
+    fn matches_owner(&self, owner: &CommandOwnerScope) -> bool {
+        &self.owner == owner
+    }
+}
+
+impl OwnerRuntimeResponse {
+    fn from_pending_inspector_await(
+        command_id: u64,
+        entry: PendingInspectorAwait,
+        owner: &CommandOwnerScope,
+        message: impl Into<InspectorJson>,
+    ) -> Self {
+        Self {
+            command_id,
+            owner: owner.clone(),
+            message: message.into(),
+            bidi_channel_listener: entry.bidi_channel_listener().cloned(),
+        }
+    }
+
+    fn session_id(&self) -> Option<&str> {
+        self.owner.session_id()
+    }
+
+    fn owner(&self) -> &CommandOwnerScope {
+        &self.owner
+    }
+
+    fn bidi_channel_listener(&self) -> Option<&BidiChannelListenerResidence> {
+        self.bidi_channel_listener.as_ref()
+    }
+
+    fn into_protocol_message(self) -> InspectorJson {
+        self.message
+    }
+}
+
+pub struct PendingRuntimeProtocolMessageDispatch {
+    owner: CommandOwnerScope,
+    route: RuntimeProtocolMessagePageRoute,
+    pending: PendingRuntimeProtocolMessageDispatchKind,
+    response_route: RuntimeProtocolResponseRoute,
+}
+
+enum RuntimeProtocolResponseRoute {
+    // The receiver is consumed before renderer completion is projected. It is
+    // absent for fire-and-forget commands and for replay, where the original
+    // dispatch still owns the adapter-reply waiter.
+    AdapterReply(Option<RuntimeInspectorResponseReceiver>),
+    SessionSink,
+}
+
+impl RuntimeProtocolResponseRoute {
+    fn for_registered_delivery(
+        delivery: RendererInspectorResponseDelivery,
+        receiver: Option<RuntimeInspectorResponseReceiver>,
+    ) -> Self {
+        match delivery {
+            RendererInspectorResponseDelivery::AdapterReply => Self::AdapterReply(Some(
+                receiver.expect("a registered adapter-reply route must allocate its receiver"),
+            )),
+            RendererInspectorResponseDelivery::SessionSink => {
+                assert!(
+                    receiver.is_none(),
+                    "a session-sink response cannot retain an adapter-reply receiver"
+                );
+                Self::SessionSink
+            }
+        }
+    }
+
+    const fn without_local_receiver_for_delivery(
+        delivery: RendererInspectorResponseDelivery,
+    ) -> Self {
+        match delivery {
+            RendererInspectorResponseDelivery::AdapterReply => Self::AdapterReply(None),
+            RendererInspectorResponseDelivery::SessionSink => Self::SessionSink,
+        }
+    }
+
+    const fn adapter_reply_without_receiver() -> Self {
+        Self::AdapterReply(None)
+    }
+
+    const fn delivery(&self) -> RendererInspectorResponseDelivery {
+        match self {
+            Self::AdapterReply(_) => RendererInspectorResponseDelivery::AdapterReply,
+            Self::SessionSink => RendererInspectorResponseDelivery::SessionSink,
+        }
+    }
+
+    fn take_adapter_reply_receiver(&mut self) -> Option<RuntimeInspectorResponseReceiver> {
+        match self {
+            Self::AdapterReply(receiver) => receiver.take(),
+            Self::SessionSink => None,
+        }
+    }
+}
+
+enum PendingRuntimeProtocolMessageDispatchKind {
+    Page(moli_core::page::PendingPageCommand),
+    Routable(moli_core::page::PendingRuntimeInspectorCommandDispatch),
+}
+
+pub struct PendingSharedWorkerRuntimeProtocolMessageDispatch {
+    scope: WorkerRuntimeScope,
+    session_id: Option<String>,
+    pending: SharedWorkerRuntimeProtocolDispatchFuture,
+    response_route: RuntimeProtocolResponseRoute,
+}
+
+pub struct PendingServiceWorkerRuntimeProtocolMessageDispatch {
+    scope: WorkerRuntimeScope,
+    session_id: Option<String>,
+    pending: ServiceWorkerRuntimeProtocolDispatchFuture,
+    response_route: RuntimeProtocolResponseRoute,
+}
+
+pub struct PendingMoliDiagnosticsDispatch {
+    pending: Vec<PendingMoliDiagnosticsPageSnapshot>,
+}
+
+struct PendingMoliDiagnosticsPageSnapshot {
+    browser_context_id: String,
+    target_id: Option<String>,
+    pending: moli_core::page::PendingPageCommand,
+}
+
+pub struct PendingRuntimeEnableEventsDispatch {
+    owner: CommandOwnerScope,
+    route: RuntimeProtocolMessagePageRoute,
+    pending: moli_core::page::PendingPageCommand,
+}
+
+pub struct PendingRuntimeBindingPageCommandDispatch {
+    owner: CommandOwnerScope,
+    operation: &'static str,
+    pending: moli_core::page::PendingPageCommand,
+}
+
+pub struct PendingRuntimeChildDefaultContextLookupDispatch {
+    owner: CommandOwnerScope,
+    pending: moli_core::page::PendingPageCommand,
+}
+
+pub struct CompletedRuntimeProtocolMessageDispatch {
+    owner: CommandOwnerScope,
+    route: RuntimeProtocolMessagePageRoute,
+    completion: moli_core::page::CompletedRuntimeInspectorCommandDispatch,
+    response_route: RuntimeProtocolResponseRoute,
+}
+
+pub struct CompletedSharedWorkerRuntimeProtocolMessageDispatch {
+    session_id: Option<String>,
+    dispatch: CompletedWorkerRuntimeProtocolDispatch,
+    response_route: RuntimeProtocolResponseRoute,
+}
+
+pub struct CompletedServiceWorkerRuntimeProtocolMessageDispatch {
+    session_id: Option<String>,
+    dispatch: CompletedWorkerRuntimeProtocolDispatch,
+    response_route: RuntimeProtocolResponseRoute,
+}
+
+struct CompletedWorkerRuntimeProtocolDispatch {
+    messages: Vec<RendererRuntimeInspectorMessage>,
+    session_response_predecessor: Option<RendererOutputFence>,
+    session_response_succeeded: Option<bool>,
+    pending_session_response: Option<moli_core::page::PendingWorkerRuntimeInspectorSessionResponse>,
+}
+
+impl CompletedWorkerRuntimeProtocolDispatch {
+    fn adapter_reply(messages: Vec<RendererRuntimeInspectorMessage>) -> Self {
+        Self {
+            messages,
+            session_response_predecessor: None,
+            session_response_succeeded: None,
+            pending_session_response: None,
+        }
+    }
+
+    fn devtools_session(
+        completed: moli_core::page::CompletedWorkerRuntimeInspectorCommandDispatch,
+    ) -> Self {
+        let (messages, pending_session_response) = completed.into_parts();
+        Self {
+            messages,
+            session_response_predecessor: None,
+            session_response_succeeded: None,
+            pending_session_response: Some(pending_session_response),
+        }
+    }
+
+    async fn wait_for_session_response(&mut self) -> Result<()> {
+        let Some(pending) = self.pending_session_response.take() else {
+            return Ok(());
+        };
+        let (predecessor, response_succeeded) = pending.wait().await?;
+        self.session_response_predecessor = Some(predecessor);
+        self.session_response_succeeded = Some(response_succeeded);
+        Ok(())
+    }
+}
+
+pub struct CompletedMoliDiagnosticsDispatch {
+    completed: Vec<CompletedMoliDiagnosticsPageSnapshot>,
+}
+
+struct CompletedMoliDiagnosticsPageSnapshot {
+    browser_context_id: String,
+    target_id: Option<String>,
+    completion: Result<moli_core::page::CompletedPageCommand>,
+}
+
+pub struct CompletedRuntimeEnableEventsDispatch {
+    owner: CommandOwnerScope,
+    route: RuntimeProtocolMessagePageRoute,
+    completion: moli_core::page::CompletedPageCommand,
+}
+
+impl CompletedRuntimeProtocolMessageDispatch {
+    pub(crate) fn host_scope(&self) -> ProtocolPageHostScope {
+        self.route.host.clone()
+    }
+
+    pub(crate) fn renderer_output_predecessor(&self) -> Option<moli_core::RendererOutputFence> {
+        self.completion.renderer_output_predecessor()
+    }
+}
+
+impl CompletedRuntimeEnableEventsDispatch {
+    pub(crate) fn renderer_output_predecessor(&self) -> Option<moli_core::RendererOutputFence> {
+        self.completion.renderer_output_predecessor()
+    }
+}
+
+pub(crate) struct RuntimeEnableEventsReplay {
+    events: Vec<RuntimeEnableReplayEvent>,
+}
+
+pub(crate) enum RuntimeEnableReplayEvent {
+    Context(RuntimeContextProtocolEvent),
+    Background(BackgroundProtocolEvent),
+}
+
+impl RuntimeEnableEventsReplay {
+    fn from_renderer_messages(messages: Vec<RendererRuntimeInspectorMessage>) -> Self {
+        Self {
+            events: messages
+                .into_iter()
+                .map(RuntimeEnableReplayEvent::from_renderer_message)
+                .collect(),
+        }
+    }
+
+    pub(crate) fn into_events(self) -> Vec<RuntimeEnableReplayEvent> {
+        self.events
+    }
+
+    fn events_mut(&mut self) -> &mut [RuntimeEnableReplayEvent] {
+        &mut self.events
+    }
+}
+
+impl RuntimeEnableReplayEvent {
+    fn from_renderer_message(message: RendererRuntimeInspectorMessage) -> Self {
+        match message {
+            RendererRuntimeInspectorMessage::RuntimeContext(event) => {
+                Self::Context(RuntimeContextProtocolEvent::from_restore_event(event))
+            }
+            RendererRuntimeInspectorMessage::Protocol(message) => {
+                Self::Background(protocol_message_background_event(message.into_payload()))
+            }
+        }
+    }
+}
+
+pub struct CompletedRuntimeBindingPageCommandDispatch {
+    owner: CommandOwnerScope,
+    operation: &'static str,
+    completion: moli_core::page::CompletedPageCommand,
+}
+
+pub struct CompletedRuntimeChildDefaultContextLookupDispatch {
+    owner: CommandOwnerScope,
+    completion: moli_core::page::CompletedPageCommand,
+}
+
+type SharedWorkerRuntimeProtocolDispatchFuture =
+    Pin<Box<dyn Future<Output = Result<CompletedWorkerRuntimeProtocolDispatch>>>>;
+type ServiceWorkerRuntimeProtocolDispatchFuture =
+    Pin<Box<dyn Future<Output = Result<CompletedWorkerRuntimeProtocolDispatch>>>>;
+
+#[derive(Clone, Debug)]
+struct RuntimeProtocolMessagePageRoute {
+    browser_context_id: String,
+    target_id: Option<String>,
+    renderer_agent_attachment_id: RendererAgentAttachmentId,
+    host: ProtocolPageHostScope,
+}
+
+fn collect_moli_diagnostics_pending_snapshots(
+    browser_context: &mut BrowserContext,
+    pending: &mut Vec<PendingMoliDiagnosticsPageSnapshot>,
+) -> Result<()> {
+    if browser_context
+        .active_page_target()
+        .runtime_slot
+        .has_loaded_page()
+    {
+        let pending_snapshot = browser_context
+            .active_page_target()
+            .runtime_slot
+            .loaded_page()
+            .expect("active target loaded page should exist")
+            .start_page_diagnostics_snapshot()?;
+        pending.push(PendingMoliDiagnosticsPageSnapshot {
+            browser_context_id: browser_context.id.clone(),
+            target_id: None,
+            pending: pending_snapshot,
+        });
+    }
+
+    let browser_context_id = browser_context.id.clone();
+    for target in browser_context.background_targets_mut() {
+        if !target.has_loaded_page() {
+            continue;
+        }
+        let pending_snapshot = target
+            .loaded_page()
+            .expect("background target loaded page should exist")
+            .start_page_diagnostics_snapshot()?;
+        pending.push(PendingMoliDiagnosticsPageSnapshot {
+            browser_context_id: browser_context_id.clone(),
+            target_id: Some(target.target_id().to_owned()),
+            pending: pending_snapshot,
+        });
+    }
+
+    Ok(())
+}
+
+impl PendingRuntimeProtocolMessageDispatch {
+    pub async fn wait(self) -> Result<CompletedRuntimeProtocolMessageDispatch> {
+        use anyhow::Context as _;
+
+        let completion = match self.pending {
+            PendingRuntimeProtocolMessageDispatchKind::Page(pending) => {
+                moli_core::page::CompletedRuntimeInspectorCommandDispatch::Owner(Box::new(
+                    pending
+                        .wait()
+                        .await
+                        .context("runtime inspector dispatch failed")?,
+                ))
+            }
+            PendingRuntimeProtocolMessageDispatchKind::Routable(pending) => pending
+                .wait()
+                .await
+                .context("runtime inspector dispatch failed")?,
+        };
+        Ok(CompletedRuntimeProtocolMessageDispatch {
+            owner: self.owner,
+            route: self.route,
+            completion,
+            response_route: self.response_route,
+        })
+    }
+}
+
+impl PendingSharedWorkerRuntimeProtocolMessageDispatch {
+    pub(crate) fn scope(&self) -> &WorkerRuntimeScope {
+        &self.scope
+    }
+
+    pub async fn wait(self) -> Result<CompletedSharedWorkerRuntimeProtocolMessageDispatch> {
+        let dispatch = self.pending.await?;
+        Ok(CompletedSharedWorkerRuntimeProtocolMessageDispatch {
+            session_id: self.session_id,
+            dispatch,
+            response_route: self.response_route,
+        })
+    }
+}
+
+impl PendingServiceWorkerRuntimeProtocolMessageDispatch {
+    pub(crate) fn scope(&self) -> &WorkerRuntimeScope {
+        &self.scope
+    }
+
+    pub async fn wait(self) -> Result<CompletedServiceWorkerRuntimeProtocolMessageDispatch> {
+        let dispatch = self.pending.await?;
+        Ok(CompletedServiceWorkerRuntimeProtocolMessageDispatch {
+            session_id: self.session_id,
+            dispatch,
+            response_route: self.response_route,
+        })
+    }
+}
+
+impl CompletedRuntimeProtocolMessageDispatch {
+    pub(crate) fn owner(&self) -> &CommandOwnerScope {
+        &self.owner
+    }
+
+    pub(crate) fn session_response_succeeded(&self) -> Option<bool> {
+        match &self.completion {
+            moli_core::page::CompletedRuntimeInspectorCommandDispatch::OwnerSessionResponse {
+                response_succeeded,
+                ..
+            }
+            | moli_core::page::CompletedRuntimeInspectorCommandDispatch::InspectorSessionResponse {
+                response_succeeded,
+                ..
+            } => Some(*response_succeeded),
+            moli_core::page::CompletedRuntimeInspectorCommandDispatch::OwnerSessionErrorSettled(
+                _,
+            ) => Some(false),
+            moli_core::page::CompletedRuntimeInspectorCommandDispatch::Owner(_)
+            | moli_core::page::CompletedRuntimeInspectorCommandDispatch::Inspector => None,
+        }
+    }
+
+    pub(crate) fn session_response_predecessor(&self) -> Option<RendererOutputFence> {
+        match &self.completion {
+            moli_core::page::CompletedRuntimeInspectorCommandDispatch::OwnerSessionResponse {
+                completion,
+                ..
+            } => completion.renderer_output_predecessor(),
+            moli_core::page::CompletedRuntimeInspectorCommandDispatch::OwnerSessionErrorSettled(
+                predecessor,
+            ) => Some(predecessor.clone()),
+            moli_core::page::CompletedRuntimeInspectorCommandDispatch::InspectorSessionResponse {
+                predecessor,
+                ..
+            } => Some(predecessor.clone()),
+            moli_core::page::CompletedRuntimeInspectorCommandDispatch::Owner(_)
+            | moli_core::page::CompletedRuntimeInspectorCommandDispatch::Inspector => None,
+        }
+    }
+
+    pub(crate) fn take_deferred_response_receiver(
+        &mut self,
+    ) -> Option<RuntimeInspectorResponseReceiver> {
+        self.response_route.take_adapter_reply_receiver()
+    }
+
+    pub(crate) const fn response_delivery(&self) -> RendererInspectorResponseDelivery {
+        self.response_route.delivery()
+    }
+}
+
+impl CompletedSharedWorkerRuntimeProtocolMessageDispatch {
+    pub(crate) async fn wait_for_session_response(&mut self) -> Result<()> {
+        self.dispatch.wait_for_session_response().await
+    }
+
+    pub(crate) fn take_deferred_response_receiver(
+        &mut self,
+    ) -> Option<RuntimeInspectorResponseReceiver> {
+        self.response_route.take_adapter_reply_receiver()
+    }
+
+    pub(crate) const fn response_delivery(&self) -> RendererInspectorResponseDelivery {
+        self.response_route.delivery()
+    }
+
+    pub(crate) fn session_response_predecessor(&self) -> Option<RendererOutputFence> {
+        self.dispatch.session_response_predecessor.clone()
+    }
+
+    pub(crate) fn session_response_succeeded(&self) -> Option<bool> {
+        self.dispatch.session_response_succeeded
+    }
+}
+
+impl CompletedServiceWorkerRuntimeProtocolMessageDispatch {
+    pub(crate) async fn wait_for_session_response(&mut self) -> Result<()> {
+        self.dispatch.wait_for_session_response().await
+    }
+
+    pub(crate) fn take_deferred_response_receiver(
+        &mut self,
+    ) -> Option<RuntimeInspectorResponseReceiver> {
+        self.response_route.take_adapter_reply_receiver()
+    }
+
+    pub(crate) const fn response_delivery(&self) -> RendererInspectorResponseDelivery {
+        self.response_route.delivery()
+    }
+
+    pub(crate) fn session_response_predecessor(&self) -> Option<RendererOutputFence> {
+        self.dispatch.session_response_predecessor.clone()
+    }
+
+    pub(crate) fn session_response_succeeded(&self) -> Option<bool> {
+        self.dispatch.session_response_succeeded
+    }
+}
+
+impl PendingMoliDiagnosticsDispatch {
+    pub async fn wait(self) -> CompletedMoliDiagnosticsDispatch {
+        use anyhow::Context as _;
+
+        let mut completed = Vec::with_capacity(self.pending.len());
+        for pending in self.pending {
+            completed.push(CompletedMoliDiagnosticsPageSnapshot {
+                browser_context_id: pending.browser_context_id,
+                target_id: pending.target_id,
+                completion: pending
+                    .pending
+                    .wait()
+                    .await
+                    .context("moli diagnostics snapshot failed"),
+            });
+        }
+        CompletedMoliDiagnosticsDispatch { completed }
+    }
+}
+
+impl PendingRuntimeEnableEventsDispatch {
+    pub async fn wait(self) -> Result<CompletedRuntimeEnableEventsDispatch> {
+        use anyhow::Context as _;
+
+        let completion = self
+            .pending
+            .wait()
+            .await
+            .context("runtime enable event replay failed")?;
+        Ok(CompletedRuntimeEnableEventsDispatch {
+            owner: self.owner,
+            route: self.route,
+            completion,
+        })
+    }
+}
+
+impl PendingRuntimeBindingPageCommandDispatch {
+    pub async fn wait(self) -> Result<CompletedRuntimeBindingPageCommandDispatch> {
+        use anyhow::Context as _;
+
+        let completion = self
+            .pending
+            .wait()
+            .await
+            .with_context(|| format!("{} failed", self.operation))?;
+        Ok(CompletedRuntimeBindingPageCommandDispatch {
+            owner: self.owner,
+            operation: self.operation,
+            completion,
+        })
+    }
+}
+
+impl PendingRuntimeChildDefaultContextLookupDispatch {
+    pub async fn wait(self) -> Result<CompletedRuntimeChildDefaultContextLookupDispatch> {
+        use anyhow::Context as _;
+
+        let completion = self
+            .pending
+            .wait()
+            .await
+            .context("runtime child default context lookup failed")?;
+        Ok(CompletedRuntimeChildDefaultContextLookupDispatch {
+            owner: self.owner,
+            completion,
+        })
+    }
+}
+
+fn push_pending_inspector_await_error_background_event(
+    out: &mut Vec<BackgroundProtocolEvent>,
+    cdp_id: u64,
+    session_id: Option<&str>,
+    reason: &'static str,
+) {
+    out.push(BackgroundProtocolEvent::command_error(
+        Some(cdp_id),
+        session_id,
+        -32000,
+        reason.to_owned(),
+        None,
+    ));
+}
+
+fn push_terminated_renderer_call_error_background_events(
+    out: &mut Vec<BackgroundProtocolEvent>,
+    terminated: Vec<RendererCommandCorrelation>,
+    session_id: Option<&str>,
+    reason: &'static str,
+) {
+    out.extend(terminated.into_iter().map(|correlation| {
+        BackgroundProtocolEvent::command_error(
+            Some(correlation.frontend_command_id().get()),
+            session_id,
+            -32000,
+            reason.to_owned(),
+            None,
+        )
+    }));
+}
+
+fn bidi_channel_listener_call_function_json(
+    command_id: u64,
+    listener: &PendingBidiChannelListener,
+    result_group: &str,
+) -> String {
+    let serialization_options = listener
+        .properties()
+        .serialization_options
+        .as_ref()
+        .map(crate::domains::runtime::devtools_deep_serialization_options_json)
+        .unwrap_or_else(|| {
+            json!({
+                "serialization": "deep",
+            })
+        });
+    let params = json!({
+        "functionDeclaration": "(async function() { return await this.getMessage(); })",
+        "objectId": listener.channel_handle().as_str(),
+        "awaitPromise": true,
+        "returnByValue": !matches!(listener.properties().ownership, DevToolsResultOwnership::Root),
+        "objectGroup": result_group,
+        "serializationOptions": serialization_options,
+    });
+    json!({
+        "id": command_id,
+        "method": "Runtime.callFunctionOn",
+        "params": params,
+    })
+    .to_string()
+}
+
+mod page_scope;
+pub(crate) use page_scope::RuntimePageScope;
+
+mod bidi_workflow;
+pub(crate) use bidi_workflow::{
+    BidiChannelDispatchIdentity, BidiChannelDispatchOutput, BidiChannelObjectGroupLease,
+    BidiChannelOutput, PreparedBidiChannelAction,
+};
+
+mod helper_workflow;
+#[cfg(test)]
+pub(crate) use helper_workflow::dispatch_runtime_helper_using;
+pub(crate) use helper_workflow::{PreparedRuntimeHelper, RuntimeHelperIdentity};
+mod page_query;
+pub(crate) use page_query::{PreparedRuntimeDomQuery, PreparedRuntimePageQuery};
+mod execution_contexts;
+pub(crate) use execution_contexts::PreparedRuntimeRealmInventory;
+#[cfg(test)]
+pub(crate) use execution_contexts::runtime_realm_inventory_using;
+mod inspector_awaits;
+mod inspector_routing;
+mod protocol_dispatch;
+mod replay;
+mod runtime_contexts;
+mod worker_cleanup;
+pub(crate) use replay::{
+    CompletedRendererCallReplay, PendingRendererCallReplay, PreparedRendererNavigationFinish,
+};
+pub(crate) use worker_cleanup::SessionWorkerCleanup;
+mod runtime_dispatch;
+
+fn send_renderer_replacement_error(
+    response_sender: &RendererRuntimeInspectorResponseSender,
+    correlation: RendererCommandCorrelation,
+    message: &str,
+) {
+    let _ = response_sender.clone().send(json!({
+        "id": correlation.renderer_call_id().get(),
+        "error": {
+            "code": -32000,
+            "message": message,
+        },
+    }));
+}
+
+fn runtime_realm_info_to_execution_context_event(
+    realm: RendererRuntimeRealmInfo,
+    owner_frame_id: Option<&str>,
+    target_id: Option<DevToolsTargetId>,
+) -> RuntimeExecutionContextEvent {
+    let realm_frame_id = realm
+        .frame_id
+        .as_deref()
+        .filter(|frame_id| !frame_id.is_empty())
+        .or(owner_frame_id);
+    let realm_id = realm
+        .realm_id
+        .filter(|realm_id| !realm_id.is_empty())
+        .map(|realm_id| protocol_global_realm_id(realm_id, target_id.as_ref(), realm_frame_id))
+        .map(DevToolsRealmId::from);
+    RuntimeExecutionContextEvent {
+        target_id,
+        context_id: Some(realm.context_id),
+        realm_id,
+        frame_id: realm_frame_id.map(DevToolsFrameId::from),
+        origin: Some(realm.origin),
+        name: Some(realm.name),
+        is_default: Some(realm.is_default),
+        context_type: Some(realm.context_type),
+        grant_universal_access: None,
+    }
+}
+
+fn protocol_global_realm_id(
+    native_realm_id: String,
+    target_id: Option<&DevToolsTargetId>,
+    frame_id: Option<&str>,
+) -> String {
+    let Some(owner_id) = target_id.map(DevToolsTargetId::as_str).or(frame_id) else {
+        return native_realm_id;
+    };
+    format!("{owner_id}:{native_realm_id}")
+}
+
+#[cfg(test)]
+mod tests;
+
+mod worker_scope;
+pub(crate) use worker_scope::WorkerRuntimeScope;

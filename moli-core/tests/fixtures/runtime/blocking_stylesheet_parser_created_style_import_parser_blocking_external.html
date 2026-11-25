@@ -1,0 +1,32 @@
+<!doctype html>
+<html>
+  <head>
+    <script>
+      window.blockingStyleImportOrder = [];
+      window.blockingStyleImportDclSeen = false;
+      document.addEventListener("DOMContentLoaded", () => {
+        window.blockingStyleImportDclSeen = true;
+        window.blockingStyleImportOrder.push("dcl");
+      });
+    </script>
+    <style>
+      @import url("/assets/blocking_stylesheet_slow.css");
+    </style>
+    <script>
+      window.blockingStylesheetOrder = window.blockingStyleImportOrder;
+      window.blockingStylesheetDclSeen = window.blockingStyleImportDclSeen;
+    </script>
+    <script src="/assets/blocking_stylesheet_parser_blocking.js"></script>
+    <script>
+      window.blockingStyleImportParserSawStylesheet =
+        window.blockingStylesheetParserSawStylesheet;
+      window.blockingStyleImportParserSawLate =
+        window.blockingStylesheetParserSawLate;
+      window.blockingStyleImportParserSawDcl =
+        window.blockingStylesheetParserSawDcl;
+    </script>
+  </head>
+  <body>
+    <div id="late">late</div>
+  </body>
+</html>

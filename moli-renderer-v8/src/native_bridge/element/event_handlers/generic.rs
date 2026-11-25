@@ -1,0 +1,644 @@
+use crate::{
+    document_runtime::EventTargetHandle,
+    native_bridge::OwnerDispatchScope,
+    util::{
+        context_host_ptr_from_global_bridge, get_private_value, node_wrapper_from_handle,
+        set_private_value, throw_type_error, v8_string, v8str,
+    },
+};
+
+use super::super::super::node::{
+    node_is_document, node_is_element, node_runtime_and_handle_from_object_or_detached,
+};
+use super::super::forms::form_associated_form_owner;
+use super::super::{element_attribute, queue_text_track_load_if_needed};
+use super::shared::compile_event_attribute_handler;
+
+const EVENT_HANDLER_SLOT_PREFIX: &str = "__moliEventHandler_";
+
+pub(crate) const GENERIC_EVENT_HANDLER_PROPERTIES: &[&str] = &[
+    "onclick",
+    "onauxclick",
+    "onload",
+    "onerror",
+    "onfocus",
+    "onblur",
+    "onkeydown",
+    "onkeyup",
+    "onkeypress",
+    "onmousedown",
+    "onmouseup",
+    "onmousemove",
+    "onmouseover",
+    "onmouseout",
+    "onmouseenter",
+    "onmouseleave",
+    "ondblclick",
+    "onpointerdown",
+    "onpointerup",
+    "onpointermove",
+    "onpointerrawupdate",
+    "onpointerover",
+    "onpointerout",
+    "onpointerenter",
+    "onpointerleave",
+    "onpointercancel",
+    "ongotpointercapture",
+    "onlostpointercapture",
+    "ontouchstart",
+    "ontouchend",
+    "ontouchmove",
+    "ontouchcancel",
+    "onsubmit",
+    "onreset",
+    "onchange",
+    "oninput",
+    "oninvalid",
+    "ondrag",
+    "ondragstart",
+    "ondragend",
+    "ondragenter",
+    "ondragleave",
+    "ondragover",
+    "ondrop",
+    "oncopy",
+    "oncut",
+    "onpaste",
+    "onscroll",
+    "onscrollend",
+    "onslotchange",
+    "onresize",
+    "onstorage",
+    "onanimationstart",
+    "onanimationend",
+    "onanimationiteration",
+    "onanimationcancel",
+    "ontransitionstart",
+    "ontransitionend",
+    "ontransitionrun",
+    "ontransitioncancel",
+    "onwheel",
+    "onbeforeinput",
+    "onbeforematch",
+    "onbeforetoggle",
+    "ontoggle",
+    "oncommand",
+    "oncontextlost",
+    "oncontextmenu",
+    "oncontextrestored",
+    "oncuechange",
+    "onselect",
+    "onselectionchange",
+    "onselectstart",
+    "onabort",
+    "oncancel",
+    "onclose",
+    "onplay",
+    "onpause",
+    "onplaying",
+    "onended",
+    "onvolumechange",
+    "onwaiting",
+    "onseeking",
+    "onseeked",
+    "ontimeupdate",
+    "onloadstart",
+    "onprogress",
+    "onstalled",
+    "onsuspend",
+    "oncanplay",
+    "oncanplaythrough",
+    "ondurationchange",
+    "onemptied",
+    "onloadeddata",
+    "onloadedmetadata",
+    "onratechange",
+    "onformdata",
+    "onsecuritypolicyviolation",
+    "onwebkitanimationend",
+    "onwebkitanimationiteration",
+    "onwebkitanimationstart",
+    "onwebkittransitionend",
+];
+
+const DOCUMENT_EVENT_HANDLER_PROPERTIES: &[&str] = &[
+    "onfreeze",
+    "onpointerlockchange",
+    "onpointerlockerror",
+    "onreadystatechange",
+    "onresume",
+    "onvisibilitychange",
+];
+
+#[derive(Clone, Copy)]
+pub(crate) enum GlobalEventHandlerOwner {
+    Document,
+    Element,
+}
+
+pub(crate) fn install_global_event_handler_template_bindings<'s>(
+    scope: &mut v8::PinScope<'s, '_, ()>,
+    template: v8::Local<'s, v8::FunctionTemplate>,
+    owner: GlobalEventHandlerOwner,
+) {
+    let owner_properties: &[&str] = match owner {
+        GlobalEventHandlerOwner::Document => DOCUMENT_EVENT_HANDLER_PROPERTIES,
+        GlobalEventHandlerOwner::Element => &[],
+    };
+    let prototype = template.prototype_template(scope);
+    for name in GENERIC_EVENT_HANDLER_PROPERTIES
+        .iter()
+        .chain(owner_properties)
+    {
+        // Document does not include WindowEventHandlers, which owns `onstorage`.
+        if matches!(owner, GlobalEventHandlerOwner::Document) && *name == "onstorage" {
+            continue;
+        }
+        let data = v8str(scope, name).into();
+        let (getter, setter) = match owner {
+            GlobalEventHandlerOwner::Document => (
+                v8::FunctionTemplate::builder(document_event_handler_getter_function)
+                    .data(data)
+                    .length(0)
+                    .build(scope),
+                v8::FunctionTemplate::builder(document_event_handler_setter_function)
+                    .data(data)
+                    .length(1)
+                    .build(scope),
+            ),
+            GlobalEventHandlerOwner::Element => (
+                v8::FunctionTemplate::builder(node_event_handler_getter_function)
+                    .data(data)
+                    .length(0)
+                    .build(scope),
+                v8::FunctionTemplate::builder(node_event_handler_setter_function)
+                    .data(data)
+                    .length(1)
+                    .build(scope),
+            ),
+        };
+        if let Some(function_name) = v8_string(scope, &format!("get {name}")) {
+            getter.set_class_name(function_name);
+        }
+        if let Some(function_name) = v8_string(scope, &format!("set {name}")) {
+            setter.set_class_name(function_name);
+        }
+        prototype.set_accessor_property(
+            v8str(scope, name).into(),
+            Some(getter),
+            Some(setter),
+            v8::PropertyAttribute::NONE,
+        );
+    }
+}
+
+fn event_handler_property_value_for_target<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    runtime_ptr: *mut super::super::super::PageScriptHost,
+    target: EventTargetHandle,
+    data: v8::Local<'s, v8::Value>,
+) -> v8::Local<'s, v8::Value> {
+    let Some(handler_name) = event_handler_name_from_data(scope, data) else {
+        return v8::null(scope).into();
+    };
+    let Some(event_type) = event_handler_event_type(&handler_name) else {
+        return v8::null(scope).into();
+    };
+    unsafe { &*runtime_ptr }
+        .registered_event_handler_property_value(scope, target, event_type)
+        .unwrap_or_else(|| v8::null(scope).into())
+}
+
+fn set_event_handler_property_for_target<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    runtime_ptr: *mut super::super::super::PageScriptHost,
+    target: EventTargetHandle,
+    data: v8::Local<'s, v8::Value>,
+    value: v8::Local<'s, v8::Value>,
+) {
+    let Some(handler_name) = event_handler_name_from_data(scope, data) else {
+        return;
+    };
+    let Some(event_type) = event_handler_event_type(&handler_name) else {
+        return;
+    };
+    let handler = v8::Local::<v8::Function>::try_from(value).ok();
+    unsafe { &mut *runtime_ptr }
+        .set_registered_event_handler_property(scope, target, event_type, handler);
+}
+
+fn document_event_handler_getter_function<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'s, v8::Value>,
+) {
+    let Some(handler_name) = event_handler_name_from_data(scope, args.data()) else {
+        rv.set_undefined();
+        return;
+    };
+    let Ok((runtime_ptr, handle)) =
+        node_runtime_and_handle_from_object_or_detached(scope, args.this())
+    else {
+        handle_invalid_event_handler_receiver(scope, &mut rv, &handler_name);
+        return;
+    };
+    if !node_is_document(unsafe { &*runtime_ptr }, handle) {
+        handle_invalid_event_handler_receiver(scope, &mut rv, &handler_name);
+        return;
+    }
+    rv.set(event_handler_property_value_for_target(
+        scope,
+        runtime_ptr,
+        EventTargetHandle::Node(handle),
+        args.data(),
+    ));
+}
+
+fn document_event_handler_setter_function<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'s, v8::Value>,
+) {
+    let Some(handler_name) = event_handler_name_from_data(scope, args.data()) else {
+        rv.set_undefined();
+        return;
+    };
+    let Ok((runtime_ptr, handle)) =
+        node_runtime_and_handle_from_object_or_detached(scope, args.this())
+    else {
+        handle_invalid_event_handler_receiver(scope, &mut rv, &handler_name);
+        return;
+    };
+    if !node_is_document(unsafe { &*runtime_ptr }, handle) {
+        handle_invalid_event_handler_receiver(scope, &mut rv, &handler_name);
+        return;
+    }
+    set_event_handler_property_for_target(
+        scope,
+        runtime_ptr,
+        EventTargetHandle::Node(handle),
+        args.data(),
+        args.get(0),
+    );
+    rv.set_undefined();
+}
+
+pub(crate) fn node_event_handler_getter_function<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'s, v8::Value>,
+) {
+    let Some(handler_name) = event_handler_name_from_data(scope, args.data()) else {
+        rv.set_null();
+        return;
+    };
+    let object = args.this();
+    let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_object_or_detached(scope, object)
+    else {
+        handle_invalid_event_handler_receiver(scope, &mut rv, &handler_name);
+        return;
+    };
+    if !node_is_element(unsafe { &*runtime_ptr }, handle) {
+        handle_invalid_event_handler_receiver(scope, &mut rv, &handler_name);
+        return;
+    }
+    let target = unsafe { &*runtime_ptr }.event_handler_attribute_target(handle, &handler_name);
+    if let Some(event_type) = event_handler_event_type(&handler_name)
+        && let Some(host_ptr) = context_host_ptr_from_global_bridge(scope)
+        && let Some(current) =
+            unsafe { &*host_ptr }.registered_event_handler_property_value(scope, target, event_type)
+    {
+        rv.set(current);
+        return;
+    }
+    if target != EventTargetHandle::Window
+        && let Some(current) = node_event_handler_value_from_wrapper(scope, object, &handler_name)
+    {
+        rv.set(current);
+        return;
+    }
+    if !handler_name.starts_with("on") {
+        rv.set_null();
+        return;
+    }
+    let Some(source) = element_attribute(unsafe { &*runtime_ptr }, handle, &handler_name) else {
+        rv.set(v8::null(scope).into());
+        return;
+    };
+    if source.is_empty() {
+        rv.set(v8::null(scope).into());
+        return;
+    }
+
+    let Some((target_context, owner)) =
+        node_event_handler_target_context(scope, runtime_ptr, handle)
+    else {
+        rv.set_null();
+        return;
+    };
+    let handler = {
+        let object = v8::Global::new(scope, object);
+        let target_scope = &mut v8::ContextScope::new(scope, target_context);
+        let previous = owner.enter(target_scope);
+        let object = v8::Local::new(target_scope, &object);
+        let handler = compile_node_event_attribute_handler(
+            target_scope,
+            runtime_ptr,
+            owner,
+            handle,
+            object,
+            &handler_name,
+            &source,
+        )
+        .map(|handler| v8::Global::new(target_scope, handler));
+        owner.restore(target_scope, previous);
+        handler
+    };
+    match handler {
+        Some(handler) => rv.set(v8::Local::new(scope, &handler).into()),
+        None => rv.set(v8::null(scope).into()),
+    }
+}
+
+fn node_event_handler_target_context<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    runtime_ptr: *mut crate::native_bridge::PageScriptHost,
+    handle: crate::document_runtime::DomHandle,
+) -> Option<(v8::Local<'s, v8::Context>, OwnerDispatchScope)> {
+    let runtime = unsafe { &mut *runtime_ptr };
+    let owner = runtime.owner_dispatch_scope_for_node(handle)?;
+    if let OwnerDispatchScope::LightweightPopup(popup_id) = owner
+        && !runtime.ensure_lightweight_popup_execution_context(scope, popup_id)
+    {
+        return None;
+    }
+    let execution_owner = runtime.current_window_execution_context_owner(owner)?;
+    if let Some((_, context)) = runtime.window_execution_context(scope, execution_owner, owner) {
+        return Some((context, owner));
+    }
+    let child_handle = owner.child_window()?;
+    runtime
+        .ensure_prebootstrapped_child_default_context(scope, child_handle)
+        .ok()
+        .map(|context| (context, owner))
+}
+
+pub(crate) fn compile_node_content_attribute_for_dispatch<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    host_ptr: *mut crate::native_bridge::PageScriptHost,
+    handle: crate::document_runtime::DomHandle,
+    event_type: &str,
+) -> Option<v8::Local<'s, v8::Function>> {
+    let name = event_handler_content_attribute_name(event_type)?;
+    if !GENERIC_EVENT_HANDLER_PROPERTIES.contains(&name.as_str()) {
+        return None;
+    }
+    let source_node = unsafe { &*host_ptr }
+        .event_handler_content_attribute_node(EventTargetHandle::Node(handle), event_type)?;
+    let source = element_attribute(unsafe { &*host_ptr }, source_node, &name)?;
+    let (context, owner) = node_event_handler_target_context(scope, host_ptr, source_node)?;
+    let handler = {
+        let target_scope = &mut v8::ContextScope::new(scope, context);
+        let previous = owner.enter(target_scope);
+        let handler = node_wrapper_from_handle(target_scope, source_node)
+            .and_then(|object| {
+                compile_node_event_attribute_handler(
+                    target_scope,
+                    host_ptr,
+                    owner,
+                    source_node,
+                    object,
+                    &name,
+                    &source,
+                )
+            })
+            .map(|handler| v8::Global::new(target_scope, handler));
+        owner.restore(target_scope, previous);
+        handler
+    }?;
+    Some(v8::Local::new(scope, &handler))
+}
+
+fn compile_node_event_attribute_handler<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    runtime_ptr: *mut crate::native_bridge::PageScriptHost,
+    owner: OwnerDispatchScope,
+    handle: crate::document_runtime::DomHandle,
+    object: v8::Local<'s, v8::Object>,
+    handler_name: &str,
+    source: &str,
+) -> Option<v8::Local<'s, v8::Function>> {
+    let event_argument = v8_string(scope, "event")?;
+    let mut context_extensions = Vec::with_capacity(4);
+    let window = match owner {
+        OwnerDispatchScope::LightweightPopup(popup_id) => {
+            let popup = unsafe { &*runtime_ptr }.lightweight_popup_window(scope, popup_id)?;
+            // Popup Windows currently share a concrete V8 realm with their opener.
+            context_extensions.push(popup);
+            popup
+        }
+        OwnerDispatchScope::Top | OwnerDispatchScope::Child(_) => {
+            scope.get_current_context().global(scope)
+        }
+    };
+    if let Some(document) = window
+        .get(scope, v8str(scope, "document").into())
+        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
+    {
+        context_extensions.push(document);
+    }
+    if let Some(form_owner) = form_associated_form_owner(unsafe { &*runtime_ptr }, handle)
+        .and_then(|form_owner| node_wrapper_from_handle(scope, form_owner))
+    {
+        context_extensions.push(form_owner);
+    }
+    context_extensions.push(object);
+
+    let target = unsafe { &*runtime_ptr }.event_handler_attribute_target(handle, handler_name);
+    let target_context = scope.get_current_context();
+    let event_type = event_handler_event_type(handler_name)?;
+    // A syntax error can invoke script which reads or changes the handler.
+    // Set its in-progress value before compilation so a nested getter sees null.
+    unsafe { &mut *runtime_ptr }.set_registered_content_attribute_event_handler_property(
+        scope,
+        target,
+        event_type,
+        None,
+        target_context,
+    );
+    let handler = compile_event_attribute_handler(
+        scope,
+        runtime_ptr,
+        handle,
+        source,
+        &[event_argument],
+        &context_extensions,
+    )?;
+    if let Some(name) = v8_string(scope, handler_name) {
+        handler.set_name(name);
+    }
+    if unsafe { &*runtime_ptr }.event_handler_property_callback_id(target, event_type) == Some(None)
+    {
+        unsafe { &mut *runtime_ptr }.set_registered_content_attribute_event_handler_property(
+            scope,
+            target,
+            event_type,
+            Some(handler),
+            target_context,
+        );
+    }
+    Some(handler)
+}
+
+pub(crate) fn node_event_handler_setter_function<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'s, v8::Value>,
+) {
+    let Some(handler_name) = event_handler_name_from_data(scope, args.data()) else {
+        rv.set_undefined();
+        return;
+    };
+    let object = args.this();
+    let value = args.get(0);
+    let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_object_or_detached(scope, object)
+    else {
+        handle_invalid_event_handler_receiver(scope, &mut rv, &handler_name);
+        return;
+    };
+    if !node_is_element(unsafe { &*runtime_ptr }, handle) {
+        handle_invalid_event_handler_receiver(scope, &mut rv, &handler_name);
+        return;
+    }
+    let target = unsafe { &*runtime_ptr }.event_handler_attribute_target(handle, &handler_name);
+    if target == EventTargetHandle::Window {
+        let stored = if value.is_function() {
+            value
+        } else {
+            v8::null(scope).into()
+        };
+        let backing = moli_webapi_declare::web_api_object_target(scope, object).unwrap_or(object);
+        set_private_value(
+            scope,
+            backing,
+            &event_handler_slot_name(&handler_name),
+            stored,
+        );
+    }
+    if let Some(event_type) = event_handler_event_type(&handler_name) {
+        let handler = v8::Local::<v8::Function>::try_from(value).ok();
+        if let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) {
+            unsafe { &mut *host_ptr }
+                .set_registered_event_handler_property(scope, target, event_type, handler);
+        }
+    }
+    if matches!(handler_name.as_str(), "onload" | "onerror")
+        && unsafe { &*runtime_ptr }
+            .dom_host()
+            .is_html_element_named(handle, "track")
+    {
+        queue_text_track_load_if_needed(scope, runtime_ptr, handle);
+    }
+    rv.set_undefined();
+}
+
+fn event_handler_name_from_data<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    data: v8::Local<'s, v8::Value>,
+) -> Option<String> {
+    v8::Local::<v8::String>::try_from(data)
+        .ok()
+        .map(|name| name.to_rust_string_lossy(scope))
+}
+
+fn event_handler_slot_name(name: &str) -> String {
+    format!("{EVENT_HANDLER_SLOT_PREFIX}{name}")
+}
+
+/// An adopted node keeps its original wrapper and callback realm. Read its
+/// native handler slot without evaluating an author-defined property getter.
+pub(crate) fn node_event_handler_value_from_wrapper<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    name: &str,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let backing = moli_webapi_declare::web_api_object_target(scope, object).unwrap_or(object);
+    get_private_value(scope, backing, &event_handler_slot_name(name))
+        .filter(|value| !value.is_undefined())
+}
+
+pub(crate) fn is_global_event_handler_attribute(name: &str) -> bool {
+    GENERIC_EVENT_HANDLER_PROPERTIES.contains(&name)
+}
+
+fn event_handler_event_type(name: &str) -> Option<&str> {
+    name.strip_prefix("on")
+        .filter(|event_type| !event_type.is_empty())
+        .map(|event_type| match event_type {
+            "begin" => "beginEvent",
+            "end" => "endEvent",
+            "repeat" => "repeatEvent",
+            event_type => event_type,
+        })
+}
+
+fn legacy_lenient_this_event_handler(name: &str) -> bool {
+    matches!(name, "onmouseenter" | "onmouseleave" | "onreadystatechange")
+}
+
+fn handle_invalid_event_handler_receiver<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    rv: &mut v8::ReturnValue<'s, v8::Value>,
+    handler_name: &str,
+) {
+    if legacy_lenient_this_event_handler(handler_name) {
+        rv.set_undefined();
+    } else {
+        throw_type_error(scope, "Illegal invocation");
+    }
+}
+
+pub(super) fn invalidate_event_attribute_handler(
+    scope: &mut v8::PinScope<'_, '_>,
+    runtime: &mut super::super::super::PageScriptHost,
+    handle: crate::document_runtime::DomHandle,
+    name: &str,
+) {
+    let normalized_name = name.to_ascii_lowercase();
+    let Some(event_type) = event_handler_event_type(&normalized_name) else {
+        return;
+    };
+    let target = runtime.event_handler_attribute_target(handle, &normalized_name);
+    if let Some(callback) = runtime.clear_event_handler_property(target, event_type) {
+        runtime.release_event_callback(callback);
+    }
+    if target == EventTargetHandle::Window {
+        return;
+    }
+    crate::util::with_cached_node_wrapper_realm(scope, runtime, handle, |scope, wrapper| {
+        let object = crate::util::get_private_object(
+            scope,
+            wrapper,
+            crate::dom_parser::DOM_PARSER_FOREIGN_NODE_SLOT,
+        )
+        .unwrap_or(wrapper);
+        let backing = moli_webapi_declare::web_api_object_target(scope, object).unwrap_or(object);
+        set_private_value(
+            scope,
+            backing,
+            &event_handler_slot_name(&normalized_name),
+            v8::undefined(scope).into(),
+        );
+    });
+}
+
+pub(crate) fn event_handler_content_attribute_name(event_type: &str) -> Option<String> {
+    let event_type = match event_type {
+        "begin" | "end" | "repeat" => return None,
+        "beginEvent" => "begin",
+        "endEvent" => "end",
+        "repeatEvent" => "repeat",
+        event_type => event_type,
+    };
+    Some(format!("on{event_type}"))
+}

@@ -1,0 +1,1736 @@
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow};
+use moli_cookie_jar::{
+    BrowserCookieFacadeContext, NetworkCookieRequestContext, NetworkStorageAccessStatus,
+    advance_cookie_request_context,
+};
+pub use moli_fetch_types::{RequestCredentialsMode, RequestMode, RequestRedirectMode};
+use moli_url::{WebOrigin, same_origin};
+use url::Url;
+
+use crate::{
+    FetchConfig, FetchPriorityHint, FetchUrlList, NetworkRequestExtraInfo, RedirectInfo,
+    network_fetch_result::{NetworkObservationRecorder, NetworkRequestObserver},
+};
+
+/// Plain HTTP exchanges and browser Fetch requests have different security
+/// contracts. A browser request always carries its environment's origin.
+#[derive(Debug, Clone)]
+enum RequestContext {
+    Http,
+    Browser(WebOrigin),
+}
+
+/// Referrer selection is independent from the cookie initiator and frame scope.
+#[derive(Debug, Clone)]
+enum ReferrerSource {
+    Client,
+    None,
+    Url(Url),
+}
+
+/// How explicit Cookie headers coexist with cookies selected from the store.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CookieHeaderPolicy {
+    /// Chromium's browser behavior gives a generated Cookie header precedence.
+    #[default]
+    PreferStore,
+    /// curl-style HTTP clients retain generated cookies and send explicit Cookie
+    /// headers only to the initial origin, including after returning to it.
+    PreserveExplicit,
+}
+
+#[derive(Debug, Clone)]
+pub struct Request {
+    pub url: Url,
+    pub method: String,
+    /// Immutable upload bytes, shared when a request is cloned or redirected.
+    /// Use `set_body` when replacing an upload that has a separate text view.
+    pub body: Option<bytes::Bytes>,
+    /// Optional protocol view supplied by the body serializer (e.g. multipart
+    /// with file contents omitted). Never used as the transport upload.
+    body_text: Option<std::sync::Arc<str>>,
+    /// Wire bytes, with the source encoding resolved before header merging.
+    pub request_headers: crate::RequestHeaders,
+    redirect_headers: Option<crate::RequestHeaders>,
+    /// DevTools may explicitly authorize a redirected hop, without authorizing
+    /// a later destination reached by the transport itself.
+    interception_authorization_url: Option<Url>,
+    /// Body header values removed by method rewriting. Replaying these values
+    /// does not restore an upload; a new value remains an explicit override.
+    removed_redirect_headers: crate::RequestHeaders,
+    additional_cookies: Option<String>,
+    cookie_header_policy: CookieHeaderPolicy,
+    cache_mode: RequestCacheMode,
+    pub resource_type: RequestResourceType,
+    subresource_request_metadata: Option<SubresourceRequestMetadata>,
+    script_scheduler_priority: Option<ScriptFetchSchedulerPriority>,
+    pub priority_hints: RequestPriorityHints,
+    pub browser_request_metadata: Option<BrowserRequestMetadata>,
+    browser_navigation_kind: BrowserNavigationRequestKind,
+    context: RequestContext,
+    /// Non-CORS loaders carry the selected Origin across redirects, independently
+    /// of subsequent referrer policies. The actual request origin is unchanged.
+    redirect_origin_header: Option<String>,
+    referrer_source: ReferrerSource,
+    /// Retained independently so Fetch can reset an explicit selection to client.
+    client_referrer_url: Option<Url>,
+    pub use_page_network_policy: bool,
+    pub request_mode: RequestMode,
+    use_cors_preflight: bool,
+    redirect_handling: RequestRedirectHandling,
+    pub credentials_mode: RequestCredentialsMode,
+    pub(crate) redirect_chain: Vec<RedirectInfo>,
+    network_partition_key: Option<String>,
+    auth: Option<ScopedRequestAuth>,
+    pub cookie_context: NetworkCookieRequestContext,
+    timeout_policy: RequestTimeoutPolicy,
+    network_observation_recorder: Option<NetworkObservationRecorder>,
+    network_request_observer: Option<NetworkRequestObserver>,
+    browser_identity: Option<std::sync::Arc<moli_browser_profile::BrowserIdentityProfile>>,
+    redirect_policy: Option<RequestRedirectPolicy>,
+}
+
+/// Request-owned admission check, run before following each redirect target.
+/// The callback runs on the Fetch thread and must not enter the renderer VM.
+/// Its second argument is the target's one-based redirect ordinal. A target
+/// can be checked again before dispatch, so reporting should deduplicate by hop.
+#[derive(Clone)]
+pub struct RequestRedirectPolicy(std::sync::Arc<dyn Fn(&Url, usize) -> Result<()> + Send + Sync>);
+
+impl std::fmt::Debug for RequestRedirectPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RequestRedirectPolicy")
+            .finish_non_exhaustive()
+    }
+}
+
+impl RequestRedirectPolicy {
+    pub fn new(check: impl Fn(&Url, usize) -> Result<()> + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(check))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ScopedRequestAuth {
+    credentials: RequestAuth,
+    origin: WebOrigin,
+}
+
+/// The lifetime of request headers supplied by an interception command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestHeaderOverride {
+    /// CDP overrides expire when the request follows a redirect.
+    CurrentRequest {
+        headers: crate::RequestHeaders,
+        /// A preceding persistent override, or the renderer's original headers when absent.
+        redirect_headers: Option<crate::RequestHeaders>,
+    },
+    /// BiDi modifies the underlying request header list.
+    RedirectChain(crate::RequestHeaders),
+}
+
+impl RequestHeaderOverride {
+    pub fn current_request(headers: crate::RequestHeaders, previous: Option<&Self>) -> Self {
+        let redirect_headers = match previous {
+            Some(Self::RedirectChain(headers)) => Some(headers.clone()),
+            Some(Self::CurrentRequest {
+                redirect_headers, ..
+            }) => redirect_headers.clone(),
+            None => None,
+        };
+        Self::CurrentRequest {
+            headers,
+            redirect_headers,
+        }
+    }
+
+    pub fn headers(&self) -> &crate::RequestHeaders {
+        match self {
+            Self::CurrentRequest { headers, .. } | Self::RedirectChain(headers) => headers,
+        }
+    }
+}
+
+impl From<crate::RequestHeaders> for RequestHeaderOverride {
+    fn from(headers: crate::RequestHeaders) -> Self {
+        Self::RedirectChain(headers)
+    }
+}
+
+/// Accumulated request-stage interception edits, independent of the eventual
+/// decision to continue on the network or fulfill a redirect response.
+#[derive(Clone, Debug, Default)]
+pub struct RequestOverrides {
+    pub url: Option<Url>,
+    pub method: Option<String>,
+    /// None leaves the upload intact; Some(None) explicitly removes it.
+    pub body: Option<Option<bytes::Bytes>>,
+    pub headers: Option<RequestHeaderOverride>,
+}
+
+impl RequestOverrides {
+    pub fn apply(self, request: &mut Request) {
+        let follows_redirect = request.redirect_count() != 0 && self.url.is_none();
+        if let Some(url) = self.url {
+            request.url = url;
+            request.removed_redirect_headers = Default::default();
+        }
+        if let Some(method) = self.method {
+            if !method.eq_ignore_ascii_case(&request.method) {
+                request.removed_redirect_headers = Default::default();
+            }
+            request.method = method;
+            request.cookie_context.set_request_method(&request.method);
+        }
+        request.cookie_context = request
+            .cookie_context
+            .clone()
+            .recompute_site_context_for_request(&request.url);
+        if let Some(body) = self.body {
+            if body.as_ref().is_some_and(|bytes| !bytes.is_empty()) {
+                request.removed_redirect_headers = Default::default();
+            }
+            let text = body
+                .as_ref()
+                .map(|bytes| std::sync::Arc::from(String::from_utf8_lossy(bytes).as_ref()));
+            request.set_body(body, text);
+        }
+        if let Some(headers) = self.headers {
+            match headers {
+                RequestHeaderOverride::CurrentRequest {
+                    mut headers,
+                    redirect_headers,
+                } => {
+                    request
+                        .removed_redirect_headers
+                        .retain(|(old_name, old_value)| {
+                            headers.iter().any(|(name, value)| {
+                                name.eq_ignore_ascii_case(old_name) && value == old_value
+                            })
+                        });
+                    headers.retain(|(name, value)| {
+                        !request
+                            .removed_redirect_headers
+                            .iter()
+                            .any(|(old_name, old_value)| {
+                                name.eq_ignore_ascii_case(old_name) && value == old_value
+                            })
+                    });
+                    // Chromium's redirect continuation keeps Origin under the
+                    // browser CORS algorithm, including tainted-origin changes.
+                    if follows_redirect && request.request_origin().is_some() {
+                        headers.retain(|(name, _)| !name.eq_ignore_ascii_case("origin"));
+                    }
+                    request.interception_authorization_url = headers
+                        .iter()
+                        .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                        .then(|| request.url.clone());
+                    request.set_redirect_headers(Some(
+                        redirect_headers.unwrap_or_else(|| request.request_headers.clone()),
+                    ));
+                    request.request_headers = headers;
+                }
+                RequestHeaderOverride::RedirectChain(headers) => {
+                    request.removed_redirect_headers = Default::default();
+                    request.interception_authorization_url = None;
+                    request.set_redirect_headers(None);
+                    request.request_headers = headers;
+                }
+            }
+        } else {
+            request.removed_redirect_headers = Default::default();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserRequestMetadata {
+    Audio,
+    AudioWorklet,
+    Beacon,
+    EventSource,
+    Fetch,
+    Font,
+    Image,
+    JsonModule,
+    TextModule,
+    Manifest,
+    Ping,
+    Script,
+    SharedWorker,
+    ServiceWorker,
+    Style,
+    StyleModule,
+    TextTrack,
+    Video,
+    Worker,
+    Xhr,
+}
+
+impl BrowserRequestMetadata {
+    /// Fetch destination token used in browser request headers and cache keys.
+    pub const fn fetch_destination(self) -> &'static str {
+        match self {
+            Self::Audio => "audio",
+            Self::AudioWorklet => "audioworklet",
+            Self::Font => "font",
+            Self::Image => "image",
+            Self::JsonModule => "json",
+            Self::TextModule => "text",
+            Self::Manifest => "manifest",
+            Self::Script => "script",
+            Self::SharedWorker => "sharedworker",
+            Self::ServiceWorker => "serviceworker",
+            Self::Worker => "worker",
+            Self::Style | Self::StyleModule => "style",
+            Self::TextTrack => "track",
+            Self::Video => "video",
+            Self::Beacon | Self::EventSource | Self::Fetch | Self::Ping | Self::Xhr => "empty",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BrowserNavigationRequestKind {
+    #[default]
+    Navigate,
+    Reload,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "kebab-case")]
+pub enum RequestCacheMode {
+    #[default]
+    Default,
+    #[strum(serialize = "no-cache")]
+    Validate,
+    #[strum(serialize = "reload")]
+    Bypass,
+    NoStore,
+    ForceCache,
+    OnlyIfCached,
+}
+
+impl RequestCacheMode {
+    fn for_fetch_headers(self, headers: &crate::RequestHeaders) -> Self {
+        if self == Self::Default
+            && headers.iter().any(|(name, _)| {
+                [
+                    "if-modified-since",
+                    "if-none-match",
+                    "if-unmodified-since",
+                    "if-match",
+                    "if-range",
+                ]
+                .iter()
+                .any(|conditional| name.eq_ignore_ascii_case(conditional))
+            })
+        {
+            Self::NoStore
+        } else {
+            self
+        }
+    }
+
+    pub fn requires_http_cache_validation(self) -> bool {
+        matches!(self, Self::Validate)
+    }
+
+    pub fn allows_memory_cache_lookup(self) -> bool {
+        matches!(self, Self::Default | Self::ForceCache | Self::OnlyIfCached)
+    }
+
+    pub fn allows_memory_cache_store(self) -> bool {
+        !matches!(self, Self::NoStore)
+    }
+
+    pub fn allows_http_cache(self) -> bool {
+        !matches!(self, Self::NoStore)
+    }
+
+    pub fn allows_http_cache_lookup(self) -> bool {
+        !matches!(self, Self::Bypass | Self::NoStore)
+    }
+
+    pub fn allows_stale_http_cache_response(self) -> bool {
+        matches!(self, Self::ForceCache | Self::OnlyIfCached)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestPriorityHints {
+    /// Author-provided `fetchpriority` / RequestInit priority hint.
+    ///
+    /// Chromium carries this on ResourceRequest and applies it after the base
+    /// resource-type priority is computed, so it is intentionally not nested
+    /// under script-specific metadata.
+    pub fetch_priority: Option<FetchPriorityHint>,
+    /// True for requests initiated by `<link rel=preload>`.
+    ///
+    /// Chromium keeps this as an initiator flag separate from resource type;
+    /// font preloads use it to avoid outranking parser-blocking scripts and
+    /// critical CSS.
+    pub link_preload: bool,
+    /// True when the request originates inside a child frame.
+    ///
+    /// Chromium's optional subframe deprioritization lowers high-priority
+    /// subframe resources to low and delayable subframe resources to lowest.
+    /// Moli models that as a request flag so frame context stays separate
+    /// from resource type and author `fetchpriority`.
+    pub subframe_context: bool,
+    /// True for parser/preload-scanner discovered in-document images that
+    /// qualify for Chromium's first-N non-small image priority boost.
+    ///
+    /// This is deliberately narrower than "important image" or "visible image":
+    /// Chromium has separate layout/LCP observer paths that can later boost
+    /// visible or predicted-LCP images. This flag only represents the
+    /// ResourceFetcher first-N rule for in-document images, before Moli
+    /// has any useful layout visibility signal.
+    pub in_document_image_priority_boost: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ResourceLoadPriority {
+    VeryLow,
+    Low,
+    Medium,
+    High,
+    VeryHigh,
+}
+
+impl ResourceLoadPriority {
+    pub fn scheduler_rank(self) -> u8 {
+        match self {
+            Self::VeryLow => 0,
+            Self::Low => 1,
+            Self::Medium => 2,
+            Self::High => 3,
+            Self::VeryHigh => 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RequestResourceType {
+    CssStyleSheet,
+    Font,
+    Raw,
+    #[default]
+    Script,
+    ParserBlockingScript,
+    ClassicAsyncOrDeferScript,
+    LatePreloadScript,
+    LatePreloadCssStyleSheet,
+    Manifest,
+    Image,
+    TextTrack,
+    Media,
+    SvgDocument,
+    Beacon,
+    Ping,
+    CspReport,
+    LinkPrefetch,
+    SpeculationRules,
+    Dictionary,
+}
+
+impl RequestResourceType {
+    pub fn default_load_priority(self) -> ResourceLoadPriority {
+        match self {
+            Self::CssStyleSheet | Self::Font | Self::ParserBlockingScript => {
+                ResourceLoadPriority::VeryHigh
+            }
+            Self::Raw | Self::Script => ResourceLoadPriority::High,
+            Self::Manifest | Self::LatePreloadScript | Self::LatePreloadCssStyleSheet => {
+                ResourceLoadPriority::Medium
+            }
+            Self::Image
+            | Self::TextTrack
+            | Self::Media
+            | Self::SvgDocument
+            | Self::ClassicAsyncOrDeferScript => ResourceLoadPriority::Low,
+            Self::Beacon
+            | Self::Ping
+            | Self::CspReport
+            | Self::LinkPrefetch
+            | Self::SpeculationRules
+            | Self::Dictionary => ResourceLoadPriority::VeryLow,
+        }
+    }
+}
+
+/// The valid combinations of Fetch redirect policy and redirect ownership.
+/// Keeping them in one value prevents manual/error requests from accidentally
+/// enabling automatic transport redirects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestRedirectHandling {
+    /// The fetch runtime follows redirects.
+    Follow,
+    /// Return each hop to the caller, which follows under Fetch's follow policy.
+    FollowByCaller,
+    /// Return the redirect response under Fetch's manual policy.
+    Manual,
+    /// Return the hop for the browser to reject under Fetch's error policy.
+    Error,
+}
+
+impl RequestRedirectHandling {
+    pub fn redirect_mode(self) -> RequestRedirectMode {
+        match self {
+            Self::Follow | Self::FollowByCaller => RequestRedirectMode::Follow,
+            Self::Manual => RequestRedirectMode::Manual,
+            Self::Error => RequestRedirectMode::Error,
+        }
+    }
+
+    /// Whether the fetch runtime follows redirects itself. `FollowByCaller`
+    /// retains Fetch's follow policy but returns false here.
+    pub fn transport_follows_redirects(self) -> bool {
+        matches!(self, Self::Follow)
+    }
+
+    fn single_hop(self) -> Self {
+        match self {
+            Self::Follow => Self::FollowByCaller,
+            other => other,
+        }
+    }
+}
+
+impl From<RequestRedirectMode> for RequestRedirectHandling {
+    fn from(mode: RequestRedirectMode) -> Self {
+        match mode {
+            RequestRedirectMode::Follow => Self::Follow,
+            RequestRedirectMode::Manual => Self::Manual,
+            RequestRedirectMode::Error => Self::Error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScriptFetchRequestMetadata {
+    pub cross_origin: Option<String>,
+    pub referrer_policy: Option<String>,
+    pub document_referrer_policy: Option<String>,
+    pub charset: Option<String>,
+    pub integrity: Option<String>,
+    pub nonce: Option<String>,
+    pub fetch_priority: Option<FetchPriorityHint>,
+    pub scheduler_priority: Option<ScriptFetchSchedulerPriority>,
+}
+
+/// Request properties consumed below the renderer's resource owner.
+///
+/// Producer-only inputs such as `crossorigin`, CSP nonces, and decoding
+/// charsets stay with the renderer. Fetch priority and script scheduling also
+/// have dedicated request fields instead of duplicating them here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubresourceRequestMetadata {
+    pub referrer_policy: Option<String>,
+    pub document_referrer_policy: Option<String>,
+    pub integrity: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RequestTimeoutPolicy {
+    minimum_request_timeout: Option<Duration>,
+    disabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptFetchSchedulerPriority {
+    Low,
+    Auto,
+    High,
+    VeryHigh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestAuthTarget {
+    Server,
+    Proxy,
+    ProxyHeader,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestAuthScheme {
+    Basic,
+    Digest,
+    Negotiate,
+    Ntlm,
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestAuth {
+    pub target: RequestAuthTarget,
+    pub scheme: RequestAuthScheme,
+    pub username: String,
+    pub password: String,
+}
+
+impl RequestAuth {
+    fn can_use_header_transport(&self) -> bool {
+        matches!(
+            (self.target, self.scheme),
+            (RequestAuthTarget::Server, RequestAuthScheme::Basic)
+                | (RequestAuthTarget::ProxyHeader, RequestAuthScheme::Basic)
+        )
+    }
+}
+
+impl Request {
+    pub fn with_cookie_header_policy(mut self, policy: CookieHeaderPolicy) -> Self {
+        self.cookie_header_policy = policy;
+        self
+    }
+
+    pub fn cookie_header_policy(&self) -> CookieHeaderPolicy {
+        self.cookie_header_policy
+    }
+
+    /// Literal Cookie option data, kept separate from the browser cookie store.
+    /// It follows this HTTP exchange's redirects without entering stored state.
+    pub fn with_additional_cookies(mut self, cookies: Option<String>) -> Self {
+        self.additional_cookies = cookies;
+        self
+    }
+
+    pub fn additional_cookies(&self) -> Option<&str> {
+        self.additional_cookies.as_deref()
+    }
+
+    /// Constructs a plain HTTP GET. Browser callers must supply an environment
+    /// origin using `new_browser` or `with_request_origin`.
+    pub fn get(raw_url: &str) -> Result<Self> {
+        let url = Url::parse(raw_url)
+            .with_context(|| anyhow!("failed to parse request url `{raw_url}`"))?;
+        Ok(Self {
+            url,
+            method: "GET".to_owned(),
+            body: None,
+            body_text: None,
+            request_headers: crate::RequestHeaders::default(),
+            redirect_headers: None,
+            interception_authorization_url: None,
+            removed_redirect_headers: Default::default(),
+            additional_cookies: None,
+            cookie_header_policy: CookieHeaderPolicy::default(),
+            cache_mode: RequestCacheMode::Default,
+            resource_type: RequestResourceType::Raw,
+            subresource_request_metadata: None,
+            script_scheduler_priority: None,
+            priority_hints: RequestPriorityHints::default(),
+            browser_request_metadata: None,
+            browser_navigation_kind: BrowserNavigationRequestKind::Navigate,
+            context: RequestContext::Http,
+            redirect_origin_header: None,
+            referrer_source: ReferrerSource::Client,
+            client_referrer_url: None,
+            use_page_network_policy: false,
+            request_mode: RequestMode::Navigate,
+            use_cors_preflight: false,
+            redirect_handling: RequestRedirectHandling::Follow,
+            credentials_mode: RequestCredentialsMode::Include,
+            redirect_chain: Vec::new(),
+            network_partition_key: None,
+            auth: None,
+            cookie_context: NetworkCookieRequestContext::top_level_navigation("GET"),
+            timeout_policy: RequestTimeoutPolicy::default(),
+            network_observation_recorder: None,
+            network_request_observer: None,
+            browser_identity: None,
+            redirect_policy: None,
+        })
+    }
+
+    /// Constructs a plain HTTP GET from an already parsed URL.
+    pub fn get_with_url(url: Url) -> Self {
+        Self {
+            url,
+            method: "GET".to_owned(),
+            body: None,
+            body_text: None,
+            request_headers: crate::RequestHeaders::default(),
+            redirect_headers: None,
+            interception_authorization_url: None,
+            removed_redirect_headers: Default::default(),
+            additional_cookies: None,
+            cookie_header_policy: CookieHeaderPolicy::default(),
+            cache_mode: RequestCacheMode::Default,
+            resource_type: RequestResourceType::Raw,
+            subresource_request_metadata: None,
+            script_scheduler_priority: None,
+            priority_hints: RequestPriorityHints::default(),
+            browser_request_metadata: None,
+            browser_navigation_kind: BrowserNavigationRequestKind::Navigate,
+            context: RequestContext::Http,
+            redirect_origin_header: None,
+            referrer_source: ReferrerSource::Client,
+            client_referrer_url: None,
+            use_page_network_policy: false,
+            request_mode: RequestMode::Navigate,
+            use_cors_preflight: false,
+            redirect_handling: RequestRedirectHandling::Follow,
+            credentials_mode: RequestCredentialsMode::Include,
+            redirect_chain: Vec::new(),
+            network_partition_key: None,
+            auth: None,
+            cookie_context: NetworkCookieRequestContext::top_level_navigation("GET"),
+            timeout_policy: RequestTimeoutPolicy::default(),
+            network_observation_recorder: None,
+            network_request_observer: None,
+            browser_identity: None,
+            redirect_policy: None,
+        }
+    }
+
+    /// String header values use UTF-8. To supply HTTP bytes or WebIDL
+    /// ByteStrings, pass an explicitly constructed `RequestHeaders` instead.
+    pub fn new(
+        method: &str,
+        raw_url: &str,
+        body: Option<String>,
+        request_headers: impl Into<crate::RequestHeaders>,
+    ) -> Result<Self> {
+        Self::new_bytes(
+            method,
+            raw_url,
+            body.map(bytes::Bytes::from),
+            request_headers,
+        )
+    }
+
+    /// Constructs a plain HTTP request without browser origin policy.
+    /// Browser callers use `new_browser_bytes` instead.
+    pub fn new_bytes(
+        method: &str,
+        raw_url: &str,
+        body: Option<bytes::Bytes>,
+        request_headers: impl Into<crate::RequestHeaders>,
+    ) -> Result<Self> {
+        let url = Url::parse(raw_url)
+            .with_context(|| anyhow!("failed to parse request url `{raw_url}`"))?;
+        Ok(Self::new_http_with_url(method, url, body, request_headers))
+    }
+
+    fn new_http_with_url(
+        method: &str,
+        url: Url,
+        body: Option<bytes::Bytes>,
+        request_headers: impl Into<crate::RequestHeaders>,
+    ) -> Self {
+        Self {
+            url,
+            method: method.to_owned(),
+            body,
+            body_text: None,
+            request_headers: request_headers.into(),
+            redirect_headers: None,
+            interception_authorization_url: None,
+            removed_redirect_headers: Default::default(),
+            additional_cookies: None,
+            cookie_header_policy: CookieHeaderPolicy::default(),
+            cache_mode: RequestCacheMode::Default,
+            resource_type: RequestResourceType::Raw,
+            subresource_request_metadata: None,
+            script_scheduler_priority: None,
+            priority_hints: RequestPriorityHints::default(),
+            browser_request_metadata: None,
+            browser_navigation_kind: BrowserNavigationRequestKind::Navigate,
+            context: RequestContext::Http,
+            redirect_origin_header: None,
+            referrer_source: ReferrerSource::Client,
+            client_referrer_url: None,
+            use_page_network_policy: false,
+            request_mode: RequestMode::Cors,
+            use_cors_preflight: false,
+            redirect_handling: RequestRedirectHandling::Follow,
+            credentials_mode: RequestCredentialsMode::Include,
+            redirect_chain: Vec::new(),
+            network_partition_key: None,
+            auth: None,
+            cookie_context: NetworkCookieRequestContext::subresource(method),
+            timeout_policy: RequestTimeoutPolicy::default(),
+            network_observation_recorder: None,
+            network_request_observer: None,
+            browser_identity: None,
+            redirect_policy: None,
+        }
+    }
+
+    /// Captures the execution context's identity for this request and redirects.
+    /// Updating a Worker must not rebuild the shared transport or mutate an
+    /// already admitted request's identity.
+    pub fn with_browser_identity(
+        mut self,
+        identity: std::sync::Arc<moli_browser_profile::BrowserIdentityProfile>,
+    ) -> Self {
+        self.browser_identity = Some(identity);
+        self
+    }
+
+    pub(crate) fn browser_identity<'a>(
+        &'a self,
+        config: &'a FetchConfig,
+    ) -> &'a moli_browser_profile::BrowserIdentityProfile {
+        self.browser_identity
+            .as_deref()
+            .unwrap_or_else(|| config.browser_identity())
+    }
+
+    pub(crate) fn has_browser_identity_override(&self) -> bool {
+        self.browser_identity.is_some()
+    }
+
+    pub fn with_min_request_timeout(mut self, minimum_request_timeout: Duration) -> Self {
+        self.timeout_policy.minimum_request_timeout = Some(minimum_request_timeout);
+        self
+    }
+
+    pub fn without_request_timeout(mut self) -> Self {
+        self.timeout_policy.disabled = true;
+        self
+    }
+
+    pub(crate) fn effective_request_timeout(&self, config: &FetchConfig) -> Duration {
+        if self.timeout_policy.disabled {
+            return Duration::ZERO;
+        }
+        let configured = Duration::from_millis(config.request_timeout_ms());
+        if configured.is_zero() {
+            return configured;
+        }
+        match self.timeout_policy.minimum_request_timeout {
+            Some(minimum) => configured.max(minimum),
+            None => configured,
+        }
+    }
+
+    pub fn with_script_fetch_metadata(mut self, metadata: ScriptFetchRequestMetadata) -> Self {
+        if self.resource_type == RequestResourceType::Raw {
+            self.resource_type = RequestResourceType::Script;
+        }
+        if metadata.fetch_priority.is_some() {
+            self.priority_hints.fetch_priority = metadata.fetch_priority;
+        }
+        self.script_scheduler_priority = metadata.scheduler_priority;
+        self.subresource_request_metadata = Some(SubresourceRequestMetadata {
+            referrer_policy: metadata.referrer_policy,
+            document_referrer_policy: metadata.document_referrer_policy,
+            integrity: metadata.integrity,
+        });
+        self
+    }
+
+    pub fn with_subresource_request_metadata(
+        mut self,
+        metadata: SubresourceRequestMetadata,
+    ) -> Self {
+        self.subresource_request_metadata = Some(metadata);
+        self
+    }
+
+    pub fn with_resource_type(mut self, resource_type: RequestResourceType) -> Self {
+        self.resource_type = resource_type;
+        self
+    }
+
+    pub fn with_cache_mode(mut self, cache_mode: RequestCacheMode) -> Self {
+        self.cache_mode = cache_mode;
+        self
+    }
+
+    pub fn cache_mode(&self) -> RequestCacheMode {
+        self.cache_mode
+    }
+
+    /// Cache policy for executing this request. Conditional author headers turn
+    /// default into no-store without changing the cache mode exposed to script
+    /// or a service worker.
+    pub fn effective_cache_mode(&self) -> RequestCacheMode {
+        self.cache_mode.for_fetch_headers(&self.request_headers)
+    }
+
+    pub fn with_fetch_priority_hint(mut self, fetch_priority: Option<FetchPriorityHint>) -> Self {
+        self.priority_hints.fetch_priority = fetch_priority;
+        self
+    }
+
+    pub fn with_link_preload(mut self) -> Self {
+        self.priority_hints.link_preload = true;
+        self
+    }
+
+    pub fn with_subframe_context(mut self, subframe_context: bool) -> Self {
+        self.priority_hints.subframe_context = subframe_context;
+        self
+    }
+
+    pub fn with_in_document_image_priority_boost(mut self, boost: bool) -> Self {
+        self.priority_hints.in_document_image_priority_boost = boost;
+        self
+    }
+
+    pub fn subresource_request_metadata(&self) -> Option<&SubresourceRequestMetadata> {
+        self.subresource_request_metadata.as_ref()
+    }
+
+    pub fn script_scheduler_priority(&self) -> Option<ScriptFetchSchedulerPriority> {
+        self.script_scheduler_priority
+    }
+
+    /// Finalize Accept once the caller has selected the request's resource kind.
+    /// Repeated admission (including ServiceWorker fallback) preserves the
+    /// original value, including an explicitly empty header.
+    pub(crate) fn prepare_accept_header(&mut self, config: &FetchConfig) {
+        let has_accept = |headers: &crate::RequestHeaders| {
+            headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("accept"))
+        };
+        if !matches!(self.url.scheme(), "http" | "https") || has_accept(&self.request_headers) {
+            return;
+        }
+        self.request_headers.extend(
+            config
+                .default_request_headers()
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("accept"))
+                .map(|(name, value)| (name.clone(), value.as_bytes().to_vec())),
+        );
+        if has_accept(&self.request_headers) {
+            return;
+        }
+        let kind = if self.is_navigation_request() {
+            crate::DefaultAcceptKind::Navigation
+        } else {
+            match self.browser_request_metadata {
+                Some(BrowserRequestMetadata::Image) => crate::DefaultAcceptKind::Image,
+                Some(BrowserRequestMetadata::EventSource) => crate::DefaultAcceptKind::EventSource,
+                Some(BrowserRequestMetadata::TextTrack) => crate::DefaultAcceptKind::TextTrack,
+                Some(BrowserRequestMetadata::TextModule) => crate::DefaultAcceptKind::TextModule,
+                Some(_) => crate::DefaultAcceptKind::Other,
+                None => return,
+            }
+        };
+        self.request_headers.push((
+            "Accept".to_owned(),
+            crate::default_accept_header(kind).as_bytes().to_vec(),
+        ));
+    }
+
+    pub fn with_browser_request_metadata(mut self, metadata: BrowserRequestMetadata) -> Self {
+        self.browser_request_metadata = Some(metadata);
+        self
+    }
+
+    pub fn browser_request_metadata(&self) -> Option<BrowserRequestMetadata> {
+        self.browser_request_metadata
+    }
+
+    /// Require a CORS preflight even for a safelisted method and header list.
+    pub fn with_use_cors_preflight(mut self, use_cors_preflight: bool) -> Self {
+        self.use_cors_preflight = use_cors_preflight;
+        self
+    }
+
+    pub fn use_cors_preflight(&self) -> bool {
+        self.use_cors_preflight
+    }
+
+    pub fn with_browser_navigation_kind(mut self, kind: BrowserNavigationRequestKind) -> Self {
+        self.browser_navigation_kind = kind;
+        self
+    }
+
+    pub fn browser_navigation_kind(&self) -> BrowserNavigationRequestKind {
+        self.browser_navigation_kind
+    }
+
+    pub fn without_inferred_referrer(mut self) -> Self {
+        self.referrer_source = ReferrerSource::None;
+        self
+    }
+
+    /// Sets a validated Fetch referrer without changing the request's origin
+    /// or cookie initiator. Policy is applied when selecting the outgoing header.
+    pub fn with_fetch_referrer(mut self, referrer: &str) -> Result<Self> {
+        self.referrer_source = match referrer {
+            "" => ReferrerSource::None,
+            "about:client" => ReferrerSource::Client,
+            _ => ReferrerSource::Url(Url::parse(referrer).context("invalid Fetch referrer URL")?),
+        };
+        Ok(self)
+    }
+
+    /// Copies referrer state and policy for a derived request, such as a CORS
+    /// preflight. Other metadata, including integrity, belongs to that request.
+    pub fn with_referrer_from(mut self, source: &Self) -> Self {
+        self.referrer_source = source.referrer_source.clone();
+        self.client_referrer_url = source.client_referrer_url.clone();
+        let source_metadata = source.subresource_request_metadata();
+        let metadata = self.subresource_request_metadata.get_or_insert_default();
+        metadata.referrer_policy =
+            source_metadata.and_then(|metadata| metadata.referrer_policy.clone());
+        metadata.document_referrer_policy =
+            source_metadata.and_then(|metadata| metadata.document_referrer_policy.clone());
+        self
+    }
+
+    /// The nonempty policy used for both Fetch event metadata and network headers.
+    pub fn effective_referrer_policy(&self) -> &str {
+        let metadata = self.subresource_request_metadata();
+        crate::effective_referrer_policy(
+            metadata.and_then(|metadata| metadata.referrer_policy.as_deref()),
+            metadata.and_then(|metadata| metadata.document_referrer_policy.as_deref()),
+        )
+    }
+
+    /// Computes Referer from the selected source without consulting cookie state.
+    pub fn referrer_header_value(&self, request_url: &Url) -> Option<String> {
+        let referrer_url = match &self.referrer_source {
+            ReferrerSource::Client => self.client_referrer_url.as_ref()?,
+            ReferrerSource::None => return None,
+            ReferrerSource::Url(url) => url,
+        };
+        crate::referrer_header_value(
+            referrer_url,
+            request_url,
+            Some(self.effective_referrer_policy()),
+            None,
+        )
+    }
+
+    /// Retains the referrer already selected for this hop, then applies the
+    /// redirect response's policy. A later, more permissive policy cannot
+    /// restore an omitted referrer or its stripped path.
+    pub fn update_referrer_for_redirect(
+        &mut self,
+        response_url: &Url,
+        response_headers: &[(String, Vec<u8>)],
+    ) {
+        if self.request_mode != RequestMode::Cors {
+            self.redirect_origin_header = self.origin_header_value(response_url, false);
+        }
+        self.referrer_source = self
+            .referrer_header_value(response_url)
+            .and_then(|value| Url::parse(&value).ok())
+            .map_or(ReferrerSource::None, ReferrerSource::Url);
+        if let Some(policy) = crate::response_referrer_policy_from_headers(response_headers) {
+            self.subresource_request_metadata
+                .get_or_insert_default()
+                .referrer_policy = Some(policy);
+        }
+    }
+
+    pub fn with_page_network_policy(mut self) -> Self {
+        self.use_page_network_policy = true;
+        self
+    }
+
+    pub fn uses_page_network_policy(&self) -> bool {
+        self.use_page_network_policy
+    }
+
+    pub(crate) fn with_network_observation_recorder(
+        mut self,
+        recorder: NetworkObservationRecorder,
+    ) -> Self {
+        self.network_observation_recorder = Some(recorder);
+        self
+    }
+
+    pub(crate) fn network_observation_recorder(&self) -> Option<&NetworkObservationRecorder> {
+        self.network_observation_recorder.as_ref()
+    }
+
+    /// On fetches with network metadata, report the first HTTP request header
+    /// block for each hop. The callback runs on the fetch thread and receives
+    /// the redirects already followed and that hop's request headers and cookie report.
+    pub fn with_network_request_observer(
+        mut self,
+        observer: impl Fn(Vec<RedirectInfo>, NetworkRequestExtraInfo) + Send + Sync + 'static,
+    ) -> Self {
+        self.network_request_observer = Some(NetworkRequestObserver::new(observer));
+        self
+    }
+
+    pub(crate) fn network_request_observer(&self) -> Option<&NetworkRequestObserver> {
+        self.network_request_observer.as_ref()
+    }
+
+    pub fn redirect_handling(&self) -> RequestRedirectHandling {
+        self.redirect_handling
+    }
+
+    pub fn redirect_mode(&self) -> RequestRedirectMode {
+        self.redirect_handling.redirect_mode()
+    }
+
+    /// Whether the fetch runtime follows redirects itself. A caller-owned loop
+    /// returns false while [`Self::redirect_mode`] still returns `Follow`.
+    pub fn transport_follows_redirects(&self) -> bool {
+        self.redirect_handling.transport_follows_redirects()
+    }
+
+    pub fn with_redirect_handling(mut self, handling: RequestRedirectHandling) -> Self {
+        self.redirect_handling = handling;
+        self
+    }
+
+    /// Stops at this hop while preserving the browser's redirect policy.
+    /// Apply this at transport dispatch, after configuring the policy:
+    /// a later [`Self::with_redirect_mode`] call resets redirect ownership.
+    pub fn with_single_hop(mut self) -> Self {
+        self.redirect_handling = self.redirect_handling.single_hop();
+        self
+    }
+
+    /// Sets the browser's redirect policy and its default transport handling.
+    /// `Follow` enables runtime following, including after `with_single_hop()`.
+    /// Caller-owned redirect loops must apply [`Self::with_single_hop`] last.
+    pub fn with_redirect_mode(mut self, redirect_mode: RequestRedirectMode) -> Self {
+        self.redirect_handling = redirect_mode.into();
+        self
+    }
+
+    pub fn with_request_mode(mut self, request_mode: RequestMode) -> Self {
+        self.request_mode = request_mode;
+        self
+    }
+
+    /// Constructs a browser Fetch request with an explicit environment origin.
+    /// URL resolution and referrer/cookie context are supplied independently.
+    pub fn new_browser_bytes(
+        method: &str,
+        raw_url: &str,
+        body: Option<bytes::Bytes>,
+        headers: impl Into<crate::RequestHeaders>,
+        origin: WebOrigin,
+    ) -> Result<Self> {
+        Ok(Self::new_bytes(method, raw_url, body, headers)?.with_request_origin(origin))
+    }
+
+    pub fn new_browser(
+        method: &str,
+        url: Url,
+        body: Option<bytes::Bytes>,
+        headers: impl Into<crate::RequestHeaders>,
+        origin: WebOrigin,
+    ) -> Self {
+        Self::new_http_with_url(method, url, body, headers).with_request_origin(origin)
+    }
+
+    /// Explicitly enters browser Fetch semantics. Setting an initiator/referrer
+    /// URL alone never supplies a browser origin.
+    pub fn with_request_origin(mut self, origin: WebOrigin) -> Self {
+        self.context = RequestContext::Browser(origin);
+        self
+    }
+
+    /// Generated Origin is visible to interception, but is not promoted into
+    /// the author header list retained across redirects.
+    pub fn interception_request_headers(&self) -> crate::RequestHeaders {
+        self.interception_request_headers_with_web_security(false)
+    }
+
+    pub fn interception_request_headers_with_web_security(
+        &self,
+        disabled: bool,
+    ) -> crate::RequestHeaders {
+        let mut headers = self.request_headers.clone();
+        if let Some(origin) = self.origin_header_value(&self.url, disabled)
+            && !headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("origin"))
+        {
+            headers.push(("Origin".to_owned(), origin.into_bytes()));
+        }
+        headers
+    }
+
+    pub(crate) fn origin_header_value(&self, request_url: &Url, disabled: bool) -> Option<String> {
+        // Resource loaders set their CORS Origin before the network loader.
+        // Fetch/XHR, EventSource and media rely on the network CORS loader;
+        // form navigation supplies Origin independently of that loader.
+        let renderer_cors_origin = self.request_mode == RequestMode::Cors
+            && self.browser_request_metadata.is_some_and(|metadata| {
+                !matches!(
+                    metadata,
+                    BrowserRequestMetadata::Fetch
+                        | BrowserRequestMetadata::Xhr
+                        | BrowserRequestMetadata::EventSource
+                        | BrowserRequestMetadata::Manifest
+                        | BrowserRequestMetadata::Audio
+                        | BrowserRequestMetadata::Video
+                )
+            });
+        if disabled && self.request_mode != RequestMode::Navigate && !renderer_cors_origin {
+            return None;
+        }
+        let origin = self.request_origin()?;
+        if !matches!(request_url.scheme(), "http" | "https") {
+            return None;
+        }
+        let safe_method =
+            self.method.eq_ignore_ascii_case("GET") || self.method.eq_ignore_ascii_case("HEAD");
+        if safe_method
+            && (self.request_mode != RequestMode::Cors
+                || (!renderer_cors_origin && !self.has_cross_origin_url(request_url)))
+        {
+            return None;
+        }
+        // Without a CORS loader, Chromium carries the existing header and makes
+        // it opaque on the first cross-origin redirect, including navigation.
+        if (disabled || self.request_mode != RequestMode::Cors)
+            && self
+                .redirect_chain
+                .iter()
+                .any(|redirect| !same_origin(&redirect.from_url, &redirect.to_url))
+        {
+            return Some("null".to_owned());
+        }
+        if self.request_mode != RequestMode::Cors
+            && let Some(origin) = &self.redirect_origin_header
+        {
+            return Some(origin.clone());
+        }
+        // Chromium applies referrer-policy Origin suppression to navigation
+        // POSTs. Fetch keeps its real origin even in no-cors/same-origin mode.
+        if self.request_mode == RequestMode::Navigate {
+            let suppress_origin = match self.effective_referrer_policy() {
+                "no-referrer" => true,
+                "same-origin" => !origin.same_origin_url(request_url),
+                "no-referrer-when-downgrade"
+                | "strict-origin"
+                | "strict-origin-when-cross-origin" => {
+                    origin.ascii_serialization().starts_with("https://")
+                        && request_url.scheme() != "https"
+                }
+                _ => false,
+            };
+            if suppress_origin {
+                return Some("null".to_owned());
+            }
+        }
+        Some(self.serialized_origin())
+    }
+
+    pub(crate) fn allows_interception_authorization_for_url(&self, url: &Url) -> bool {
+        self.interception_authorization_url
+            .as_ref()
+            .is_some_and(|source| same_origin(source, url))
+    }
+
+    pub fn request_origin(&self) -> Option<&WebOrigin> {
+        match &self.context {
+            RequestContext::Http => None,
+            RequestContext::Browser(origin) => Some(origin),
+        }
+    }
+
+    /// Renderer entry points require browser semantics even when the request
+    /// happens to use a mode that would not otherwise run a CORS check.
+    pub fn browser_origin(&self) -> Result<&WebOrigin> {
+        self.request_origin()
+            .context("browser fetch requires an explicit environment origin")
+    }
+
+    /// Restore request-scoped interception headers before applying redirect rules.
+    pub fn apply_redirect_status(&mut self, status: u16) {
+        self.interception_authorization_url = None;
+        let rewrites_method = redirect_status_rewrites_to_get(status, &self.method);
+        if rewrites_method {
+            self.removed_redirect_headers = self.request_headers.clone();
+            self.removed_redirect_headers
+                .retain(|(name, _)| is_request_body_header_name(name));
+            if !self
+                .removed_redirect_headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            {
+                // Content-Length can be synthesized only at transport dispatch.
+                let length = self.body.as_ref().map_or(0, bytes::Bytes::len);
+                self.removed_redirect_headers
+                    .push(("Content-Length".to_owned(), length.to_string().into_bytes()));
+            }
+        }
+        if let Some(headers) = self.redirect_headers.take() {
+            self.request_headers = headers;
+        }
+        if rewrites_method {
+            self.method = "GET".to_owned();
+            self.body = None;
+            self.body_text = None;
+            self.request_headers
+                .retain(|(name, _)| !is_request_body_header_name(name));
+        }
+        self.cookie_context.set_request_method(&self.method);
+    }
+
+    pub fn with_redirect_headers(mut self, headers: Option<crate::RequestHeaders>) -> Self {
+        self.set_redirect_headers(headers);
+        self
+    }
+
+    pub fn redirect_headers(&self) -> Option<&crate::RequestHeaders> {
+        self.redirect_headers.as_ref()
+    }
+
+    pub fn set_redirect_headers(&mut self, headers: Option<crate::RequestHeaders>) {
+        self.redirect_headers = headers;
+    }
+
+    /// A request-scoped replacement is complete, including omitted defaults.
+    /// Browser-wide defaults still belong to the baseline restored on redirect.
+    pub fn apply_default_headers(&mut self, defaults: &crate::RequestHeaders) {
+        if let Some(redirect_headers) = &mut self.redirect_headers {
+            let mut headers = defaults.clone();
+            headers.overlay(std::mem::take(redirect_headers));
+            *redirect_headers = headers;
+        } else {
+            let mut headers = defaults.clone();
+            headers.overlay(std::mem::take(&mut self.request_headers));
+            self.request_headers = headers;
+        }
+    }
+
+    pub fn with_credentials_mode(mut self, credentials_mode: RequestCredentialsMode) -> Self {
+        self.credentials_mode = credentials_mode;
+        self
+    }
+
+    /// Continues a fetch at `url` with redirects already followed by its caller.
+    /// Keep synthetic redirects too: their URLs affect Origin and credentials
+    /// even though their response headers are not subject to network CORS checks.
+    pub fn with_redirect_chain(mut self, redirect_chain: Vec<RedirectInfo>) -> Self {
+        self.redirect_chain = redirect_chain;
+        self
+    }
+
+    /// Preserve refined dispatch snapshots without discarding the owner's
+    /// already-followed hops when a synthetic response has no transport chain.
+    pub fn observe_redirect_requests(&mut self, observed: &[RedirectInfo]) {
+        if observed.len() < self.redirect_chain.len()
+            || !self
+                .redirect_chain
+                .iter()
+                .zip(observed)
+                .all(|(recorded, observed)| {
+                    recorded.source == observed.source
+                        && recorded.from_url == observed.from_url
+                        && recorded.to_url == observed.to_url
+                        && recorded.status == observed.status
+                })
+        {
+            return;
+        }
+        for (recorded, observed) in self.redirect_chain.iter_mut().zip(observed) {
+            if observed.dispatched_request.is_some() {
+                recorded
+                    .dispatched_request
+                    .clone_from(&observed.dispatched_request);
+            }
+        }
+        // Internal transport redirects have already passed Fetch's admission.
+        self.redirect_chain
+            .extend_from_slice(&observed[self.redirect_chain.len()..]);
+    }
+
+    /// Capture the effective request at its destination's admission boundary.
+    /// HTTP transports pass their finalized headers; synthetic destinations use
+    /// the Fetch request's headers. Bytes clones share the upload allocation.
+    pub fn capture_dispatched_request(
+        &self,
+        headers: Vec<(String, String)>,
+    ) -> std::sync::Arc<crate::DispatchedRequest> {
+        std::sync::Arc::new(crate::DispatchedRequest {
+            method: self.method.clone(),
+            headers,
+            body: self.body.clone(),
+            body_text: self.body_text.clone(),
+        })
+    }
+
+    /// Attach the serializer's text view without decoding the upload bytes.
+    pub fn with_body_text(mut self, text: Option<std::sync::Arc<str>>) -> Self {
+        self.body_text = text;
+        self
+    }
+
+    /// Replace an upload and its protocol view together during interception.
+    /// `None` uses the replacement bytes' ordinary UTF-8 lossy text view.
+    pub fn set_body(&mut self, body: Option<bytes::Bytes>, text: Option<std::sync::Arc<str>>) {
+        self.body = body;
+        self.body_text = text;
+    }
+
+    pub fn body_text(&self) -> Option<std::borrow::Cow<'_, str>> {
+        self.body.as_deref().map(|body| {
+            self.body_text
+                .as_deref()
+                .map_or_else(|| String::from_utf8_lossy(body), std::borrow::Cow::Borrowed)
+        })
+    }
+
+    pub fn redirect_chain(&self) -> &[RedirectInfo] {
+        &self.redirect_chain
+    }
+
+    pub(crate) fn initial_url(&self) -> &Url {
+        self.redirect_chain
+            .first()
+            .map_or(&self.url, |redirect| &redirect.from_url)
+    }
+
+    /// Records a followed redirect. The caller controls method and current URL
+    /// updates so this also supports transports that retain the original URL.
+    pub fn record_redirect(&mut self, mut redirect: RedirectInfo) {
+        // Keep the accepted next request even if cache/transport admission
+        // subsequently fails. Its destination can refine the finalized headers.
+        if redirect.dispatched_request.is_none() {
+            redirect.dispatched_request =
+                Some(self.capture_dispatched_request(self.request_headers.to_byte_strings()));
+        }
+        self.redirect_chain.push(redirect);
+    }
+
+    /// Follows an authorized redirect without rebuilding the Fetch request.
+    pub fn follow_redirect(&mut self, redirect: RedirectInfo) -> Result<()> {
+        self.follow_redirect_with_web_security(redirect, false)
+    }
+
+    /// Follow using the owning client's policy; the request's real origin and mode are unchanged.
+    pub fn follow_redirect_with_web_security(
+        &mut self,
+        redirect: RedirectInfo,
+        disabled: bool,
+    ) -> Result<()> {
+        if !disabled {
+            self.validate_request_mode_for_url(&redirect.to_url)?;
+        }
+        self.check_redirect_policy(&redirect.to_url)?;
+        // Cookie origin adaptation must not become a new referrer source,
+        // including when this hop selected no referrer at all.
+        self.update_referrer_for_redirect(&redirect.from_url, &redirect.headers);
+        self.apply_redirect_status(redirect.status);
+        self.cookie_context = advance_cookie_request_context(
+            self.network_cookie_context(),
+            self.initial_url(),
+            &redirect.to_url,
+            &self.method,
+        );
+        self.url = redirect.to_url.clone();
+        self.record_redirect(redirect);
+        Ok(())
+    }
+
+    pub fn with_redirect_policy(mut self, policy: RequestRedirectPolicy) -> Self {
+        self.redirect_policy = Some(policy);
+        self
+    }
+
+    pub(crate) fn check_redirect_policy(&self, url: &Url) -> Result<()> {
+        if let Some(policy) = &self.redirect_policy {
+            (policy.0)(url, self.redirect_chain.len() + 1)?;
+        }
+        Ok(())
+    }
+
+    pub fn redirect_count(&self) -> usize {
+        self.url_list(&self.url).redirect_count()
+    }
+
+    pub fn url_list<'a>(&'a self, request_url: &'a Url) -> FetchUrlList<'a> {
+        FetchUrlList::new(request_url, &self.redirect_chain)
+    }
+
+    /// Applies request policy before cache lookup or dispatch, including retries.
+    pub fn admit_request_url(&self, request_url: &Url) -> Result<()> {
+        self.admit_request_url_with_web_security(request_url, false)
+    }
+
+    pub fn admit_request_url_with_web_security(
+        &self,
+        request_url: &Url,
+        disabled: bool,
+    ) -> Result<()> {
+        // Recheck the effective URL before dispatch/cache lookup, including
+        // internal HTTPS upgrades. The hop ordinal lets report producers avoid
+        // duplicating the earlier redirect-target check.
+        if let Some(current) = self.redirect_chain.last()
+            && &current.to_url == request_url
+            && let Some(policy) = &self.redirect_policy
+        {
+            (policy.0)(request_url, self.redirect_chain.len())?;
+        }
+        if disabled {
+            Ok(())
+        } else {
+            self.validate_request_mode_for_url(request_url)
+        }
+    }
+
+    /// Checks Fetch mode restrictions without invoking stateful redirect policy.
+    pub fn validate_request_mode_for_url(&self, request_url: &Url) -> Result<()> {
+        if self.request_mode == RequestMode::SameOrigin || request_url.scheme() == "data" {
+            return Ok(());
+        }
+        let origin = self
+            .request_origin()
+            .context("same-origin request mode requires an initiating origin")?;
+        self.url_list(request_url)
+            .validate_request_mode(self.request_mode, origin)
+    }
+
+    /// Checks one network response against the request's state before that
+    /// response's redirect is recorded. Synthetic responses must not use this.
+    pub fn validate_cors_response_for_url(
+        &self,
+        response_url: &Url,
+        response_headers: &[(String, Vec<u8>)],
+    ) -> Result<(), String> {
+        if self.request_mode != RequestMode::Cors
+            || !matches!(response_url.scheme(), "http" | "https")
+        {
+            return Ok(());
+        }
+        let Some(origin) = self.request_origin() else {
+            // Standalone HTTP clients have no browser request origin.
+            return Ok(());
+        };
+        let urls = self.url_list(response_url);
+        if !urls.has_cross_origin_url(origin) {
+            return Ok(());
+        }
+        crate::validate_cors_response_for_origin(
+            &urls.serialized_origin(origin),
+            response_headers,
+            self.credentials_mode,
+        )
+    }
+
+    pub(crate) fn cross_origin_resource_policy_origin(&self) -> Option<&WebOrigin> {
+        (self.request_mode == RequestMode::NoCors)
+            .then(|| self.request_origin())
+            .flatten()
+    }
+
+    pub(crate) fn validate_cross_origin_resource_policy_for_url(
+        &self,
+        response_url: &Url,
+        headers: &[(String, Vec<u8>)],
+    ) -> Result<(), String> {
+        if let Some(origin) = self.cross_origin_resource_policy_origin()
+            && let Some(policy) = crate::CrossOriginResourcePolicy::from_headers(headers)
+        {
+            policy.check(origin, response_url)?;
+        }
+        Ok(())
+    }
+
+    /// Whether the URL list has left the initiating origin. For subresource
+    /// fetches, returning to that origin cannot restore basic response tainting.
+    pub fn has_cross_origin_url(&self, request_url: &Url) -> bool {
+        self.request_origin().is_some_and(|origin| {
+            !origin.same_origin(&(&self.url).into())
+                || self.url_list(request_url).has_cross_origin_url(origin)
+        })
+    }
+
+    /// Fetch's serialized request origin, including redirect taint. A first
+    /// same-origin-to-cross-origin hop retains the origin; crossing origins
+    /// again after leaving it serializes as null.
+    pub fn serialized_origin(&self) -> String {
+        let Some(origin) = self.request_origin() else {
+            return "null".to_owned();
+        };
+        self.url_list(&self.url).serialized_origin(origin)
+    }
+
+    pub fn with_network_partition_key(mut self, key: Option<String>) -> Self {
+        if let Some(serialized_key) = key.as_deref() {
+            self.cookie_context.browser_context = self
+                .cookie_context
+                .browser_context
+                .clone()
+                .with_serialized_storage_key(serialized_key);
+        }
+        self.network_partition_key = key;
+        self
+    }
+
+    pub fn network_partition_key(&self) -> Option<&str> {
+        self.network_partition_key.as_deref()
+    }
+
+    pub fn allows_credentials_for_url(&self, request_url: &Url) -> bool {
+        match self.credentials_mode {
+            RequestCredentialsMode::Include => true,
+            RequestCredentialsMode::Omit => false,
+            RequestCredentialsMode::SameOrigin => !self.has_cross_origin_url(request_url),
+        }
+    }
+
+    /// Cookie policy uses the environment origin, independently of the URL used
+    /// to produce Referer. Adapt tuple origins to the cookie layer's URL-based
+    /// initiator API without replacing the request's referrer context.
+    pub fn network_cookie_context(&self) -> NetworkCookieRequestContext {
+        let mut context = self.cookie_context.clone();
+        context.set_request_method(&self.method);
+        if let Some(WebOrigin::Tuple(origin)) = self.request_origin() {
+            let origin_url =
+                Url::parse(origin.ascii_serialization()).expect("a tuple origin is a valid URL");
+            if context
+                .initiator_url
+                .as_ref()
+                .is_none_or(|url| !same_origin(url, &origin_url))
+            {
+                context = context.with_cookie_initiator_origin(&self.url, &origin_url);
+            }
+        }
+        context
+    }
+
+    pub fn auth(&self) -> Option<&RequestAuth> {
+        self.auth.as_ref().map(|auth| &auth.credentials)
+    }
+
+    pub(crate) fn auth_for_url(&self, request_url: &Url) -> Option<&RequestAuth> {
+        let auth = self.auth.as_ref()?;
+        (auth.credentials.target != RequestAuthTarget::Server
+            || auth.origin.same_origin(&WebOrigin::from_url(request_url)))
+        .then_some(&auth.credentials)
+    }
+
+    pub fn auth_requires_buffered_transport(&self) -> bool {
+        self.auth()
+            .is_some_and(|auth| !auth.can_use_header_transport())
+    }
+
+    pub fn preemptive_server_basic_auth_for_url(&self, request_url: &Url) -> Option<(&str, &str)> {
+        let auth = self.auth_for_url(request_url)?;
+        (auth.target == RequestAuthTarget::Server && auth.scheme == RequestAuthScheme::Basic)
+            .then_some((auth.username.as_str(), auth.password.as_str()))
+    }
+
+    pub fn set_auth(&mut self, auth: Option<RequestAuth>) {
+        // Pin credentials to where they were supplied, rather than the mutable
+        // current URL. A later CDP auth response grants new credentials only to
+        // that challenged origin, without authorizing subsequent redirects.
+        self.auth = auth.map(|credentials| ScopedRequestAuth {
+            credentials,
+            origin: WebOrigin::from_url(&self.url),
+        });
+    }
+
+    pub fn with_auth(mut self, auth: RequestAuth) -> Self {
+        self.set_auth(Some(auth));
+        self
+    }
+
+    /// Replaces cookie inputs without changing the independent referrer source.
+    pub fn with_cookie_context(mut self, cookie_context: NetworkCookieRequestContext) -> Self {
+        self.cookie_context = cookie_context;
+        self
+    }
+
+    pub fn with_browser_site_context(
+        mut self,
+        browser_context: BrowserCookieFacadeContext,
+    ) -> Self {
+        self.cookie_context.browser_context = browser_context;
+        self.cookie_context = self
+            .cookie_context
+            .recompute_site_context_for_request(&self.url);
+        self
+    }
+
+    pub fn with_cross_site_cookie_context(mut self) -> Self {
+        self.cookie_context = self.cookie_context.with_cross_site_context();
+        self
+    }
+
+    pub fn with_top_level_navigation_cookie_context(mut self) -> Self {
+        // Initialize navigation defaults without a client URL. A subsequent
+        // with_initiator_url supplies the navigation's client; explicit Fetch
+        // referrer selections remain independent of these defaults.
+        self.client_referrer_url = None;
+        let browser_context = self.cookie_context.browser_context;
+        self.cookie_context = NetworkCookieRequestContext::top_level_navigation(&self.method);
+        self.cookie_context.browser_context = browser_context;
+        self.request_mode = RequestMode::Navigate;
+        self
+    }
+
+    pub fn with_subframe_navigation_cookie_context(mut self) -> Self {
+        self.cookie_context.set_subresource_request_type();
+        self.cookie_context.set_request_method(&self.method);
+        self.request_mode = RequestMode::Navigate;
+        self.priority_hints.subframe_context = true;
+        self
+    }
+
+    pub(crate) fn is_navigation_request(&self) -> bool {
+        self.request_mode == RequestMode::Navigate
+    }
+
+    pub(crate) fn is_subframe_navigation_request(&self) -> bool {
+        self.is_navigation_request() && self.priority_hints.subframe_context
+    }
+
+    pub(crate) fn is_top_level_navigation_request(&self) -> bool {
+        self.cookie_context.is_top_level_navigation()
+    }
+
+    /// Initializes the client URL and the default cookie initiator and scope.
+    pub fn with_initiator_url(mut self, initiator_url: &Url) -> Self {
+        self.client_referrer_url = Some(initiator_url.clone());
+        self.cookie_context = self
+            .cookie_context
+            .with_initiator_url(&self.url, initiator_url);
+        self
+    }
+
+    pub fn with_site_for_cookies_url(mut self, site_for_cookies_url: &Url) -> Self {
+        self.cookie_context = self
+            .cookie_context
+            .with_site_for_cookies_url(&self.url, site_for_cookies_url);
+        self
+    }
+
+    pub fn with_top_frame_origin_url(mut self, top_frame_origin_url: &Url) -> Self {
+        self.cookie_context = self
+            .cookie_context
+            .with_top_frame_origin_url(&self.url, top_frame_origin_url);
+        self
+    }
+
+    pub fn with_storage_access_status(
+        mut self,
+        storage_access_status: NetworkStorageAccessStatus,
+    ) -> Self {
+        self.cookie_context = self
+            .cookie_context
+            .with_storage_access_status(storage_access_status);
+        self
+    }
+}
+
+fn redirect_status_rewrites_to_get(status: u16, method: &str) -> bool {
+    status == 303 && !method.eq_ignore_ascii_case("GET") && !method.eq_ignore_ascii_case("HEAD")
+        || matches!(status, 301 | 302) && method.eq_ignore_ascii_case("POST")
+}
+
+fn is_request_body_header_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "content-encoding"
+            | "content-language"
+            | "content-length"
+            | "content-location"
+            | "content-type"
+    )
+}

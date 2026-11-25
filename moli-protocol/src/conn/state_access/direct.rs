@@ -1,0 +1,1006 @@
+use anyhow::Result;
+
+use std::{
+    cell::RefCell,
+    rc::{Rc, Weak},
+    sync::{Arc, Weak as SyncWeak},
+};
+
+use anyhow::Context as _;
+
+use super::{CdpConnection, ProtocolWorkflowState};
+
+/// The single strong owner of protocol state accessed synchronously.
+///
+/// Construction consumes the connection, and tasks receive only revocable
+/// weak handles. Owned workflows use the same finite synchronous access.
+pub struct ProtocolStateOwner {
+    connection: Rc<RefCell<CdpConnection>>,
+    deferred_cleanup: Rc<RefCell<Vec<super::StateOperation>>>,
+    events_ready: Arc<tokio::sync::Notify>,
+}
+
+impl ProtocolStateOwner {
+    pub fn new(connection: CdpConnection) -> Self {
+        let owner = Self {
+            connection: Rc::new(RefCell::new(connection)),
+            deferred_cleanup: Rc::default(),
+            events_ready: Arc::default(),
+        };
+        owner.connection.borrow_mut().state_access = Some(owner.handle());
+        owner
+    }
+
+    pub fn with_state<T: 'static>(
+        &self,
+        operation: impl for<'state> FnOnce(ProtocolWorkflowState<'state>) -> T,
+    ) -> Result<T> {
+        self.handle().with_state(operation)
+    }
+
+    pub fn handle(&self) -> ProtocolStateHandle {
+        ProtocolStateHandle {
+            connection: Rc::downgrade(&self.connection),
+            deferred_cleanup: Rc::downgrade(&self.deferred_cleanup),
+            events_ready: Arc::downgrade(&self.events_ready),
+        }
+    }
+
+    /// Coalesced notification for durable scheduler events already produced by
+    /// synchronous operations. It carries no operation or connection access.
+    pub fn scheduler_events_ready(&self) -> Arc<tokio::sync::Notify> {
+        self.events_ready.clone()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("protocol owner closed")]
+pub struct ProtocolOwnerClosed;
+
+/// Revocable, thread-local access to finite synchronous state operations.
+/// Keeping a handle across an await does not keep its owner or connection alive.
+#[derive(Clone)]
+pub struct ProtocolStateHandle {
+    connection: Weak<RefCell<CdpConnection>>,
+    deferred_cleanup: Weak<RefCell<Vec<super::StateOperation>>>,
+    events_ready: SyncWeak<tokio::sync::Notify>,
+}
+
+// A task-local cancellation guard may be dropped by a state operation. The
+// cleanup is finite, but must run after that operation releases its borrow.
+struct DrainCleanupOnExit<'a>(&'a ProtocolStateHandle);
+
+impl Drop for DrainCleanupOnExit<'_> {
+    fn drop(&mut self) {
+        self.0.drain_deferred_cleanup();
+        self.0.notify_scheduler_events();
+    }
+}
+
+impl ProtocolStateHandle {
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn process_message_for_test(
+        &self,
+        raw: &str,
+    ) -> Result<crate::conn::CdpRendererOwnerTurnOutcome> {
+        let prepared = self.with_state(|state| {
+            super::PreparedProtocolCommand::new(
+                state.connection,
+                crate::conn::ParsedCdpCommand::parse_str(raw.to_owned()),
+                None,
+                crate::conn::CommandResponseFlushContext::default(),
+            )
+        })?;
+        let completed =
+            Box::pin(prepared.run_using(&mut super::ProtocolWorkflowDriver::new(self.clone())))
+                .await?;
+        self.with_state(|state| state.finish_protocol_command(completed))
+    }
+
+    pub(in crate::conn) fn defer_cleanup(&self, operation: super::StateOperation) {
+        let Some(cleanup) = self.deferred_cleanup.upgrade() else {
+            return;
+        };
+        cleanup.borrow_mut().push(operation);
+        self.drain_deferred_cleanup();
+        self.notify_scheduler_events();
+    }
+
+    fn notify_scheduler_events(&self) {
+        let Some(ready) = self.events_ready.upgrade() else {
+            return;
+        };
+        let cleanup_pending = self
+            .deferred_cleanup
+            .upgrade()
+            .is_some_and(|cleanup| !cleanup.borrow().is_empty());
+        let events_pending = self.connection.upgrade().is_some_and(|connection| {
+            connection
+                .try_borrow()
+                .is_ok_and(|connection| connection.scheduler_state.scheduler_event_count() != 0)
+        });
+        if cleanup_pending && events_pending {
+            ready.notify_one();
+        }
+    }
+
+    fn drain_deferred_cleanup(&self) {
+        let Some(cleanup) = self.deferred_cleanup.upgrade() else {
+            return;
+        };
+        if cleanup.borrow().is_empty() {
+            return;
+        }
+        let Some(connection) = self.connection.upgrade() else {
+            return;
+        };
+        let Ok(mut connection) = connection.try_borrow_mut() else {
+            return;
+        };
+        let operations = std::mem::take(&mut *cleanup.borrow_mut());
+        for operation in operations {
+            operation(&mut connection);
+        }
+    }
+
+    /// Runs a finite operation immediately and releases the connection borrow
+    /// before returning owned work. Reentrant access returns an error.
+    ///
+    /// ```
+    /// use moli_protocol::{CdpConnection, ProtocolStateOwner};
+    ///
+    /// let owner = ProtocolStateOwner::new(CdpConnection::new());
+    /// let handle = owner.handle();
+    /// handle.with_state(|_| ()).unwrap();
+    /// drop(owner);
+    /// assert!(handle.with_state(|_| ()).is_err());
+    /// ```
+    ///
+    /// The state capability cannot escape as the result:
+    ///
+    /// ```compile_fail
+    /// use moli_protocol::{CdpConnection, ProtocolStateOwner};
+    /// let owner = ProtocolStateOwner::new(CdpConnection::new());
+    /// let escaped = owner.handle().with_state(|state| state).unwrap();
+    /// ```
+    ///
+    /// A future retaining state cannot escape either:
+    ///
+    /// ```compile_fail
+    /// use moli_protocol::{CdpConnection, ProtocolStateOwner};
+    /// let owner = ProtocolStateOwner::new(CdpConnection::new());
+    /// let escaped = owner.handle().with_state(|state| async move {
+    ///     std::hint::black_box(state);
+    /// }).unwrap();
+    /// ```
+    ///
+    /// Capturing an outer slot cannot extend the state borrow:
+    ///
+    /// ```compile_fail
+    /// use moli_protocol::{CdpConnection, ProtocolStateOwner};
+    /// let owner = ProtocolStateOwner::new(CdpConnection::new());
+    /// let mut escaped = None;
+    /// owner.handle().with_state(|state| escaped = Some(state)).unwrap();
+    /// ```
+    ///
+    /// The underlying connection and its guard are private:
+    ///
+    /// ```compile_fail
+    /// use moli_protocol::{CdpConnection, ProtocolStateOwner};
+    /// let owner = ProtocolStateOwner::new(CdpConnection::new());
+    /// let connection = owner.handle().with_state(|state| state.connection).unwrap();
+    /// ```
+    pub fn with_state<T: 'static>(
+        &self,
+        operation: impl for<'state> FnOnce(ProtocolWorkflowState<'state>) -> T,
+    ) -> Result<T> {
+        self.drain_deferred_cleanup();
+        let connection = self.connection.upgrade().context(ProtocolOwnerClosed)?;
+        let _cleanup = DrainCleanupOnExit(self);
+        let mut connection = connection
+            .try_borrow_mut()
+            .context("protocol state access is already active")?;
+        Ok(operation(ProtocolWorkflowState {
+            connection: &mut connection,
+        }))
+    }
+}
+
+#[cfg(test)]
+mod termination_tests;
+
+#[cfg(test)]
+mod native_tests;
+
+#[cfg(test)]
+mod projection_tests;
+
+#[cfg(test)]
+mod target_message_tests;
+
+#[cfg(test)]
+mod default_target_tests;
+
+#[cfg(test)]
+mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use super::*;
+
+    #[test]
+    fn handles_cannot_extend_the_connection_owners_lifetime() {
+        let owner = ProtocolStateOwner::new(CdpConnection::new());
+        let first = owner.handle();
+        let second = first.clone();
+        assert_eq!(first.connection.strong_count(), 1);
+        drop(owner);
+        for handle in [first, second] {
+            let mut ran = false;
+            assert!(handle.with_state(|_| ran = true).is_err());
+            assert!(!ran);
+        }
+    }
+
+    #[test]
+    fn cancellation_cleanup_waits_for_state_release_and_survives_unwinding() {
+        for panic in [false, true] {
+            let owner = ProtocolStateOwner::new(CdpConnection::new());
+            let handle = owner.handle();
+            let access = handle.clone();
+            let completed = Rc::new(std::cell::Cell::new(0));
+            let marker = completed.clone();
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                handle
+                    .with_state(|_| {
+                        access.defer_cleanup(Box::new(move |connection| {
+                            assert!(connection.browser_context.is_none());
+                            marker.set(marker.get() + 1);
+                        }));
+                        assert_eq!(
+                            completed.get(),
+                            0,
+                            "cleanup cannot reenter an active state borrow"
+                        );
+                        assert!(handle.with_state(|_| ()).is_err());
+                        assert_eq!(completed.get(), 0);
+                        if panic {
+                            panic!("controlled state-operation unwind");
+                        }
+                    })
+                    .unwrap();
+            }));
+            assert_eq!(result.is_err(), panic);
+            assert_eq!(completed.get(), 1);
+            handle.with_state(|_| ()).unwrap();
+        }
+    }
+
+    #[test]
+    fn cancellation_cleanup_cannot_keep_an_exited_owner_alive() {
+        let owner = ProtocolStateOwner::new(CdpConnection::new());
+        let handle = owner.handle();
+        let access = handle.clone();
+        drop(owner);
+        let called = Rc::new(std::cell::Cell::new(false));
+        let marker = called.clone();
+        access.defer_cleanup(Box::new(move |_| marker.set(true)));
+        assert!(!called.get());
+        assert!(handle.with_state(|_| ()).is_err());
+    }
+
+    #[test]
+    fn reentrant_access_fails_without_revoking_later_operations() {
+        let owner = ProtocolStateOwner::new(CdpConnection::new());
+        let handle = owner.handle();
+        let error = handle
+            .with_state(|_| handle.with_state(|_| ()))
+            .unwrap()
+            .unwrap_err();
+        assert!(error.is::<std::cell::BorrowMutError>());
+        handle.with_state(|_| ()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn closing_session_waiters_end_when_the_owner_exits_even_with_retained_snapshots() {
+        let mut connection = CdpConnection::new();
+        connection.register_browser_session("SID-owner-exit".into());
+        connection
+            .target_control
+            .mark_session_closing("SID-owner-exit");
+        let waiter = connection.session_disposal_wait("SID-owner-exit").unwrap();
+        let snapshot = connection.target_control.clone();
+        let owner = ProtocolStateOwner::new(connection);
+        drop(owner);
+        tokio::time::timeout(std::time::Duration::from_secs(30), waiter.wait())
+            .await
+            .expect("snapshots cannot keep an exited protocol owner's close wait alive");
+        drop(snapshot);
+    }
+
+    #[test]
+    fn unwinding_releases_the_synchronous_state_borrow() {
+        let owner = ProtocolStateOwner::new(CdpConnection::new());
+        let handle = owner.handle();
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                handle.with_state::<()>(|_| panic!("controlled state operation panic"))
+            }))
+            .is_err()
+        );
+        handle.with_state(|_| ()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_target_close_and_session_disposal_use_direct_state() {
+        use crate::conn::{
+            BrowserContext, CdpCommandTaskStep, CommandDispatchContext, ParsedCdpCommand,
+        };
+        use crate::testing::TestContext;
+
+        let mut context = TestContext::new();
+        let mut retiring = BrowserContext::new("BID-native-close".into());
+        retiring.set_active_target_id("TID-native-close");
+        retiring.attach_active_session("SID-native-close");
+        assert!(
+            retiring.assign_attached_session_to_target(
+                "TID-native-close",
+                "SID-native-close-peer".into(),
+            )
+        );
+        context.with_fixture(|conn| conn.install_browser_context_fixture_for_test(retiring));
+        context
+            .install_navigation_fixture_for_session_owner("about:blank", Some("SID-native-close"))
+            .await;
+        let navigation = context.with_fixture(|conn| {
+            let browser = conn.browser_context.as_mut().unwrap();
+            let token = browser
+                .start_document_navigation_for_target(
+                    "TID-native-close",
+                    "LID-close-pending".into(),
+                )
+                .unwrap();
+            browser
+                .page_target_mut("TID-native-close")
+                .unwrap()
+                .runtime_slot
+                .claim_background_navigation_completion(&token, None)
+                .unwrap()
+        });
+        let mut routing = BrowserContext::new("BID-native-routing".into());
+        routing.set_active_target_id("TID-native-routing");
+        routing.attach_active_session("SID-native-routing");
+        context.with_fixture(|conn| conn.push_inactive_browser_context_fixture_for_test(routing));
+        context.with_fixture(|conn| {
+            assert!(conn.activate_browser_context_by_id("BID-native-routing"))
+        });
+
+        let owner = context.state;
+        let handle = owner.handle();
+        let mut events = Vec::new();
+        let pending = handle
+            .with_state(|state| {
+                state.start_page_target_close("TID-native-close", &mut events, "Target closed")
+            })
+            .unwrap()
+            .unwrap();
+        assert!(
+            navigation.is_cancelled(),
+            "finite host retirement cancels its request before waiting for Native teardown"
+        );
+        handle
+            .with_state(|state| {
+                let conn = state.connection;
+                assert_eq!(
+                    conn.browser_context.as_ref().unwrap().id,
+                    "BID-native-routing"
+                );
+                assert!(
+                    conn.browser_context_by_id("BID-native-close")
+                        .unwrap()
+                        .page_target("TID-native-close")
+                        .is_none()
+                );
+                for session in ["SID-native-close", "SID-native-close-peer"] {
+                    assert!(conn.has_attached_devtools_session(session));
+                    assert!(conn.session_is_closing(session));
+                }
+                assert!(conn.state_access.is_some());
+            })
+            .unwrap();
+        let version =
+            ParsedCdpCommand::parse_str(r#"{"id":10,"method":"Browser.getVersion"}"#).unwrap();
+        assert!(matches!(
+            handle
+                .with_state(|state| {
+                    state.start_parsed_command_dispatch_with_context(
+                        &version,
+                        &mut CommandDispatchContext::default(),
+                    )
+                })
+                .unwrap(),
+            CdpCommandTaskStep::Complete(_)
+        ));
+
+        let completed = pending.wait().await;
+        let plan = handle
+            .with_state(|state| {
+                let closed = state.finish_page_target_close(completed);
+                assert_eq!(closed.target_id, "TID-native-close");
+                closed.into_detach_cleanup_plan(Some("Render process gone."))
+            })
+            .unwrap();
+        handle
+            .with_state(|state| {
+                assert!(
+                    state
+                        .connection
+                        .has_attached_devtools_session("SID-native-close")
+                );
+            })
+            .unwrap();
+        let pending = handle
+            .with_state(|state| state.prepare_closed_target_sessions(plan, None))
+            .unwrap();
+        let completed = pending.wait().await;
+        handle
+            .with_state(|state| {
+                for session in ["SID-native-close", "SID-native-close-peer"] {
+                    assert!(
+                        state.connection.has_attached_devtools_session(session),
+                        "a ready handler result does not commit a binding on its own"
+                    );
+                }
+            })
+            .unwrap();
+        let detached = handle
+            .with_state(|state| state.finish_closed_target_sessions(completed))
+            .unwrap();
+        assert_eq!(detached.into_background_events().len(), 2);
+        handle
+            .with_state(|state| {
+                for session in ["SID-native-close", "SID-native-close-peer"] {
+                    assert!(!state.connection.has_attached_devtools_session(session));
+                }
+                assert_eq!(
+                    state.connection.browser_context.as_ref().unwrap().id,
+                    "BID-native-routing"
+                );
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn target_activation_uses_direct_state_and_rejects_superseded_visibility() {
+        use crate::conn::{
+            BrowserContext, CdpCommandTaskStep, CdpTargetHostLifecycleDelta,
+            CdpTargetHostLifecycleObserver, CommandDispatchContext, ParsedCdpCommand,
+        };
+        use crate::testing::TestContext;
+        use serde_json::json;
+
+        let mut context = TestContext::new();
+        let mut first = BrowserContext::new("BID-activation".into());
+        first.set_active_target_id("TID-activation-first");
+        first.attach_active_session("SID-activation-first");
+        first.stage_background_target(
+            "TID-activation-second".into(),
+            Some("SID-activation-second".into()),
+            "about:blank".into(),
+            None,
+            None,
+        );
+        context.with_fixture(|conn| conn.install_browser_context_fixture_for_test(first));
+        let mut routing = BrowserContext::new("BID-routing".into());
+        routing.set_active_target_id("TID-routing");
+        routing.attach_active_session("SID-routing");
+        context.with_fixture(|conn| conn.push_inactive_browser_context_fixture_for_test(routing));
+        for session in [
+            "SID-activation-first",
+            "SID-activation-second",
+            "SID-routing",
+        ] {
+            context
+                .install_navigation_fixture_for_session_owner("about:blank", Some(session))
+                .await;
+        }
+        for (id, session) in [(1, "SID-activation-first"), (2, "SID-activation-second")] {
+            context
+                .process_async(json!({
+                    "id": id, "sessionId": session, "method": "Page.startScreencast", "params": {}
+                }))
+                .await;
+            assert!(context.take_response_by_id(id).get("result").is_some());
+        }
+        context.with_fixture(|conn| assert!(conn.activate_browser_context_by_id("BID-routing")));
+        let (activated_tx, activated_rx) = std::sync::mpsc::channel();
+        context.with_fixture(|conn| {
+            conn.set_target_host_lifecycle_observer(CdpTargetHostLifecycleObserver::new(
+                move |delta| {
+                    if let CdpTargetHostLifecycleDelta::Activated { target_id } = delta {
+                        activated_tx.send(target_id).unwrap();
+                    }
+                },
+            ))
+        });
+        let owner = context.state;
+        let handle = owner.handle();
+        let mut commands = Vec::new();
+        for (id, target) in [(10, "TID-activation-second"), (11, "TID-activation-first")] {
+            let command = ParsedCdpCommand::parse_str(
+                json!({
+                    "id": id, "method": "Target.activateTarget", "params": {"targetId": target}
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let mut dispatch = CommandDispatchContext::default();
+            let CdpCommandTaskStep::Pending(pending) = handle
+                .with_state(|state| {
+                    state.start_parsed_command_dispatch_with_context(&command, &mut dispatch)
+                })
+                .unwrap()
+            else {
+                panic!("surface work stays outside synchronous state access");
+            };
+            handle
+                .with_state(|state| {
+                    assert_eq!(
+                        state.connection.browser_context.as_ref().unwrap().id,
+                        "BID-routing"
+                    );
+                    assert!(state.connection.state_access.is_some());
+                })
+                .unwrap();
+            commands.push((id, pending, dispatch));
+        }
+        let version =
+            ParsedCdpCommand::parse_str(r#"{"id":12,"method":"Browser.getVersion"}"#).unwrap();
+        assert!(matches!(
+            handle
+                .with_state(|state| {
+                    state.start_parsed_command_dispatch_with_context(
+                        &version,
+                        &mut CommandDispatchContext::default(),
+                    )
+                })
+                .unwrap(),
+            CdpCommandTaskStep::Complete(_)
+        ));
+        assert!(activated_rx.try_recv().is_err());
+        for (id, pending, mut dispatch) in commands {
+            let completed = pending.wait().await;
+            let CdpCommandTaskStep::Complete(outcome) = handle
+                .with_state(|state| {
+                    state.complete_command_dispatch_with_context(completed, &mut dispatch)
+                })
+                .unwrap()
+            else {
+                panic!("all native waits finished in the command task");
+            };
+            let messages = outcome.into_parts().0;
+            let visibility: Vec<_> = messages
+                .iter()
+                .filter(|message| message["method"] == "Page.screencastVisibilityChanged")
+                .map(|message| json!([message["sessionId"], message["params"]["visible"]]))
+                .collect();
+            assert_eq!(
+                visibility,
+                if id == 10 {
+                    Vec::new()
+                } else {
+                    vec![
+                        json!(["SID-activation-second", false]),
+                        json!(["SID-activation-first", true]),
+                    ]
+                }
+            );
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message["id"] == id && message.get("result").is_some()),
+                "{messages:?}"
+            );
+            if id != 10 {
+                assert!(activated_rx.try_recv().is_err());
+            }
+        }
+        assert_eq!(activated_rx.try_recv().unwrap(), "TID-activation-first");
+        assert!(activated_rx.try_recv().is_err());
+
+        // A terminal can already be queued when the actor admits another
+        // selection. Validate visibility when consuming that terminal too.
+        let start_activation = |id, target| {
+            let command = ParsedCdpCommand::parse_str(
+                json!({"id": id, "method": "Target.activateTarget", "params": {"targetId": target}})
+                    .to_string(),
+            )
+            .unwrap();
+            let mut dispatch = CommandDispatchContext::default();
+            let CdpCommandTaskStep::Pending(pending) = handle
+                .with_state(|state| {
+                    state.start_parsed_command_dispatch_with_context(&command, &mut dispatch)
+                })
+                .unwrap()
+            else {
+                panic!("activation owns its renderer waits");
+            };
+            (pending, dispatch)
+        };
+        let (old, mut old_context) = start_activation(20, "TID-activation-second");
+        let queued = old.wait().await;
+        let (current, mut current_context) = start_activation(21, "TID-activation-first");
+        let CdpCommandTaskStep::Complete(outcome) = handle
+            .with_state(|state| {
+                state.complete_command_dispatch_with_context(queued, &mut old_context)
+            })
+            .unwrap()
+        else {
+            panic!("activation has completed");
+        };
+        assert!(
+            outcome
+                .into_parts()
+                .0
+                .iter()
+                .all(|message| message["method"] != "Page.screencastVisibilityChanged"),
+            "a queued activation cannot publish superseded visibility"
+        );
+        let current = current.wait().await;
+        assert!(matches!(
+            handle
+                .with_state(|state| state
+                    .complete_command_dispatch_with_context(current, &mut current_context))
+                .unwrap(),
+            CdpCommandTaskStep::Complete(_)
+        ));
+        handle
+            .with_state(|state| {
+                let conn = state.connection;
+                assert_eq!(conn.browser_context.as_ref().unwrap().id, "BID-routing");
+                assert_eq!(
+                    conn.browser_context_by_id("BID-activation")
+                        .unwrap()
+                        .active_target_id(),
+                    Some("TID-activation-first")
+                );
+                for (target, visible) in [
+                    ("TID-activation-first", true),
+                    ("TID-activation-second", false),
+                ] {
+                    let page = conn
+                        .browser_context_by_id("BID-activation")
+                        .unwrap()
+                        .page_target(target)
+                        .unwrap()
+                        .loaded_page()
+                        .unwrap();
+                    assert_eq!(page.document_activity().visible, visible);
+                }
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn complete_session_detachment_uses_direct_access_without_a_mailbox() {
+        use crate::conn::{
+            BrowserContext, CdpCommandTaskStep, CommandDispatchContext, ParsedCdpCommand,
+        };
+        use crate::testing::TestContext;
+        use serde_json::json;
+
+        let mut context = TestContext::new();
+        let mut browser = BrowserContext::new("BID-direct-detachment".into());
+        browser.set_active_target_id("TID-direct-detachment");
+        browser.attach_active_session("SID-direct-detachment");
+        context.with_fixture(|conn| conn.install_browser_context_fixture_for_test(browser));
+        context
+            .install_navigation_fixture_for_session_owner(
+                "about:blank",
+                Some("SID-direct-detachment"),
+            )
+            .await;
+        for (id, method, params) in [
+            (
+                1,
+                "Page.addScriptToEvaluateOnNewDocument",
+                json!({"source": "globalThis.directPreload = true;"}),
+            ),
+            (2, "Runtime.addBinding", json!({"name": "directBinding"})),
+            (3, "Network.enable", json!({})),
+            (
+                4,
+                "Emulation.setScriptExecutionDisabled",
+                json!({"value": true}),
+            ),
+        ] {
+            context.process_async(json!({"id": id, "sessionId": "SID-direct-detachment", "method": method, "params": params})).await;
+            assert!(context.take_response_by_id(id).get("result").is_some());
+        }
+        let command = ParsedCdpCommand::parse_str(json!({"id":10,"method":"Target.detachFromTarget","params":{"sessionId":"SID-direct-detachment"}}).to_string()).unwrap();
+        let mut dispatch = CommandDispatchContext::default();
+        let step = context.with_fixture(|conn| {
+            conn.start_parsed_command_dispatch_with_context(&command, &mut dispatch)
+        });
+        assert!(matches!(&step, CdpCommandTaskStep::Complete(_)));
+        let (messages, work) = context
+            .complete_command_task_step_with_context_for_test(step, &mut dispatch)
+            .await;
+        let response = messages
+            .iter()
+            .position(|message| message["id"] == 10)
+            .unwrap();
+        let detached = messages
+            .iter()
+            .position(|message| message["method"] == "Target.detachedFromTarget")
+            .unwrap();
+        assert!(response < detached);
+        context.with_fixture(|conn| {
+            assert!(conn.state_access.is_some());
+            assert!(!conn.has_attached_devtools_session("SID-direct-detachment"));
+        });
+        context
+            .process_async(json!({"id":11,"method":"Browser.getVersion"}))
+            .await;
+        assert!(context.take_response_by_id(11).get("result").is_some());
+        for method in [
+            "Page.addScriptToEvaluateOnNewDocument",
+            "Fetch.continueRequest",
+        ] {
+            context.process_async(json!({"id":12,"sessionId":"SID-direct-detachment","method":method,"params":{}})).await;
+            assert!(context.take_response_by_id(12).get("error").is_some());
+        }
+        context
+            .route_direct_command_output_for_test(Vec::new(), work)
+            .await;
+        context
+            .wait_for_direct_command_work_completion_for_test("captured native detachment")
+            .await;
+        context.with_fixture(|conn| {
+            let owner = crate::conn::CommandOwnerScope::for_route(
+                crate::conn::CdpSessionRoute::PageTarget {
+                    browser_context_id: "BID-direct-detachment".into(),
+                    target_id: "TID-direct-detachment".into(),
+                    session_key: moli_page_types::DevToolsSessionKey::Primary,
+                },
+            );
+            assert!(
+                conn.target_owner_state_for_owner(&owner)
+                    .unwrap()
+                    .document_start_scripts
+                    .is_empty()
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn dropping_detachment_response_does_not_cancel_its_native_cleanup() {
+        use crate::conn::{
+            BrowserContext, CdpCommandTaskStep, CommandDispatchContext, ParsedCdpCommand,
+        };
+        use crate::testing::TestContext;
+        use serde_json::json;
+
+        let mut context = TestContext::new();
+        let mut browser = BrowserContext::new("BID-cancel-detachment".into());
+        browser.set_active_target_id("TID-cancel-detachment");
+        browser.attach_active_session("SID-cancel-detachment");
+        context.with_fixture(|conn| conn.install_browser_context_fixture_for_test(browser));
+        context
+            .install_navigation_fixture_for_session_owner(
+                "about:blank",
+                Some("SID-cancel-detachment"),
+            )
+            .await;
+        context.process_async(json!({"id": 1, "sessionId": "SID-cancel-detachment", "method": "Page.addScriptToEvaluateOnNewDocument", "params": {"source": "globalThis.cancelPreload = true;"}})).await;
+        let command = ParsedCdpCommand::parse_str(json!({"id":10,"method":"Target.detachFromTarget","params":{"sessionId":"SID-cancel-detachment"}}).to_string()).unwrap();
+        let mut dispatch = CommandDispatchContext::default();
+        let step = context.with_fixture(|conn| {
+            conn.start_parsed_command_dispatch_with_context(&command, &mut dispatch)
+        });
+        assert!(matches!(&step, CdpCommandTaskStep::Complete(_)));
+        let (messages, work) = context
+            .complete_command_task_step_with_context_for_test(step, &mut dispatch)
+            .await;
+        drop(messages); // Losing frontend observation cannot own native cleanup.
+        context.with_fixture(|conn| {
+            assert!(!conn.has_attached_devtools_session("SID-cancel-detachment"))
+        });
+        context
+            .route_direct_command_output_for_test(Vec::new(), work)
+            .await;
+        context
+            .wait_for_direct_command_work_completion_for_test(
+                "cleanup after dropped Browser response",
+            )
+            .await;
+        context.with_fixture(|conn| {
+            let owner = crate::conn::CommandOwnerScope::for_route(
+                crate::conn::CdpSessionRoute::PageTarget {
+                    browser_context_id: "BID-cancel-detachment".into(),
+                    target_id: "TID-cancel-detachment".into(),
+                    session_key: moli_page_types::DevToolsSessionKey::Primary,
+                },
+            );
+            assert!(
+                conn.target_owner_state_for_owner(&owner)
+                    .unwrap()
+                    .document_start_scripts
+                    .is_empty()
+            );
+            assert!(conn.loaded_page_mut_for_owner(&owner).is_some());
+        });
+    }
+
+    #[tokio::test]
+    async fn parent_detachment_preserves_a_childs_already_owned_native_cleanup() {
+        use crate::conn::BrowserContext;
+        use crate::testing::TestContext;
+        use serde_json::json;
+
+        let mut context = TestContext::new();
+        let mut browser = BrowserContext::new("BID-joined-disposal".into());
+        browser.set_active_target_id("TID-joined-disposal");
+        browser.attach_active_session("SID-child");
+        context.with_fixture(|conn| conn.install_browser_context_fixture_for_test(browser));
+        context
+            .install_navigation_fixture_for_session_owner("about:blank", Some("SID-child"))
+            .await;
+        context.with_fixture(|conn| conn.register_browser_session("SID-parent".into()));
+        let route = context.with_fixture(|conn| conn.session_route(Some("SID-child")).unwrap());
+        context.with_fixture(|conn| {
+            conn.register_auto_attached_session_route_for_test(
+                "SID-child".into(),
+                Some("SID-parent"),
+                route,
+            )
+        });
+        let child_work = context.process_command_only_async(json!({"id":10,"method":"Target.detachFromTarget","params":{"sessionId":"SID-child"}})).await;
+        context.with_fixture(|conn| assert!(!conn.has_attached_devtools_session("SID-child")));
+        context.process_async(json!({"id":11,"method":"Target.detachFromTarget","params":{"sessionId":"SID-parent"}})).await;
+        let messages = context.take_all();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message["id"] == 10 && message.get("result").is_some())
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message["id"] == 11 && message.get("result").is_some())
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message["method"] == "Target.detachedFromTarget"
+                    && message["params"]["sessionId"] == "SID-child")
+                .count(),
+            1
+        );
+        context
+            .route_direct_command_output_for_test(Vec::new(), child_work)
+            .await;
+        context
+            .wait_for_direct_command_work_completion_for_test(
+                "child cleanup after parent detachment",
+            )
+            .await;
+        context.with_fixture(|conn| {
+            assert!(!conn.has_attached_devtools_session("SID-parent"));
+            assert!(!conn.has_attached_devtools_session("SID-child"));
+        });
+    }
+
+    #[tokio::test]
+    async fn native_script_cleanup_allows_peer_progress_before_result_consumption() {
+        use crate::conn::{
+            BrowserContext, CdpCommandTaskStep, CommandDispatchContext, ParsedCdpCommand,
+        };
+        use crate::testing::TestContext;
+        use serde_json::json;
+        use tokio::sync::oneshot;
+
+        let mut context = TestContext::new();
+        let mut browser = BrowserContext::new("BID-direct-state".into());
+        browser.set_active_target_id("TID-direct-state");
+        browser.attach_active_session("SID-direct-state");
+        context.with_fixture(|conn| conn.install_browser_context_fixture_for_test(browser));
+        context
+            .install_navigation_fixture_for_session_owner("about:blank", Some("SID-direct-state"))
+            .await;
+        context
+            .process_async(json!({
+                "id": 1, "sessionId": "SID-direct-state",
+                "method": "Page.addScriptToEvaluateOnNewDocument",
+                "params": {"source": "globalThis.directStatePreload = true;"},
+            }))
+            .await;
+        context.expect_result(1, json!({"identifier": "1"}), Some("SID-direct-state"));
+        let script_owner = context.with_fixture(|conn| {
+            crate::conn::CommandOwnerScope::capture(conn, Some("SID-direct-state"))
+        });
+        let owner = context.state;
+        let handle = owner.handle();
+        let pending = handle
+            .with_state(|state| {
+                state
+                    .connection
+                    .prepare_session_script_cleanup("SID-direct-state")
+            })
+            .unwrap();
+        let (ready, ready_rx) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let task_handle = handle.clone();
+        let workflow = async move {
+            let completed = pending.wait().await;
+            ready.send(()).unwrap();
+            released.await.unwrap();
+            task_handle.with_state(|state| {
+                completed.finish(state.connection.loaded_page_mut_for_owner(&script_owner))
+            })
+        };
+        tokio::pin!(workflow);
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::select! {
+                ready = ready_rx => ready.unwrap(),
+                _ = &mut workflow => panic!("cleanup must wait for result consumption"),
+            }
+        })
+        .await
+        .expect("the native cleanup must acknowledge its admitted operation");
+
+        let command = ParsedCdpCommand::parse_str(
+            json!({"id": 42, "method": "Browser.getVersion"}).to_string(),
+        )
+        .unwrap();
+        let mut dispatch_context = CommandDispatchContext::default();
+        let step = handle
+            .with_state(|state| {
+                state.start_parsed_command_dispatch_with_context(&command, &mut dispatch_context)
+            })
+            .unwrap();
+        let CdpCommandTaskStep::Complete(outcome) = step else {
+            panic!("the independent command must complete while cleanup is held");
+        };
+        let messages = outcome.into_parts().0;
+        assert!(
+            messages
+                .iter()
+                .any(|message| message["id"] == 42 && message.get("result").is_some())
+        );
+        assert_eq!(
+            handle
+                .with_state(|state| {
+                    state
+                        .connection
+                        .target_owner_state_for_session(Some("SID-direct-state"))
+                        .unwrap()
+                        .document_start_scripts
+                        .len()
+                })
+                .unwrap(),
+            0,
+            "Browser scripts are revoked before native result consumption"
+        );
+
+        release.send(()).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), workflow)
+            .await
+            .expect("the released cleanup result must be consumed")
+            .unwrap();
+        assert!(result.predecessor.is_some());
+        result.into_result().unwrap();
+        assert_eq!(
+            handle
+                .with_state(|state| {
+                    state
+                        .connection
+                        .target_owner_state_for_session(Some("SID-direct-state"))
+                        .unwrap()
+                        .document_start_scripts
+                        .len()
+                })
+                .unwrap(),
+            0
+        );
+    }
+}

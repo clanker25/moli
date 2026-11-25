@@ -1,0 +1,112 @@
+use moli_core::page::RendererDocumentSourcedTopLevelLocationNavigation;
+
+use super::{CommandOwnerScope, TargetPageResidenceIdentity};
+
+/// One renderer-requested top-level navigation projected from a concrete
+/// renderer output record.
+///
+/// The renderer freezes and moves the request at its producing turn boundary.
+/// Protocol only projects that immutable record into scheduler work; it never
+/// rescans mutable Page state. The action retains both identities needed at its
+/// eventual turn:
+///
+/// - `page_owner` rejects execution after Page replacement or retirement;
+/// - `owner_scope` restores the target route used by an implicit (`None`)
+///   session instead of resolving whichever target is current later.
+///
+/// The source Document remains inside `navigation` as causal metadata. A
+/// same-Page `document.open()` replacement therefore does not manufacture a
+/// new request, while replacement of the Page residence makes the action
+/// stale.
+#[derive(Debug, PartialEq)]
+pub(crate) struct TopLevelNavigationOwnerAction {
+    owner_scope: CommandOwnerScope,
+    page_owner: TargetPageResidenceIdentity,
+    navigation: TopLevelNavigationRequest,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum TopLevelNavigationRequest {
+    Location(RendererDocumentSourcedTopLevelLocationNavigation),
+    History(moli_core::page::RendererPendingTopLevelHistoryTraversal),
+}
+
+impl TopLevelNavigationOwnerAction {
+    /// Wraps a navigation that has already been claimed while its exact
+    /// protocol route is installed.
+    ///
+    /// Preparing renderer output moves the navigation out of the Page before
+    /// the output slot is drained. Draining must therefore publish this
+    /// concrete action rather than execute the navigation inline or rescan the
+    /// current Page.
+    pub(crate) fn from_prepared(
+        owner_scope: CommandOwnerScope,
+        page_owner: TargetPageResidenceIdentity,
+        navigation: RendererDocumentSourcedTopLevelLocationNavigation,
+    ) -> Self {
+        Self {
+            owner_scope,
+            page_owner,
+            navigation: TopLevelNavigationRequest::Location(navigation),
+        }
+    }
+
+    pub(crate) fn history(
+        owner_scope: CommandOwnerScope,
+        page_owner: TargetPageResidenceIdentity,
+        traversal: moli_core::page::RendererPendingTopLevelHistoryTraversal,
+    ) -> Self {
+        Self {
+            owner_scope,
+            page_owner,
+            navigation: TopLevelNavigationRequest::History(traversal),
+        }
+    }
+
+    pub(crate) fn session_id(&self) -> Option<&str> {
+        self.owner_scope.session_id()
+    }
+
+    pub(crate) fn owner_scope(&self) -> &CommandOwnerScope {
+        &self.owner_scope
+    }
+
+    pub(crate) fn page_owner(&self) -> &TargetPageResidenceIdentity {
+        &self.page_owner
+    }
+
+    pub(crate) fn history_delta(&self) -> Option<i64> {
+        match &self.navigation {
+            TopLevelNavigationRequest::History(traversal) => Some(traversal.delta),
+            TopLevelNavigationRequest::Location(_) => None,
+        }
+    }
+
+    pub(crate) fn target_id(&self) -> Option<&str> {
+        self.page_owner.target_id()
+    }
+
+    pub(crate) fn source_document(&self) -> Option<moli_core::RendererDocumentLifecycleIdentity> {
+        match &self.navigation {
+            TopLevelNavigationRequest::Location(navigation) => Some(navigation.source_document()),
+            TopLevelNavigationRequest::History(_) => None,
+        }
+    }
+
+    pub(crate) fn url(&self) -> Option<&str> {
+        match &self.navigation {
+            TopLevelNavigationRequest::Location(navigation) => Some(navigation.url()),
+            TopLevelNavigationRequest::History(_) => None,
+        }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        CommandOwnerScope,
+        TargetPageResidenceIdentity,
+        TopLevelNavigationRequest,
+    ) {
+        (self.owner_scope, self.page_owner, self.navigation)
+    }
+}

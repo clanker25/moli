@@ -1,0 +1,42 @@
+use super::*;
+
+pub(super) fn element_option_value(runtime: &PageScriptHost, handle: DomHandle) -> Option<String> {
+    runtime.dom_host().dom().option_value(handle)
+}
+
+pub(super) fn select_option_handles(runtime: &PageScriptHost, handle: DomHandle) -> Vec<DomHandle> {
+    runtime.dom_host().select_option_elements(handle)
+}
+
+pub(super) fn select_is_multiple(runtime: &PageScriptHost, handle: DomHandle) -> bool {
+    element_has_attribute(runtime, handle, "multiple")
+}
+
+pub(super) fn effective_option_selected(runtime: &PageScriptHost, handle: DomHandle) -> bool {
+    let Some(element) = runtime.dom_host().node(handle).and_then(Node::as_element) else {
+        return false;
+    };
+    if !element.is_html_option() {
+        return false;
+    }
+
+    if let Some(select) = runtime.dom_host().option_nearest_ancestor_select(handle) {
+        return runtime
+            .dom_host()
+            .select_selected_option_elements(select)
+            .contains(&handle);
+    }
+    element.selected()
+}
+
+pub(super) fn selected_index_for_select(runtime: &PageScriptHost, handle: DomHandle) -> i32 {
+    for (index, option) in select_option_handles(runtime, handle)
+        .into_iter()
+        .enumerate()
+    {
+        if effective_option_selected(runtime, option) {
+            return index as i32;
+        }
+    }
+    -1
+}

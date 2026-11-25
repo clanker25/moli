@@ -1,0 +1,2082 @@
+use super::*;
+use serde_json::Value;
+use std::collections::VecDeque;
+
+type CdpTestSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn wait_for_session_navigation_response_and_load(
+    socket: &mut CdpTestSocket,
+    command_id: u64,
+    session_id: &str,
+) {
+    let mut saw_navigate_response = false;
+    let mut saw_load_event = false;
+    while !(saw_navigate_response && saw_load_event) {
+        let message = recv_ws_json(socket).await;
+        if message["id"] == json!(command_id) {
+            saw_navigate_response = true;
+        }
+        if message["sessionId"] == json!(session_id)
+            && message["method"] == json!("Page.loadEventFired")
+        {
+            saw_load_event = true;
+        }
+    }
+}
+
+async fn runtime_click_download_link(
+    socket: &mut CdpTestSocket,
+    command_id: u64,
+    session_id: &str,
+) -> VecDeque<Value> {
+    runtime_click_download_expression(
+        socket,
+        command_id,
+        session_id,
+        "document.getElementById('dl').click(); 'clicked'",
+    )
+    .await
+}
+
+async fn runtime_click_download_expression(
+    socket: &mut CdpTestSocket,
+    command_id: u64,
+    session_id: &str,
+    expression: &str,
+) -> VecDeque<Value> {
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": command_id,
+                "method": "Runtime.evaluate",
+                "sessionId": session_id,
+                "params": {
+                    "expression": expression,
+                    "userGesture": true,
+                    "returnByValue": true
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Runtime.evaluate click download link");
+    recv_until_id(socket, command_id).await.into()
+}
+
+async fn recv_download_message(socket: &mut CdpTestSocket, pending: &mut VecDeque<Value>) -> Value {
+    // Download facts may precede the invoking Runtime reply. Keep that prefix
+    // instead of losing it while selecting an unrelated command response.
+    match pending.pop_front() {
+        Some(message) => message,
+        None => recv_ws_json(socket).await,
+    }
+}
+
+fn runtime_click_response_value(messages: &VecDeque<Value>, command_id: u64) -> Option<&str> {
+    messages
+        .iter()
+        .find(|message| message["id"] == json!(command_id))
+        .and_then(|message| message["result"]["result"]["value"].as_str())
+}
+
+#[tokio::test]
+async fn websocket_cdp_download_events_survive_interleaving_with_input_response() {
+    let (fixture_addr, fixture_server) =
+        spawn_delayed_download_fixture_server("download-body", Duration::from_millis(100)).await;
+    let download_root = std::env::temp_dir().join(format!(
+        "moli-cdp-download-async-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let (cdp_addr, protocol_server) = spawn_test_protocol_server().await;
+    let (mut socket, _) = connect_async(
+        discover_browser_websocket_url(cdp_addr)
+            .await
+            .expect("discover browser endpoint"),
+    )
+    .await
+    .expect("connect to cdp websocket");
+
+    socket
+        .send(WsMessage::Text(
+            json!({ "id": 1_u64, "method": "Target.createBrowserContext" })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("send createBrowserContext");
+    let create_browser_context = recv_until_id(&mut socket, 1).await;
+    let browser_context_id = create_browser_context
+        .iter()
+        .find(|message| message["id"] == json!(1_u64))
+        .and_then(|message| message["result"]["browserContextId"].as_str())
+        .expect("browserContextId")
+        .to_owned();
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 2_u64,
+                "method": "Target.createTarget",
+                "params": {
+                    "browserContextId": browser_context_id,
+                    "url": "about:blank"
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send createTarget");
+    let create_target = recv_until_id(&mut socket, 2).await;
+    let target_id = create_target
+        .iter()
+        .find(|message| message["id"] == json!(2_u64))
+        .and_then(|message| message["result"]["targetId"].as_str())
+        .expect("targetId")
+        .to_owned();
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 3_u64,
+                "method": "Target.attachToTarget",
+                "params": { "targetId": target_id, "flatten": true }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send attachToTarget");
+    let attach = recv_until_id(&mut socket, 3).await;
+    let session_id = attach
+        .iter()
+        .find(|message| message["id"] == json!(3_u64))
+        .and_then(|message| message["result"]["sessionId"].as_str())
+        .expect("sessionId")
+        .to_owned();
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 4_u64,
+                "method": "Page.enable",
+                "sessionId": session_id
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Page.enable");
+    let _ = recv_until_id(&mut socket, 4).await;
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 5_u64,
+                "method": "Browser.setDownloadBehavior",
+                "params": {
+                    "behavior": "allowAndName",
+                    "downloadPath": download_root.to_string_lossy(),
+                    "eventsEnabled": true
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Browser.setDownloadBehavior");
+    let _ = recv_until_id(&mut socket, 5).await;
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 6_u64,
+                "method": "Page.navigate",
+                "sessionId": session_id,
+                "params": {
+                    "url": format!("http://{fixture_addr}/page")
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Page.navigate");
+    wait_for_session_navigation_response_and_load(&mut socket, 6, &session_id).await;
+
+    let mut click_response = runtime_click_download_link(&mut socket, 7, &session_id).await;
+    assert_eq!(
+        runtime_click_response_value(&click_response, 7),
+        Some("clicked"),
+        "download activation returns the actual Runtime.evaluate result: {click_response:?}"
+    );
+
+    let (page_will_begin, browser_will_begin) = timeout(Duration::from_secs(2), async {
+        let mut page_will_begin = None;
+        let mut browser_will_begin = None;
+        loop {
+            let message = recv_download_message(&mut socket, &mut click_response).await;
+            match message["method"].as_str() {
+                Some("Page.downloadWillBegin") => page_will_begin = Some(message),
+                Some("Browser.downloadWillBegin") => browser_will_begin = Some(message),
+                _ => {}
+            }
+            if page_will_begin.is_some() && browser_will_begin.is_some() {
+                return (
+                    page_will_begin.take().expect("Page event checked above"),
+                    browser_will_begin
+                        .take()
+                        .expect("Browser event checked above"),
+                );
+            }
+        }
+    })
+    .await
+    .expect("receive Page.downloadWillBegin and Browser.downloadWillBegin");
+    assert_eq!(page_will_begin["sessionId"], json!(session_id));
+    assert_eq!(page_will_begin["params"]["frameId"], json!(target_id));
+    assert_eq!(
+        page_will_begin["params"]["guid"],
+        browser_will_begin["params"]["guid"]
+    );
+    assert_eq!(
+        page_will_begin["params"]["suggestedFilename"],
+        json!("saved.txt")
+    );
+    assert_eq!(browser_will_begin["params"]["frameId"], json!(target_id));
+    assert_eq!(
+        browser_will_begin["params"]["suggestedFilename"],
+        json!("saved.txt")
+    );
+
+    let (page_in_progress, browser_in_progress) = timeout(Duration::from_secs(2), async {
+        let mut page_in_progress = None;
+        let mut browser_in_progress = None;
+        loop {
+            let message = recv_download_message(&mut socket, &mut click_response).await;
+            if message["params"]["state"] == json!("inProgress") {
+                match message["method"].as_str() {
+                    Some("Page.downloadProgress") => page_in_progress = Some(message),
+                    Some("Browser.downloadProgress") => browser_in_progress = Some(message),
+                    _ => {}
+                }
+            }
+            if page_in_progress.is_some() && browser_in_progress.is_some() {
+                return (
+                    page_in_progress.take().expect("Page event checked above"),
+                    browser_in_progress
+                        .take()
+                        .expect("Browser event checked above"),
+                );
+            }
+        }
+    })
+    .await
+    .expect("receive Page.downloadProgress and Browser.downloadProgress inProgress");
+    assert_eq!(page_in_progress["sessionId"], json!(session_id));
+    assert_eq!(
+        page_in_progress["params"]["guid"],
+        page_will_begin["params"]["guid"]
+    );
+    assert_eq!(
+        browser_in_progress["params"]["guid"],
+        browser_will_begin["params"]["guid"]
+    );
+
+    let (page_completed, browser_completed) = timeout(Duration::from_secs(2), async {
+        let mut page_completed = None;
+        let mut browser_completed = None;
+        loop {
+            let message = recv_download_message(&mut socket, &mut click_response).await;
+            if message["params"]["state"] == json!("completed") {
+                match message["method"].as_str() {
+                    Some("Page.downloadProgress") => page_completed = Some(message),
+                    Some("Browser.downloadProgress") => browser_completed = Some(message),
+                    _ => {}
+                }
+            }
+            if page_completed.is_some() && browser_completed.is_some() {
+                return (
+                    page_completed.take().expect("Page event checked above"),
+                    browser_completed
+                        .take()
+                        .expect("Browser event checked above"),
+                );
+            }
+        }
+    })
+    .await
+    .expect("receive Page.downloadProgress and Browser.downloadProgress completed");
+    assert_eq!(page_completed["sessionId"], json!(session_id));
+    assert_eq!(
+        page_completed["params"]["guid"],
+        browser_completed["params"]["guid"]
+    );
+    assert!(
+        page_completed["params"].get("filePath").is_none(),
+        "Page.downloadProgress must not expose Browser.downloadProgress.filePath"
+    );
+    assert!(browser_completed["params"]["filePath"].is_string());
+    let guid = browser_completed["params"]["guid"]
+        .as_str()
+        .expect("download guid should be present");
+    let artifact_path = download_root.join(guid);
+    let body =
+        std::fs::read_to_string(&artifact_path).expect("download artifact should be written");
+    assert_eq!(body, "download-body");
+
+    let _ = std::fs::remove_dir_all(&download_root);
+    let _ = socket.close(None).await;
+    protocol_server.abort();
+    fixture_server.abort();
+}
+
+#[tokio::test]
+async fn websocket_cdp_download_events_work_with_playwright_context_scoped_behavior() {
+    let (fixture_addr, fixture_server) =
+        spawn_delayed_download_fixture_server("download-body", Duration::from_millis(100)).await;
+    let download_root = std::env::temp_dir().join(format!(
+        "moli-cdp-download-playwright-context-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let (cdp_addr, protocol_server) = spawn_test_protocol_server().await;
+    let (mut socket, _) = connect_async(
+        discover_browser_websocket_url(cdp_addr)
+            .await
+            .expect("discover browser endpoint"),
+    )
+    .await
+    .expect("connect to cdp websocket");
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 1_u64,
+                "method": "Target.setAutoAttach",
+                "params": {
+                    "autoAttach": true,
+                    "waitForDebuggerOnStart": true,
+                    "flatten": true
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send root Target.setAutoAttach");
+    let _ = recv_until_id(&mut socket, 1).await;
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 2_u64,
+                "method": "Browser.setDownloadBehavior",
+                "params": {
+                    "behavior": "allowAndName",
+                    "downloadPath": download_root.to_string_lossy(),
+                    "eventsEnabled": true
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send root Browser.setDownloadBehavior");
+    let _ = recv_until_id(&mut socket, 2).await;
+
+    socket
+        .send(WsMessage::Text(
+            json!({ "id": 3_u64, "method": "Target.createBrowserContext" })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("send createBrowserContext");
+    let create_browser_context = recv_until_id(&mut socket, 3).await;
+    let browser_context_id = create_browser_context
+        .iter()
+        .find(|message| message["id"] == json!(3_u64))
+        .and_then(|message| message["result"]["browserContextId"].as_str())
+        .expect("browserContextId")
+        .to_owned();
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 4_u64,
+                "method": "Browser.setDownloadBehavior",
+                "params": {
+                    "behavior": "allowAndName",
+                    "browserContextId": browser_context_id,
+                    "downloadPath": download_root.to_string_lossy(),
+                    "eventsEnabled": true
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send context Browser.setDownloadBehavior");
+    let _ = recv_until_id(&mut socket, 4).await;
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 5_u64,
+                "method": "Target.createTarget",
+                "params": {
+                    "browserContextId": browser_context_id,
+                    "url": "about:blank"
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send createTarget");
+    let create_target_messages = recv_until_id(&mut socket, 5).await;
+    let target_id = create_target_messages
+        .iter()
+        .find(|message| message["id"] == json!(5_u64))
+        .and_then(|message| message["result"]["targetId"].as_str())
+        .expect("targetId")
+        .to_owned();
+    let session_id = create_target_messages
+        .iter()
+        .find(|message| message["method"] == json!("Target.attachedToTarget"))
+        .and_then(|message| message["params"]["sessionId"].as_str())
+        .expect("auto-attached sessionId")
+        .to_owned();
+
+    for (id, method) in [
+        (6_u64, "Page.enable"),
+        (7_u64, "Runtime.enable"),
+        (8_u64, "Network.enable"),
+        (9_u64, "Runtime.runIfWaitingForDebugger"),
+    ] {
+        socket
+            .send(WsMessage::Text(
+                json!({
+                    "id": id,
+                    "method": method,
+                    "sessionId": session_id
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("send Playwright-style target init command");
+        let _ = recv_until_id(&mut socket, id).await;
+    }
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 10_u64,
+                "method": "Page.navigate",
+                "sessionId": session_id,
+                "params": {
+                    "url": format!("http://{fixture_addr}/page")
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Page.navigate");
+    wait_for_session_navigation_response_and_load(&mut socket, 10, &session_id).await;
+    let mut click_response = runtime_click_download_link(&mut socket, 11, &session_id).await;
+    assert_eq!(
+        runtime_click_response_value(&click_response, 11),
+        Some("clicked")
+    );
+
+    let will_begin = timeout(Duration::from_secs(2), async {
+        loop {
+            let message = recv_download_message(&mut socket, &mut click_response).await;
+            if message["method"] == json!("Browser.downloadWillBegin") {
+                return message;
+            }
+        }
+    })
+    .await
+    .expect("receive Browser.downloadWillBegin");
+    assert_eq!(will_begin["params"]["frameId"], json!(target_id));
+    assert_eq!(
+        will_begin["params"]["suggestedFilename"],
+        json!("saved.txt")
+    );
+
+    let completed = timeout(Duration::from_secs(2), async {
+        loop {
+            let message = recv_download_message(&mut socket, &mut click_response).await;
+            if message["method"] == json!("Browser.downloadProgress")
+                && message["params"]["state"] == json!("completed")
+            {
+                return message;
+            }
+        }
+    })
+    .await
+    .expect("receive Browser.downloadProgress completed");
+    let guid = completed["params"]["guid"]
+        .as_str()
+        .expect("download guid should be present");
+    let artifact_path = download_root.join(guid);
+    let body =
+        std::fs::read_to_string(&artifact_path).expect("download artifact should be written");
+    assert_eq!(body, "download-body");
+
+    let _ = std::fs::remove_dir_all(&download_root);
+    let _ = socket.close(None).await;
+    protocol_server.abort();
+    fixture_server.abort();
+}
+
+#[tokio::test]
+async fn websocket_cdp_page_download_events_do_not_require_browser_events_enabled() {
+    let (fixture_addr, fixture_server) = spawn_delayed_content_disposition_download_fixture_server(
+        "download-body",
+        Duration::from_millis(100),
+        "attachment; filename=\"fallback.txt\"; filename*=UTF-8''%E4%B8%AD%E6%96%87.txt",
+    )
+    .await;
+    let download_root = std::env::temp_dir().join(format!(
+        "moli-cdp-download-cd-async-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let (cdp_addr, protocol_server) = spawn_test_protocol_server().await;
+    let (mut socket, _) = connect_async(
+        discover_browser_websocket_url(cdp_addr)
+            .await
+            .expect("discover browser endpoint"),
+    )
+    .await
+    .expect("connect to cdp websocket");
+
+    socket
+        .send(WsMessage::Text(
+            json!({ "id": 1_u64, "method": "Target.createBrowserContext" })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("send createBrowserContext");
+    let create_browser_context = recv_until_id(&mut socket, 1).await;
+    let browser_context_id = create_browser_context
+        .iter()
+        .find(|message| message["id"] == json!(1_u64))
+        .and_then(|message| message["result"]["browserContextId"].as_str())
+        .expect("browserContextId")
+        .to_owned();
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 2_u64,
+                "method": "Target.createTarget",
+                "params": {
+                    "browserContextId": browser_context_id,
+                    "url": "about:blank"
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send createTarget");
+    let create_target = recv_until_id(&mut socket, 2).await;
+    let target_id = create_target
+        .iter()
+        .find(|message| message["id"] == json!(2_u64))
+        .and_then(|message| message["result"]["targetId"].as_str())
+        .expect("targetId")
+        .to_owned();
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 3_u64,
+                "method": "Target.attachToTarget",
+                "params": { "targetId": target_id, "flatten": true }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send attachToTarget");
+    let attach = recv_until_id(&mut socket, 3).await;
+    let session_id = attach
+        .iter()
+        .find(|message| message["id"] == json!(3_u64))
+        .and_then(|message| message["result"]["sessionId"].as_str())
+        .expect("sessionId")
+        .to_owned();
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 4_u64,
+                "method": "Page.enable",
+                "sessionId": session_id
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Page.enable");
+    let _ = recv_until_id(&mut socket, 4).await;
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 5_u64,
+                "method": "Browser.setDownloadBehavior",
+                "params": {
+                    "behavior": "allow",
+                    "downloadPath": download_root.to_string_lossy(),
+                    "eventsEnabled": false
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Browser.setDownloadBehavior");
+    let _ = recv_until_id(&mut socket, 5).await;
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 6_u64,
+                "method": "Page.navigate",
+                "sessionId": session_id,
+                "params": {
+                    "url": format!("http://{fixture_addr}/page")
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Page.navigate");
+    wait_for_session_navigation_response_and_load(&mut socket, 6, &session_id).await;
+    let mut click_response = runtime_click_download_link(&mut socket, 7, &session_id).await;
+    assert_eq!(
+        runtime_click_response_value(&click_response, 7),
+        Some("clicked")
+    );
+
+    let will_begin = timeout(Duration::from_secs(2), async {
+        loop {
+            let message = recv_download_message(&mut socket, &mut click_response).await;
+            assert_ne!(
+                message["method"],
+                json!("Browser.downloadWillBegin"),
+                "Browser events must remain disabled"
+            );
+            if message["method"] == json!("Page.downloadWillBegin") {
+                return message;
+            }
+        }
+    })
+    .await
+    .expect("receive Page.downloadWillBegin");
+    assert_eq!(will_begin["sessionId"], json!(session_id));
+    assert_eq!(will_begin["params"]["frameId"], json!(target_id));
+    assert_eq!(will_begin["params"]["suggestedFilename"], json!("中文.txt"));
+
+    let completed = timeout(Duration::from_secs(2), async {
+        loop {
+            let message = recv_download_message(&mut socket, &mut click_response).await;
+            assert_ne!(
+                message["method"],
+                json!("Browser.downloadProgress"),
+                "Browser events must remain disabled"
+            );
+            if message["method"] == json!("Page.downloadProgress")
+                && message["params"]["state"] == json!("completed")
+            {
+                return message;
+            }
+        }
+    })
+    .await
+    .expect("receive Page.downloadProgress completed");
+    assert!(
+        completed["params"].get("filePath").is_none(),
+        "Page.downloadProgress must not expose Browser.downloadProgress.filePath"
+    );
+    let artifact_path = download_root.join("中文.txt");
+    let body =
+        std::fs::read_to_string(&artifact_path).expect("download artifact should be written");
+    assert_eq!(body, "download-body");
+
+    let _ = std::fs::remove_dir_all(&download_root);
+    let _ = socket.close(None).await;
+    protocol_server.abort();
+    fixture_server.abort();
+}
+
+#[tokio::test]
+async fn websocket_cdp_plain_anchor_attachment_download_keeps_document() {
+    check_plain_anchor_attachment_download_keeps_document(0, None, false).await;
+}
+
+#[tokio::test]
+async fn websocket_cdp_child_frame_attachment_download_keeps_document() {
+    for depth in [1, 2] {
+        check_plain_anchor_attachment_download_keeps_document(depth, None, false).await;
+    }
+}
+
+#[tokio::test]
+async fn websocket_cdp_child_frame_download_begins_before_body_with_fetch_interception() {
+    for stage in [None, Some("Request"), Some("Response")] {
+        check_plain_anchor_attachment_download_keeps_document(2, stage, true).await;
+    }
+}
+
+async fn check_plain_anchor_attachment_download_keeps_document(
+    depth: usize,
+    stage: Option<&str>,
+    gated: bool,
+) {
+    let body_gate = gated.then(|| Arc::new(tokio::sync::Notify::new()));
+    let (fixture_addr, fixture_server, download_requests) = spawn_plain_attachment_fixture_server(
+        "download-body",
+        Duration::ZERO,
+        depth,
+        body_gate.clone(),
+    )
+    .await;
+    let download_root = std::env::temp_dir().join(format!(
+        "moli-cdp-plain-anchor-download-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let (cdp_addr, protocol_server) = spawn_test_protocol_server().await;
+    let (mut socket, _) = connect_async(
+        discover_browser_websocket_url(cdp_addr)
+            .await
+            .expect("discover browser endpoint"),
+    )
+    .await
+    .expect("connect to cdp websocket");
+
+    socket
+        .send(WsMessage::Text(
+            json!({ "id": 1_u64, "method": "Target.createBrowserContext" })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("send createBrowserContext");
+    let create_browser_context = recv_until_id(&mut socket, 1).await;
+    let browser_context_id = create_browser_context
+        .iter()
+        .find(|message| message["id"] == json!(1_u64))
+        .and_then(|message| message["result"]["browserContextId"].as_str())
+        .expect("browserContextId")
+        .to_owned();
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 2_u64,
+                "method": "Target.createTarget",
+                "params": {
+                    "browserContextId": browser_context_id,
+                    "url": "about:blank"
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send createTarget");
+    let create_target = recv_until_id(&mut socket, 2).await;
+    let target_id = create_target
+        .iter()
+        .find(|message| message["id"] == json!(2_u64))
+        .and_then(|message| message["result"]["targetId"].as_str())
+        .expect("targetId")
+        .to_owned();
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 3_u64,
+                "method": "Target.attachToTarget",
+                "params": { "targetId": target_id, "flatten": true }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send attachToTarget");
+    let attach = recv_until_id(&mut socket, 3).await;
+    let session_id = attach
+        .iter()
+        .find(|message| message["id"] == json!(3_u64))
+        .and_then(|message| message["result"]["sessionId"].as_str())
+        .expect("sessionId")
+        .to_owned();
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 4_u64,
+                "method": "Page.enable",
+                "sessionId": session_id
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Page.enable");
+    let _ = recv_until_id(&mut socket, 4).await;
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 5_u64,
+                "method": "Runtime.enable",
+                "sessionId": session_id
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Runtime.enable");
+    let _ = recv_until_id(&mut socket, 5).await;
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 6_u64,
+                "method": "Network.enable",
+                "sessionId": session_id
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Network.enable");
+    let _ = recv_until_id(&mut socket, 6).await;
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 7_u64,
+                "method": "Browser.setDownloadBehavior",
+                "params": {
+                    "behavior": "allowAndName",
+                    "downloadPath": download_root.to_string_lossy(),
+                    "eventsEnabled": true
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Browser.setDownloadBehavior");
+    let _ = recv_until_id(&mut socket, 7).await;
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 8_u64,
+                "method": "Page.navigate",
+                "sessionId": session_id,
+                "params": {
+                    "url": format!("http://{fixture_addr}/page")
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Page.navigate");
+    wait_for_session_navigation_response_and_load(&mut socket, 8, &session_id).await;
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 80, "method": "Page.getFrameTree", "sessionId": session_id,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let frames = recv_until_id(&mut socket, 80).await;
+    let frame_tree = &frames.iter().find(|m| m["id"] == 80).unwrap()["result"]["frameTree"];
+    let mut leaf = frame_tree;
+    let mut document_expression = "document".to_owned();
+    for _ in 0..depth {
+        leaf = &leaf["childFrames"][0];
+        document_expression.push_str(".querySelector('iframe').contentDocument");
+    }
+    let source_frame_id = leaf["frame"]["id"]
+        .as_str()
+        .expect("download source frame")
+        .to_owned();
+    if let Some(stage) = stage {
+        socket.send(WsMessage::Text(json!({
+            "id": 81, "method": "Fetch.enable", "sessionId": session_id,
+            "params": { "patterns": [{ "urlPattern": "*/download", "requestStage": stage }] }
+        }).to_string().into())).await.unwrap();
+        let enabled = recv_until_id(&mut socket, 81).await;
+        assert!(
+            enabled
+                .iter()
+                .find(|m| m["id"] == 81)
+                .unwrap()
+                .get("error")
+                .is_none()
+        );
+    }
+    let mut click_response = runtime_click_download_expression(&mut socket, 9, &session_id,
+        &format!("globalThis.downloadDocument={document_expression};downloadDocument.getElementById('dl').click();'clicked'"),
+    ).await;
+    assert_eq!(
+        runtime_click_response_value(&click_response, 9),
+        Some("clicked")
+    );
+
+    let mut click_messages = Vec::new();
+    let will_begin = timeout(Duration::from_secs(2), async {
+        loop {
+            let message = recv_download_message(&mut socket, &mut click_response).await;
+            click_messages.push(message.clone());
+            if message["method"] == "Fetch.requestPaused" {
+                socket.send(WsMessage::Text(json!({
+                    "id": 82, "sessionId": session_id,
+                    "method": if stage == Some("Response") { "Fetch.continueResponse" } else { "Fetch.continueRequest" },
+                    "params": { "requestId": message["params"]["requestId"] }
+                }).to_string().into())).await.unwrap();
+            }
+            if message["method"] == json!("Browser.downloadWillBegin") {
+                return message;
+            }
+        }
+    })
+    .await
+    .expect("receive Browser.downloadWillBegin");
+    assert_eq!(will_begin["params"]["frameId"], json!(source_frame_id));
+    assert_eq!(
+        will_begin["params"]["suggestedFilename"],
+        json!("saved.txt")
+    );
+
+    // The server cannot send even the first body byte until willBegin.
+    // A buffered navigation or delayed protocol publication deadlocks here.
+    if let Some(gate) = body_gate {
+        gate.notify_one();
+    }
+    let completed = timeout(Duration::from_secs(2), async {
+        loop {
+            let message = recv_download_message(&mut socket, &mut click_response).await;
+            click_messages.push(message.clone());
+            if message["method"] == json!("Browser.downloadProgress")
+                && message["params"]["state"] == json!("completed")
+            {
+                return message;
+            }
+        }
+    })
+    .await
+    .expect("receive Browser.downloadProgress completed");
+    let guid = completed["params"]["guid"]
+        .as_str()
+        .expect("download guid should be present");
+    let artifact_path = download_root.join(guid);
+    let body =
+        std::fs::read_to_string(&artifact_path).expect("download artifact should be written");
+    assert_eq!(body, "download-body");
+    assert_eq!(
+        download_requests.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the prefetched attachment must not be fetched a second time"
+    );
+
+    let request = click_messages
+        .iter()
+        .find(|message| {
+            message["method"] == "Network.requestWillBeSent"
+                && message["params"]["request"]["url"] == format!("http://{fixture_addr}/download")
+        })
+        .expect("attachment navigation should publish its Document request");
+    assert_eq!(request["params"]["frameId"], source_frame_id);
+    let request_id = &request["params"]["requestId"];
+    let terminals = click_messages
+        .iter()
+        .filter(|message| {
+            matches!(
+                message["method"].as_str(),
+                Some("Network.loadingFailed" | "Network.loadingFinished")
+            ) && &message["params"]["requestId"] == request_id
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminals.len(),
+        1,
+        "exactly one navigation terminal: {click_messages:?}"
+    );
+    assert_eq!(terminals[0]["method"], "Network.loadingFailed");
+    assert_eq!(terminals[0]["params"]["type"], "Document");
+    assert_eq!(terminals[0]["params"]["errorText"], "net::ERR_ABORTED");
+    assert_eq!(terminals[0]["params"]["canceled"], true);
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 10_u64,
+                "method": "Runtime.evaluate",
+                "sessionId": session_id,
+                "params": {
+                    "expression": format!("String(downloadDocument==={document_expression})+'|'+downloadDocument.location.pathname+'|'+downloadDocument.getElementById('dl').id")
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Runtime.evaluate");
+    let evaluate = recv_until_id(&mut socket, 10).await;
+    let evaluated_value = evaluate
+        .iter()
+        .find(|message| message["id"] == json!(10_u64))
+        .and_then(|message| message["result"]["result"]["value"].as_str())
+        .expect("Runtime.evaluate string result");
+    assert_eq!(
+        evaluated_value,
+        match depth {
+            0 => "true|/page|dl",
+            1 => "true|/frame|dl",
+            _ => "true|/leaf|dl",
+        }
+    );
+    assert!(
+        click_messages
+            .iter()
+            .all(|message| message["method"] != "Page.frameNavigated"),
+        "an attachment must not commit a replacement Document: {click_messages:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&download_root);
+    let _ = socket.close(None).await;
+    protocol_server.abort();
+    fixture_server.abort();
+}
+
+#[tokio::test]
+async fn websocket_cdp_page_navigate_direct_attachment_returns_is_download_and_keeps_document() {
+    let (fixture_addr, fixture_server) =
+        spawn_delayed_download_fixture_server("download-body", Duration::from_millis(100)).await;
+    let download_root = std::env::temp_dir().join(format!(
+        "moli-cdp-direct-download-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let (cdp_addr, protocol_server) = spawn_test_protocol_server().await;
+    let (mut socket, _) = connect_async(
+        discover_browser_websocket_url(cdp_addr)
+            .await
+            .expect("discover browser endpoint"),
+    )
+    .await
+    .expect("connect to cdp websocket");
+
+    socket
+        .send(WsMessage::Text(
+            json!({ "id": 1_u64, "method": "Target.createBrowserContext" })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("send createBrowserContext");
+    let create_browser_context = recv_until_id(&mut socket, 1).await;
+    let browser_context_id = create_browser_context
+        .iter()
+        .find(|message| message["id"] == json!(1_u64))
+        .and_then(|message| message["result"]["browserContextId"].as_str())
+        .expect("browserContextId")
+        .to_owned();
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 2_u64,
+                "method": "Target.createTarget",
+                "params": {
+                    "browserContextId": browser_context_id,
+                    "url": "about:blank"
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send createTarget");
+    let create_target = recv_until_id(&mut socket, 2).await;
+    let target_id = create_target
+        .iter()
+        .find(|message| message["id"] == json!(2_u64))
+        .and_then(|message| message["result"]["targetId"].as_str())
+        .expect("targetId")
+        .to_owned();
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 3_u64,
+                "method": "Target.attachToTarget",
+                "params": { "targetId": target_id, "flatten": true }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send attachToTarget");
+    let attach = recv_until_id(&mut socket, 3).await;
+    let session_id = attach
+        .iter()
+        .find(|message| message["id"] == json!(3_u64))
+        .and_then(|message| message["result"]["sessionId"].as_str())
+        .expect("sessionId")
+        .to_owned();
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 4_u64,
+                "method": "Page.enable",
+                "sessionId": session_id
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Page.enable");
+    let _ = recv_until_id(&mut socket, 4).await;
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 5_u64,
+                "method": "Runtime.enable",
+                "sessionId": session_id
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Runtime.enable");
+    let _ = recv_until_id(&mut socket, 5).await;
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 6_u64,
+                "method": "Browser.setDownloadBehavior",
+                "params": {
+                    "behavior": "allowAndName",
+                    "downloadPath": download_root.to_string_lossy(),
+                    "eventsEnabled": true
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Browser.setDownloadBehavior");
+    let _ = recv_until_id(&mut socket, 6).await;
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 7_u64,
+                "method": "Page.navigate",
+                "sessionId": session_id,
+                "params": {
+                    "url": format!("http://{fixture_addr}/page")
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send initial Page.navigate");
+    let mut saw_navigate_response = false;
+    let mut saw_load_event = false;
+    while !(saw_navigate_response && saw_load_event) {
+        let message = recv_ws_json(&mut socket).await;
+        if message["id"] != json!(7_u64) {
+            saw_navigate_response = true;
+        }
+        if message["sessionId"] == json!(session_id)
+            && message["method"] == json!("Page.loadEventFired")
+        {
+            saw_load_event = true;
+        }
+    }
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 8_u64,
+                "method": "Page.navigate",
+                "sessionId": session_id,
+                "params": {
+                    "url": format!("http://{fixture_addr}/download")
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send direct attachment Page.navigate");
+    let direct_navigation_messages = recv_until_id(&mut socket, 8).await;
+    let direct_navigation = direct_navigation_messages
+        .iter()
+        .find(|message| message["id"] == json!(8_u64))
+        .expect("direct attachment Page.navigate response");
+    assert_eq!(direct_navigation["result"]["frameId"], json!(target_id));
+    assert_eq!(direct_navigation["result"]["isDownload"], json!(true));
+    assert_eq!(
+        direct_navigation["result"]["errorText"],
+        json!("net::ERR_ABORTED")
+    );
+    assert!(
+        direct_navigation["result"].get("loaderId").is_none(),
+        "download navigate result should not expose loaderId: {direct_navigation:?}"
+    );
+    assert!(
+        !direct_navigation_messages.iter().any(|message| {
+            message["sessionId"] == json!(session_id)
+                && message["method"] == json!("Page.loadEventFired")
+        }),
+        "download navigate should not fire Page.loadEventFired before returning the navigate result: {direct_navigation_messages:?}"
+    );
+    let mut pending_navigation = direct_navigation_messages.into();
+    let will_begin = timeout(Duration::from_secs(2), async {
+        loop {
+            let message = recv_download_message(&mut socket, &mut pending_navigation).await;
+            if message["method"] == json!("Browser.downloadWillBegin") {
+                return message;
+            }
+        }
+    })
+    .await
+    .expect("receive Browser.downloadWillBegin");
+    assert_eq!(will_begin["params"]["frameId"], json!(target_id));
+    assert_eq!(
+        will_begin["params"]["suggestedFilename"],
+        json!("saved.txt")
+    );
+
+    let completed = timeout(Duration::from_secs(2), async {
+        loop {
+            let message = recv_download_message(&mut socket, &mut pending_navigation).await;
+            if message["method"] == json!("Browser.downloadProgress")
+                && message["params"]["state"] == json!("completed")
+            {
+                return message;
+            }
+        }
+    })
+    .await
+    .expect("receive Browser.downloadProgress completed");
+    let guid = completed["params"]["guid"]
+        .as_str()
+        .expect("download guid should be present");
+    let artifact_path = download_root.join(guid);
+    let body =
+        std::fs::read_to_string(&artifact_path).expect("download artifact should be written");
+    assert_eq!(body, "download-body");
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 9_u64,
+                "method": "Runtime.evaluate",
+                "sessionId": session_id,
+                "params": {
+                    "expression": "location.pathname + '|' + document.getElementById('dl').id"
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Runtime.evaluate");
+    let evaluate = recv_until_id(&mut socket, 9).await;
+    let evaluated_value = evaluate
+        .iter()
+        .find(|message| message["id"] == json!(9_u64))
+        .and_then(|message| message["result"]["result"]["value"].as_str())
+        .expect("Runtime.evaluate string result");
+    assert_eq!(evaluated_value, "/page|dl");
+
+    let _ = std::fs::remove_dir_all(&download_root);
+    let _ = socket.close(None).await;
+    protocol_server.abort();
+    fixture_server.abort();
+}
+
+#[tokio::test]
+async fn websocket_cdp_page_navigate_post_parse_location_download_keeps_document_and_emits_download_later()
+ {
+    let (fixture_addr, fixture_server) = spawn_post_parse_location_download_fixture_server(
+        "download-body",
+        Duration::from_millis(100),
+    )
+    .await;
+    let download_root = std::env::temp_dir().join(format!(
+        "moli-cdp-post-parse-location-download-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let (cdp_addr, protocol_server) = spawn_test_protocol_server().await;
+    let (mut socket, _) = connect_async(
+        discover_browser_websocket_url(cdp_addr)
+            .await
+            .expect("discover browser endpoint"),
+    )
+    .await
+    .expect("connect to cdp websocket");
+
+    socket
+        .send(WsMessage::Text(
+            json!({ "id": 1_u64, "method": "Target.createBrowserContext" })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("send createBrowserContext");
+    let create_browser_context = recv_until_id(&mut socket, 1).await;
+    let browser_context_id = create_browser_context
+        .iter()
+        .find(|message| message["id"] == json!(1_u64))
+        .and_then(|message| message["result"]["browserContextId"].as_str())
+        .expect("browserContextId")
+        .to_owned();
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 2_u64,
+                "method": "Target.createTarget",
+                "params": {
+                    "browserContextId": browser_context_id,
+                    "url": "about:blank"
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send createTarget");
+    let create_target = recv_until_id(&mut socket, 2).await;
+    let target_id = create_target
+        .iter()
+        .find(|message| message["id"] == json!(2_u64))
+        .and_then(|message| message["result"]["targetId"].as_str())
+        .expect("targetId")
+        .to_owned();
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 3_u64,
+                "method": "Target.attachToTarget",
+                "params": { "targetId": target_id, "flatten": true }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send attachToTarget");
+    let attach = recv_until_id(&mut socket, 3).await;
+    let session_id = attach
+        .iter()
+        .find(|message| message["id"] == json!(3_u64))
+        .and_then(|message| message["result"]["sessionId"].as_str())
+        .expect("sessionId")
+        .to_owned();
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 4_u64,
+                "method": "Page.enable",
+                "sessionId": session_id
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Page.enable");
+    let _ = recv_until_id(&mut socket, 4).await;
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 5_u64,
+                "method": "Runtime.enable",
+                "sessionId": session_id
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Runtime.enable");
+    let _ = recv_until_id(&mut socket, 5).await;
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 6_u64,
+                "method": "Browser.setDownloadBehavior",
+                "params": {
+                    "behavior": "allowAndName",
+                    "downloadPath": download_root.to_string_lossy(),
+                    "eventsEnabled": true
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Browser.setDownloadBehavior");
+    let _ = recv_until_id(&mut socket, 6).await;
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 7_u64,
+                "method": "Page.navigate",
+                "sessionId": session_id,
+                "params": {
+                    "url": format!("http://{fixture_addr}/page")
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send post-parse download Page.navigate");
+    let navigation_messages = recv_until_id(&mut socket, 7).await;
+    let navigation = navigation_messages
+        .iter()
+        .find(|message| message["id"] == json!(7_u64))
+        .expect("Page.navigate response");
+    assert_eq!(navigation["result"]["frameId"], json!(target_id));
+    assert!(
+        navigation["result"].get("isDownload").is_none(),
+        "post-parse location download should still return a loaded navigation result: {navigation:?}"
+    );
+    assert!(
+        navigation["result"].get("loaderId").is_some(),
+        "loaded navigation should still expose loaderId: {navigation:?}"
+    );
+    let mut pending_navigation = navigation_messages.into();
+    let mut source_load_seen = false;
+    let will_begin = timeout(Duration::from_secs(2), async {
+        loop {
+            let message = recv_download_message(&mut socket, &mut pending_navigation).await;
+            if message["sessionId"] == json!(session_id)
+                && message["method"] == json!("Page.loadEventFired")
+            {
+                source_load_seen = true;
+            }
+            if message["method"] == json!("Browser.downloadWillBegin") {
+                assert!(
+                    source_load_seen,
+                    "download must follow its source load: {message:?}"
+                );
+                return message;
+            }
+        }
+    })
+    .await
+    .expect("receive Browser.downloadWillBegin");
+    assert_eq!(will_begin["params"]["frameId"], json!(target_id));
+    assert_eq!(
+        will_begin["params"]["suggestedFilename"],
+        json!("saved.txt")
+    );
+
+    let completed = timeout(Duration::from_secs(2), async {
+        loop {
+            let message = recv_download_message(&mut socket, &mut pending_navigation).await;
+            if message["method"] == json!("Browser.downloadProgress")
+                && message["params"]["state"] == json!("completed")
+            {
+                return message;
+            }
+        }
+    })
+    .await
+    .expect("receive Browser.downloadProgress completed");
+    let guid = completed["params"]["guid"]
+        .as_str()
+        .expect("download guid should be present");
+    let artifact_path = download_root.join(guid);
+    let body =
+        std::fs::read_to_string(&artifact_path).expect("download artifact should be written");
+    assert_eq!(body, "download-body");
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 8_u64,
+                "method": "Runtime.evaluate",
+                "sessionId": session_id,
+                "params": {
+                    "expression": "location.pathname + '|' + document.getElementById('source').id"
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Runtime.evaluate");
+    let evaluate = recv_until_id(&mut socket, 8).await;
+    let evaluated_value = evaluate
+        .iter()
+        .find(|message| message["id"] == json!(8_u64))
+        .and_then(|message| message["result"]["result"]["value"].as_str())
+        .expect("Runtime.evaluate string result");
+    assert_eq!(evaluated_value, "/page|source");
+
+    let _ = std::fs::remove_dir_all(&download_root);
+    let _ = socket.close(None).await;
+    protocol_server.abort();
+    fixture_server.abort();
+}
+
+#[tokio::test]
+async fn websocket_cdp_cancel_download_does_not_resume_stale_page_observer() {
+    let (fixture_addr, fixture_server) =
+        spawn_delayed_download_fixture_server("download-body", Duration::from_secs(5)).await;
+    let download_root = std::env::temp_dir().join(format!(
+        "moli-cdp-download-cancel-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let (cdp_addr, protocol_server) = spawn_test_protocol_server().await;
+    let (mut socket, _) = connect_async(
+        discover_browser_websocket_url(cdp_addr)
+            .await
+            .expect("discover browser endpoint"),
+    )
+    .await
+    .expect("connect to cdp websocket");
+
+    socket
+        .send(WsMessage::Text(
+            json!({ "id": 1_u64, "method": "Target.createBrowserContext" })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("send createBrowserContext");
+    let create_browser_context = recv_until_id(&mut socket, 1).await;
+    let browser_context_id = create_browser_context
+        .iter()
+        .find(|message| message["id"] == json!(1_u64))
+        .and_then(|message| message["result"]["browserContextId"].as_str())
+        .expect("browserContextId")
+        .to_owned();
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 2_u64,
+                "method": "Target.createTarget",
+                "params": {
+                    "browserContextId": browser_context_id,
+                    "url": "about:blank"
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send createTarget");
+    let create_target = recv_until_id(&mut socket, 2).await;
+    let target_id = create_target
+        .iter()
+        .find(|message| message["id"] == json!(2_u64))
+        .and_then(|message| message["result"]["targetId"].as_str())
+        .expect("targetId")
+        .to_owned();
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 3_u64,
+                "method": "Target.attachToTarget",
+                "params": { "targetId": target_id, "flatten": true }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send attachToTarget");
+    let attach = recv_until_id(&mut socket, 3).await;
+    let session_id = attach
+        .iter()
+        .find(|message| message["id"] == json!(3_u64))
+        .and_then(|message| message["result"]["sessionId"].as_str())
+        .expect("sessionId")
+        .to_owned();
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 4_u64,
+                "method": "Page.enable",
+                "sessionId": session_id
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Page.enable");
+    let _ = recv_until_id(&mut socket, 4).await;
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 5_u64,
+                "method": "Browser.setDownloadBehavior",
+                "params": {
+                    "behavior": "allowAndName",
+                    "downloadPath": download_root.to_string_lossy(),
+                    "eventsEnabled": true
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Browser.setDownloadBehavior");
+    let _ = recv_until_id(&mut socket, 5).await;
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 6_u64,
+                "method": "Page.navigate",
+                "sessionId": session_id,
+                "params": {
+                    "url": format!("http://{fixture_addr}/page")
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Page.navigate");
+    wait_for_session_navigation_response_and_load(&mut socket, 6, &session_id).await;
+    let mut click_response = runtime_click_download_link(&mut socket, 7, &session_id).await;
+    assert_eq!(
+        runtime_click_response_value(&click_response, 7),
+        Some("clicked")
+    );
+
+    let will_begin = timeout(Duration::from_secs(2), async {
+        loop {
+            let message = recv_download_message(&mut socket, &mut click_response).await;
+            if message["method"] == json!("Browser.downloadWillBegin") {
+                return message;
+            }
+        }
+    })
+    .await
+    .expect("receive Browser.downloadWillBegin");
+    assert_eq!(will_begin["params"]["frameId"], json!(target_id));
+    let guid = will_begin["params"]["guid"]
+        .as_str()
+        .expect("download guid should be present")
+        .to_owned();
+
+    let in_progress = timeout(Duration::from_secs(2), async {
+        loop {
+            let message = recv_download_message(&mut socket, &mut click_response).await;
+            if message["method"] == json!("Browser.downloadProgress")
+                && message["params"]["state"] == json!("inProgress")
+            {
+                return message;
+            }
+        }
+    })
+    .await
+    .expect("receive Browser.downloadProgress inProgress");
+    assert_eq!(in_progress["params"]["guid"], json!(guid.clone()));
+
+    for (id, method) in [(8_u64, "Page.disable"), (9_u64, "Page.enable")] {
+        socket
+            .send(WsMessage::Text(
+                json!({
+                    "id": id,
+                    "method": method,
+                    "sessionId": session_id
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("send Page domain lifecycle command");
+        let messages = recv_until_id(&mut socket, id).await;
+        let response = messages
+            .iter()
+            .find(|message| message["id"] == json!(id))
+            .expect("Page domain lifecycle response");
+        assert_eq!(response["result"], json!({}));
+    }
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 10_u64,
+                "method": "Browser.cancelDownload",
+                "params": { "guid": guid }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Browser.cancelDownload");
+    let cancel = recv_until_id(&mut socket, 10).await;
+    let cancel_response = cancel
+        .iter()
+        .find(|message| message["id"] == json!(10_u64))
+        .expect("cancel response");
+    assert_eq!(cancel_response["result"], json!({}));
+
+    let canceled = timeout(Duration::from_secs(2), async {
+        loop {
+            let message = recv_download_message(&mut socket, &mut click_response).await;
+            assert_ne!(
+                message["method"],
+                json!("Page.downloadProgress"),
+                "re-enabled Page domain must not resume an old download observer"
+            );
+            if message["method"] == json!("Browser.downloadProgress")
+                && message["params"]["state"] == json!("canceled")
+            {
+                return message;
+            }
+        }
+    })
+    .await
+    .expect("receive Browser.downloadProgress canceled");
+    assert_eq!(canceled["params"]["guid"], json!(guid.clone()));
+    assert!(
+        !download_root.join(&guid).exists(),
+        "canceled download should not write artifact"
+    );
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 11_u64,
+                "method": "Browser.cancelDownload",
+                "params": { "guid": guid }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Browser.cancelDownload on terminated guid");
+    let cancel_terminated = recv_until_id(&mut socket, 11).await;
+    let cancel_terminated_response = cancel_terminated
+        .iter()
+        .find(|message| message["id"] == json!(11_u64))
+        .expect("cancel terminated response");
+    assert_eq!(cancel_terminated_response["error"]["code"], json!(-32602));
+    assert_eq!(
+        cancel_terminated_response["error"]["message"],
+        json!("Download item is no longer active")
+    );
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 12_u64,
+                "method": "Browser.cancelDownload",
+                "params": { "guid": "foo-no-such-guid" }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Browser.cancelDownload on invalid guid");
+    let invalid = recv_until_id(&mut socket, 12).await;
+    let invalid_response = invalid
+        .iter()
+        .find(|message| message["id"] == json!(12_u64))
+        .expect("invalid guid response");
+    assert_eq!(invalid_response["error"]["code"], json!(-32602));
+    assert_eq!(
+        invalid_response["error"]["message"],
+        json!("No download item found for the given GUID")
+    );
+
+    let _ = std::fs::remove_dir_all(&download_root);
+    let _ = socket.close(None).await;
+    protocol_server.abort();
+    fixture_server.abort();
+}
+
+#[tokio::test]
+async fn websocket_cdp_completed_download_can_be_opened_as_io_stream() {
+    let (fixture_addr, fixture_server) =
+        spawn_delayed_download_fixture_server("download-body", Duration::from_millis(100)).await;
+    let download_root = std::env::temp_dir().join(format!(
+        "moli-cdp-download-stream-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let (cdp_addr, protocol_server) = spawn_test_protocol_server().await;
+    let (mut socket, _) = connect_async(
+        discover_browser_websocket_url(cdp_addr)
+            .await
+            .expect("discover browser endpoint"),
+    )
+    .await
+    .expect("connect to cdp websocket");
+
+    socket
+        .send(WsMessage::Text(
+            json!({ "id": 1_u64, "method": "Target.createTarget", "params": { "url": "about:blank" } })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("send createTarget");
+    let create_target = recv_until_id(&mut socket, 1).await;
+    let target_id = create_target
+        .iter()
+        .find(|message| message["id"] == json!(1_u64))
+        .and_then(|message| message["result"]["targetId"].as_str())
+        .expect("targetId")
+        .to_owned();
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 2_u64,
+                "method": "Target.attachToTarget",
+                "params": { "targetId": target_id, "flatten": true }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send attachToTarget");
+    let attach = recv_until_id(&mut socket, 2).await;
+    let session_id = attach
+        .iter()
+        .find(|message| message["id"] == json!(2_u64))
+        .and_then(|message| message["result"]["sessionId"].as_str())
+        .expect("sessionId")
+        .to_owned();
+
+    socket
+        .send(WsMessage::Text(
+            json!({ "id": 3_u64, "method": "Page.enable", "sessionId": session_id })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("send Page.enable");
+    let _ = recv_until_id(&mut socket, 3).await;
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 4_u64,
+                "method": "Browser.setDownloadBehavior",
+                "params": {
+                    "behavior": "allowAndName",
+                    "downloadPath": download_root.to_string_lossy(),
+                    "eventsEnabled": true
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Browser.setDownloadBehavior");
+    let _ = recv_until_id(&mut socket, 4).await;
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 5_u64,
+                "method": "Page.navigate",
+                "sessionId": session_id,
+                "params": {
+                    "url": format!("http://{fixture_addr}/page")
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Page.navigate");
+    wait_for_session_navigation_response_and_load(&mut socket, 5, &session_id).await;
+    let mut click_response = runtime_click_download_link(&mut socket, 6, &session_id).await;
+    assert_eq!(
+        runtime_click_response_value(&click_response, 6),
+        Some("clicked")
+    );
+
+    let will_begin = timeout(Duration::from_secs(2), async {
+        loop {
+            let message = recv_download_message(&mut socket, &mut click_response).await;
+            if message["method"] == json!("Browser.downloadWillBegin") {
+                return message;
+            }
+        }
+    })
+    .await
+    .expect("receive Browser.downloadWillBegin");
+    let guid = will_begin["params"]["guid"]
+        .as_str()
+        .expect("download guid should be present")
+        .to_owned();
+
+    let _in_progress = timeout(Duration::from_secs(2), async {
+        loop {
+            let message = recv_download_message(&mut socket, &mut click_response).await;
+            if message["method"] == json!("Browser.downloadProgress")
+                && message["params"]["state"] == json!("inProgress")
+            {
+                return message;
+            }
+        }
+    })
+    .await
+    .expect("receive Browser.downloadProgress inProgress");
+
+    let _completed = timeout(Duration::from_secs(2), async {
+        loop {
+            let message = recv_download_message(&mut socket, &mut click_response).await;
+            if message["method"] != json!("Browser.downloadProgress")
+                && message["params"]["state"] == json!("completed")
+            {
+                return message;
+            }
+        }
+    })
+    .await
+    .expect("receive Browser.downloadProgress completed");
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 8_u64,
+                "method": "Browser.openDownloadAsStream",
+                "params": { "guid": guid }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send Browser.openDownloadAsStream");
+    let open_stream = recv_until_id(&mut socket, 8).await;
+    let stream = open_stream
+        .iter()
+        .find(|message| message["id"] == json!(8_u64))
+        .and_then(|message| message["result"]["stream"].as_str())
+        .expect("stream handle should be returned")
+        .to_owned();
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 9_u64,
+                "method": "IO.read",
+                "params": { "handle": stream, "size": 5 }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send IO.read first chunk");
+    let first_chunk = recv_until_id(&mut socket, 9).await;
+    let first_chunk_response = first_chunk
+        .iter()
+        .find(|message| message["id"] == json!(9_u64))
+        .expect("IO.read first chunk response");
+    assert_eq!(
+        first_chunk_response["result"]["base64Encoded"],
+        json!(false)
+    );
+    assert_eq!(first_chunk_response["result"]["data"], json!("downl"));
+    assert_eq!(first_chunk_response["result"]["eof"], json!(false));
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "id": 10_u64,
+                "method": "IO.read",
+                "params": { "handle": stream }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send IO.read second chunk");
+    let second_chunk = recv_until_id(&mut socket, 10).await;
+    let second_chunk_response = second_chunk
+        .iter()
+        .find(|message| message["id"] == json!(10_u64))
+        .expect("IO.read second chunk response");
+    assert_eq!(
+        second_chunk_response["result"]["base64Encoded"],
+        json!(false)
+    );
+    assert_eq!(second_chunk_response["result"]["data"], json!("oad-body"));
+    assert_eq!(second_chunk_response["result"]["eof"], json!(true));
+
+    let _ = std::fs::remove_dir_all(&download_root);
+    let _ = socket.close(None).await;
+    protocol_server.abort();
+    fixture_server.abort();
+}

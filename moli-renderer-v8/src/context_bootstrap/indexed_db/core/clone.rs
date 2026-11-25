@@ -1,0 +1,593 @@
+use super::*;
+use crate::context_bootstrap::indexed_db::{
+    indexed_db_transaction_status, update_indexed_db_transaction_status,
+};
+use crate::structured_clone::{
+    HOST_OBJECT_TAG_DOM_EXCEPTION, HOST_OBJECT_TAG_QUOTA_EXCEEDED_ERROR,
+    read_dom_exception_payload, read_quota_exceeded_error_payload, write_dom_exception_payload,
+    write_quota_exceeded_error_payload,
+};
+use crate::structured_clone::{
+    HOST_OBJECT_TAG_GEOMETRY, read_geometry_clone_object, write_geometry_clone_object,
+};
+use crate::{
+    context_bootstrap::{
+        FileSystemHandleDurablePayload, build_file_system_handle_from_durable_payload,
+        file_system_handle_clone_payload_from_object,
+        file_system_handle_durable_payload_from_object, image_data_clone_payload_from_object,
+    },
+    structured_clone::{
+        BlobClonePayload, HOST_OBJECT_TAG_BLOB, HOST_OBJECT_TAG_CRYPTO_KEY,
+        HOST_OBJECT_TAG_FILE_SYSTEM_HANDLE, HOST_OBJECT_TAG_IMAGE_DATA,
+        blob_clone_payload_from_object, read_crypto_key_payload, read_image_data_payload,
+        write_crypto_key_payload, write_image_data_payload,
+    },
+};
+use crate::{
+    context_bootstrap::{
+        build_web_transport_error_from_clone_payload, web_transport_error_clone_payload_from_object,
+    },
+    structured_clone::{
+        HOST_OBJECT_TAG_WEB_TRANSPORT_ERROR, read_web_transport_error_payload,
+        write_web_transport_error_payload,
+    },
+};
+use moli_indexeddb::{IndexedDbFileSystemHandleBucket, IndexedDbFileSystemHandleKind};
+use std::{cell::RefCell, rc::Rc};
+
+struct IndexedDbStructuredCloneSerializer {
+    external_objects: Rc<RefCell<Vec<IndexedDbExternalObject>>>,
+}
+
+impl v8::ValueSerializerImpl for IndexedDbStructuredCloneSerializer {
+    fn throw_data_clone_error<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        message: v8::Local<'s, v8::String>,
+    ) {
+        let message = message.to_rust_string_lossy(scope);
+        let exception = dom_exception_value(scope, &message, "DataCloneError");
+        scope.throw_exception(exception);
+    }
+
+    fn has_custom_host_object(&self, _isolate: &v8::Isolate) -> bool {
+        true
+    }
+
+    fn is_host_object<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        object: v8::Local<'s, v8::Object>,
+    ) -> Option<bool> {
+        Some(moli_webapi_declare::web_api_object_type(scope, object).is_some())
+    }
+
+    fn write_host_object<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        object: v8::Local<'s, v8::Object>,
+        serializer: &dyn v8::ValueSerializerHelper,
+    ) -> Option<bool> {
+        match moli_webapi_declare::web_api_object_type(scope, object).map(|kind| kind.name()) {
+            Some("DOMException")
+                if write_dom_exception_payload(scope, object, serializer).is_some() =>
+            {
+                return Some(true);
+            }
+            Some("QuotaExceededError")
+                if write_quota_exceeded_error_payload(scope, object, serializer).is_some() =>
+            {
+                return Some(true);
+            }
+            Some(
+                "DOMPoint" | "DOMPointReadOnly" | "DOMRect" | "DOMRectReadOnly" | "DOMQuad"
+                | "DOMMatrix" | "DOMMatrixReadOnly",
+            ) => {
+                return write_geometry_clone_object(scope, object, serializer);
+            }
+            Some("WebTransportError") => {
+                if let Some(payload) = web_transport_error_clone_payload_from_object(scope, object)
+                {
+                    write_web_transport_error_payload(serializer, &payload);
+                    return Some(true);
+                }
+            }
+            Some("EncodedVideoChunk") => {
+                let exception = dom_exception_value(
+                    scope,
+                    "EncodedVideoChunk cannot be stored.",
+                    "DataCloneError",
+                );
+                scope.throw_exception(exception);
+                return None;
+            }
+            Some("CryptoKey") => {
+                if write_crypto_key_payload(scope, object, serializer).is_some() {
+                    return Some(true);
+                }
+            }
+            Some("Blob" | "File") => {
+                if let Some(payload) = blob_clone_payload_from_object(scope, object) {
+                    let mut external_objects = self.external_objects.borrow_mut();
+                    let Ok(index) = u32::try_from(external_objects.len()) else {
+                        drop(external_objects);
+                        let exception = dom_exception_value(
+                            scope,
+                            "Too many external objects in IndexedDB structured clone.",
+                            "DataCloneError",
+                        );
+                        scope.throw_exception(exception);
+                        return None;
+                    };
+                    external_objects.push(indexed_db_external_object_from_blob_payload(payload));
+                    serializer.write_uint32(HOST_OBJECT_TAG_BLOB);
+                    serializer.write_uint32(index);
+                    return Some(true);
+                }
+            }
+            Some("ImageData") => {
+                if let Some(payload) = image_data_clone_payload_from_object(scope, object) {
+                    write_image_data_payload(serializer, payload);
+                    return Some(true);
+                }
+            }
+            Some("FileSystemFileHandle" | "FileSystemDirectoryHandle")
+                if file_system_handle_clone_payload_from_object(scope, object).is_some() =>
+            {
+                let Some(payload) = file_system_handle_durable_payload_from_object(scope, object)
+                else {
+                    let exception = dom_exception_value(
+                        scope,
+                        "FileSystemHandle is not authorized for this IndexedDB storage scope.",
+                        "DataCloneError",
+                    );
+                    scope.throw_exception(exception);
+                    return None;
+                };
+                let mut external_objects = self.external_objects.borrow_mut();
+                let Ok(index) = u32::try_from(external_objects.len()) else {
+                    drop(external_objects);
+                    let exception = dom_exception_value(
+                        scope,
+                        "Too many external objects in IndexedDB structured clone.",
+                        "DataCloneError",
+                    );
+                    scope.throw_exception(exception);
+                    return None;
+                };
+                external_objects.push(indexed_db_external_object_from_file_system_handle(payload));
+                serializer.write_uint32(HOST_OBJECT_TAG_FILE_SYSTEM_HANDLE);
+                serializer.write_uint32(index);
+                return Some(true);
+            }
+            _ => {}
+        }
+        let exception = dom_exception_value(
+            scope,
+            "Unsupported host object during IndexedDB structured clone.",
+            "DataCloneError",
+        );
+        scope.throw_exception(exception);
+        None
+    }
+
+    fn get_shared_array_buffer_id<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        _buffer: v8::Local<'s, v8::SharedArrayBuffer>,
+    ) -> Option<u32> {
+        let exception = dom_exception_value(
+            scope,
+            "SharedArrayBuffer could not be cloned.",
+            "DataCloneError",
+        );
+        scope.throw_exception(exception);
+        None
+    }
+
+    fn get_wasm_module_transfer_id(
+        &self,
+        scope: &mut v8::PinScope<'_, '_>,
+        _module: v8::Local<v8::WasmModuleObject>,
+    ) -> Option<u32> {
+        let exception = dom_exception_value(
+            scope,
+            "A WebAssembly.Module can not be serialized for storage.",
+            "DataCloneError",
+        );
+        scope.throw_exception(exception);
+        None
+    }
+}
+
+#[derive(Default)]
+struct DecodedObjects {
+    error: Option<IndexedDbError>,
+    blobs: Vec<moli_file_api::BlobId>,
+}
+
+impl DecodedObjects {
+    fn reserve_blob(&mut self) -> Option<()> {
+        if self.error.is_some() {
+            return None;
+        }
+        if let Err(error) = self.blobs.try_reserve(1) {
+            self.error = Some(IndexedDbError::Resource(error.to_string()));
+            return None;
+        }
+        Some(())
+    }
+}
+
+// Covers a whole result, including getAll's partially decoded rows. Failed
+// results and internal index/inline-key decodes release unpublished backings
+// immediately instead of waiting for the next V8 GC.
+pub(in crate::context_bootstrap::indexed_db) struct ValueDecodeSession {
+    state: Rc<RefCell<DecodedObjects>>,
+    published: bool,
+}
+
+impl ValueDecodeSession {
+    pub(in crate::context_bootstrap::indexed_db) fn new() -> Self {
+        Self {
+            state: Rc::default(),
+            published: false,
+        }
+    }
+    pub(in crate::context_bootstrap::indexed_db) fn deserialize<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        value: &IndexedDbValue,
+    ) -> Result<Option<v8::Local<'s, v8::Value>>, IndexedDbError> {
+        let context = scope.get_current_context();
+        let deserializer = v8::ValueDeserializer::new(
+            scope,
+            Box::new(IndexedDbStructuredCloneDeserializer {
+                external_objects: value.external_objects(),
+                objects: Rc::clone(&self.state),
+            }),
+            value.wire_bytes(),
+        );
+        let decoded = if deserializer.read_header(context) == Some(true) {
+            deserializer.read_value(context)
+        } else {
+            None
+        };
+        drop(deserializer);
+        if let Some(error) = self.state.borrow_mut().error.take() {
+            return Err(error);
+        }
+        Ok(decoded)
+    }
+    pub(in crate::context_bootstrap::indexed_db) fn deserialize_or_throw<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        value: &IndexedDbValue,
+    ) -> Option<v8::Local<'s, v8::Value>> {
+        v8::tc_scope!(let scope, scope);
+        let result = self.deserialize(scope, value);
+        if scope.is_execution_terminating() || !scope.can_continue() {
+            if scope.has_caught() {
+                scope.rethrow();
+            }
+            return None;
+        }
+        match result {
+            Ok(value) => {
+                if scope.has_caught() {
+                    scope.rethrow();
+                }
+                value
+            }
+            Err(error) => {
+                scope.reset();
+                let error = request_error_object(scope, &error);
+                scope.throw_exception(error);
+                scope.rethrow();
+                None
+            }
+        }
+    }
+    pub(in crate::context_bootstrap::indexed_db) fn publish(mut self) {
+        self.published = true;
+    }
+}
+
+impl Drop for ValueDecodeSession {
+    fn drop(&mut self) {
+        let mut state = self.state.borrow_mut();
+        let blobs = std::mem::take(&mut state.blobs);
+        if !self.published {
+            for id in &blobs {
+                crate::blob::release_blob_wrapper_ref(*id);
+            }
+        }
+    }
+}
+
+struct IndexedDbStructuredCloneDeserializer<'value> {
+    external_objects: &'value [IndexedDbExternalObject],
+    objects: Rc<RefCell<DecodedObjects>>,
+}
+
+impl v8::ValueDeserializerImpl for IndexedDbStructuredCloneDeserializer<'_> {
+    fn read_host_object<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        deserializer: &dyn v8::ValueDeserializerHelper,
+    ) -> Option<v8::Local<'s, v8::Object>> {
+        let mut tag = 0;
+        if !deserializer.read_uint32(&mut tag) {
+            let exception = dom_exception_value(
+                scope,
+                "Failed to deserialize IndexedDB structured clone host object.",
+                "DataCloneError",
+            );
+            scope.throw_exception(exception);
+            return None;
+        }
+        match tag {
+            HOST_OBJECT_TAG_DOM_EXCEPTION => read_dom_exception_payload(scope, deserializer),
+            HOST_OBJECT_TAG_QUOTA_EXCEEDED_ERROR => {
+                read_quota_exceeded_error_payload(scope, deserializer)
+            }
+            HOST_OBJECT_TAG_GEOMETRY => read_geometry_clone_object(scope, deserializer),
+            HOST_OBJECT_TAG_WEB_TRANSPORT_ERROR => {
+                let payload = read_web_transport_error_payload(deserializer)?;
+                build_web_transport_error_from_clone_payload(scope, &payload)
+            }
+            HOST_OBJECT_TAG_IMAGE_DATA => read_image_data_payload(scope, deserializer),
+            HOST_OBJECT_TAG_CRYPTO_KEY => {
+                read_crypto_key_payload(scope, deserializer).or_else(|| {
+                    let exception = dom_exception_value(
+                        scope,
+                        "Failed to deserialize IndexedDB CryptoKey.",
+                        "DataCloneError",
+                    );
+                    scope.throw_exception(exception);
+                    None
+                })
+            }
+            HOST_OBJECT_TAG_BLOB => {
+                let mut index = 0;
+                if !deserializer.read_uint32(&mut index) {
+                    let exception = dom_exception_value(
+                        scope,
+                        "Failed to deserialize IndexedDB Blob index.",
+                        "DataCloneError",
+                    );
+                    scope.throw_exception(exception);
+                    return None;
+                }
+                let Some(object) = self.external_objects.get(index as usize).filter(|object| {
+                    matches!(
+                        object,
+                        IndexedDbExternalObject::Blob { .. } | IndexedDbExternalObject::File { .. }
+                    )
+                }) else {
+                    let exception = dom_exception_value(
+                        scope,
+                        "Missing external Blob during IndexedDB structured clone.",
+                        "DataCloneError",
+                    );
+                    scope.throw_exception(exception);
+                    return None;
+                };
+                self.objects.borrow_mut().reserve_blob()?;
+                let (object, id) = build_blob_from_external_object(scope, object)?;
+                self.objects.borrow_mut().blobs.push(id);
+                Some(object)
+            }
+            HOST_OBJECT_TAG_FILE_SYSTEM_HANDLE => {
+                let mut index = 0;
+                if !deserializer.read_uint32(&mut index) {
+                    let exception = dom_exception_value(
+                        scope,
+                        "Failed to deserialize IndexedDB FileSystemHandle index.",
+                        "DataCloneError",
+                    );
+                    scope.throw_exception(exception);
+                    return None;
+                }
+                let Some(object @ IndexedDbExternalObject::FileSystemHandle { .. }) =
+                    self.external_objects.get(index as usize)
+                else {
+                    let exception = dom_exception_value(
+                        scope,
+                        "Missing external FileSystemHandle during IndexedDB structured clone.",
+                        "DataCloneError",
+                    );
+                    scope.throw_exception(exception);
+                    return None;
+                };
+                let Some(payload) =
+                    file_system_handle_payload_from_indexed_db_external_object(object)
+                else {
+                    let exception = dom_exception_value(
+                        scope,
+                        "Missing external FileSystemHandle during IndexedDB structured clone.",
+                        "DataCloneError",
+                    );
+                    scope.throw_exception(exception);
+                    return None;
+                };
+                build_file_system_handle_from_durable_payload(scope, &payload).or_else(|| {
+                    let exception = dom_exception_value(
+                        scope,
+                        "FileSystemHandle is not authorized for this IndexedDB storage scope.",
+                        "DataCloneError",
+                    );
+                    scope.throw_exception(exception);
+                    None
+                })
+            }
+            _ => {
+                let exception = dom_exception_value(
+                    scope,
+                    "Unsupported IndexedDB structured clone host object.",
+                    "DataCloneError",
+                );
+                scope.throw_exception(exception);
+                None
+            }
+        }
+    }
+}
+
+fn indexed_db_external_object_from_blob_payload(
+    payload: BlobClonePayload,
+) -> IndexedDbExternalObject {
+    match payload {
+        BlobClonePayload::Blob { bytes, mime_type } => {
+            IndexedDbExternalObject::Blob { bytes, mime_type }
+        }
+        BlobClonePayload::File {
+            bytes,
+            mime_type,
+            name,
+            last_modified,
+            ..
+        } => IndexedDbExternalObject::File {
+            bytes,
+            mime_type,
+            name,
+            last_modified,
+        },
+    }
+}
+
+fn build_blob_from_external_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: &IndexedDbExternalObject,
+) -> Option<(v8::Local<'s, v8::Object>, moli_file_api::BlobId)> {
+    match object {
+        IndexedDbExternalObject::Blob { bytes, mime_type } => {
+            crate::blob::build_blob_object_unpublished(scope, bytes.clone(), mime_type.clone())
+        }
+        IndexedDbExternalObject::File {
+            bytes,
+            mime_type,
+            name,
+            last_modified,
+        } => {
+            // IndexedDB restores owned bytes, not an OPFS-backed snapshot.
+            crate::context_bootstrap::file_api::build_file_object_unpublished(
+                scope,
+                bytes.clone(),
+                mime_type.clone(),
+                name,
+                *last_modified,
+            )
+        }
+        IndexedDbExternalObject::FileSystemHandle { .. } => None,
+    }
+}
+
+fn indexed_db_external_object_from_file_system_handle(
+    payload: FileSystemHandleDurablePayload,
+) -> IndexedDbExternalObject {
+    let kind = match payload.kind {
+        moli_storage_service::EntryKind::File => IndexedDbFileSystemHandleKind::File,
+        moli_storage_service::EntryKind::Directory => IndexedDbFileSystemHandleKind::Directory,
+    };
+    let bucket = payload
+        .bucket_id
+        .map(|bucket_id| IndexedDbFileSystemHandleBucket::Named { bucket_id })
+        .unwrap_or(IndexedDbFileSystemHandleBucket::Default);
+    IndexedDbExternalObject::FileSystemHandle {
+        kind,
+        bucket,
+        path: payload.path,
+    }
+}
+
+fn file_system_handle_payload_from_indexed_db_external_object(
+    object: &IndexedDbExternalObject,
+) -> Option<FileSystemHandleDurablePayload> {
+    let IndexedDbExternalObject::FileSystemHandle { kind, bucket, path } = object else {
+        return None;
+    };
+    let kind = match kind {
+        IndexedDbFileSystemHandleKind::File => moli_storage_service::EntryKind::File,
+        IndexedDbFileSystemHandleKind::Directory => moli_storage_service::EntryKind::Directory,
+    };
+    let bucket_id = match bucket {
+        IndexedDbFileSystemHandleBucket::Default => None,
+        IndexedDbFileSystemHandleBucket::Named { bucket_id } => Some(*bucket_id),
+    };
+    Some(FileSystemHandleDurablePayload {
+        bucket_id,
+        path: path.clone(),
+        kind,
+    })
+}
+
+pub(in crate::context_bootstrap::indexed_db) fn serialize_js_value(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+) -> Option<IndexedDbValue> {
+    let external_objects = Rc::new(RefCell::new(Vec::new()));
+    let serialized = {
+        let context = scope.get_current_context();
+        let serializer = v8::ValueSerializer::new(
+            scope,
+            Box::new(IndexedDbStructuredCloneSerializer {
+                external_objects: Rc::clone(&external_objects),
+            }),
+        );
+        serializer.write_header();
+        match serializer.write_value(context, value) {
+            Some(true) => Some(serializer.release()),
+            _ => None,
+        }
+    };
+    if let Some(wire_bytes) = serialized {
+        let external_objects = std::mem::take(&mut *external_objects.borrow_mut());
+        return Some(IndexedDbValue::new(wire_bytes, external_objects));
+    }
+    None
+}
+
+/// Serialization invokes getters while the transaction cannot accept requests.
+/// Restore its state before propagating the original exception, including throws
+/// of null or undefined. An explicit abort during serialization stays finished.
+pub(in crate::context_bootstrap::indexed_db) fn serialize_js_value_for_transaction<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    transaction: v8::Local<'s, v8::Object>,
+    value: v8::Local<'s, v8::Value>,
+) -> Option<IndexedDbValue> {
+    let _ = update_indexed_db_transaction_status(scope, transaction, |state| state.active = false);
+    v8::tc_scope!(let scope, scope);
+    let serialized = serialize_js_value(scope, value);
+    if scope.can_continue() {
+        let exception = scope.exception();
+        scope.reset();
+        if !indexed_db_transaction_status(scope, transaction).is_some_and(|state| state.finished) {
+            let _ = update_indexed_db_transaction_status(scope, transaction, |state| {
+                state.active = true
+            });
+        }
+        if let Some(exception) = exception {
+            scope.throw_exception(exception);
+        }
+    }
+    if scope.has_caught() {
+        scope.rethrow();
+    }
+    serialized
+}
+
+// The source owns wire/external data for the entire decode. Only the final
+// host objects own new byte buffers; the delegate borrows the source slice.
+#[cfg(test)]
+pub(in crate::context_bootstrap::indexed_db) fn deserialize_js_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: &IndexedDbValue,
+) -> Result<Option<v8::Local<'s, v8::Value>>, IndexedDbError> {
+    let session = ValueDecodeSession::new();
+    let value = session.deserialize(scope, value)?;
+    if value.is_some() {
+        session.publish();
+    }
+    Ok(value)
+}

@@ -1,0 +1,32 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <script>
+      const link = document.createElement("link");
+      link.rel = "stylesheet";
+      link.href =
+        "/assets/runtime_inserted_stylesheet_href_mutation_stale.css";
+      document.head.appendChild(link);
+      link.href =
+        "/assets/runtime_inserted_stylesheet_href_mutation_fresh.css";
+    </script>
+    <!-- stylesheet-blocking-control -->
+    <script>
+      window.runtimeInsertedHrefMutationParserNotBlocked = "pending";
+      window.runtimeInsertedHrefMutationSawLate =
+        !!document.getElementById("late");
+      fetch("/assets/runtime_inserted_stylesheet_href_mutation_script_executed", {
+        cache: "no-store"
+      }).then(response => response.text()).then(value => {
+        window.runtimeInsertedHrefMutationParserNotBlocked = value === "true";
+      }).catch(error => {
+        window.runtimeInsertedHrefMutationParserNotBlocked = false;
+        window.runtimeInsertedHrefMutationProbeError = String(error);
+      });
+    </script>
+  </head>
+  <body>
+    <div id="late">late</div>
+  </body>
+</html>

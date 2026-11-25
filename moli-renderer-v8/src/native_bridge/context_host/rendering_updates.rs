@@ -1,0 +1,647 @@
+use super::window_document_tasks::{ExactWindowDocumentTaskLedger, PendingExactWindowDocumentTask};
+use super::{OwnerDispatchScope, PageScriptHost, WindowDocumentOwner, WindowDocumentTaskTarget};
+use crate::{
+    document_runtime::EventTargetHandle,
+    frame_owner_model::FrameDocumentTaskOwner,
+    page_task_queue::{RendererPageRenderingUpdateTaskId, RendererPageRenderingUpdateTaskKind},
+};
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum PendingRenderingUpdatePayload {
+    DocumentScrollEvents,
+    AnimationStartScan(EventTargetHandle),
+    /// Flush the main Document's autofocus candidates after DOMContentLoaded.
+    /// The candidate is intentionally resolved at execution time.
+    PostParseAutofocus,
+    EnvironmentChange(PendingEnvironmentChange),
+    NonLayoutEnvironmentChange(PendingEnvironmentChange),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct PendingEnvironmentChange {
+    pub(super) previous_window_size: (Option<f64>, Option<f64>),
+    pub(super) previous_visual_viewport: Option<moli_page_types::MobileViewport>,
+    pub(super) previous_activity: moli_page_types::DocumentActivity,
+    pub(super) previous_orientation: moli_page_types::ScreenOrientation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PostParseAutofocusAdmission {
+    /// The exact lifecycle owner was replaced before admission.
+    StaleOwner,
+    /// Focus already exists or the Document has no eligible candidate.
+    NotNeeded,
+    /// One exact rendering-update entry owns the pending flush.
+    Published,
+    /// The Page rendering route retired before the entry could be stored.
+    RouteClosed,
+}
+
+pub(super) type RenderingUpdateState = ExactWindowDocumentTaskLedger<
+    RendererPageRenderingUpdateTaskId,
+    RendererPageRenderingUpdateTaskKind,
+    PendingRenderingUpdatePayload,
+>;
+
+impl PageScriptHost {
+    /// Publish post-parse autofocus as a rendering update for the exact main
+    /// Document that just completed DOMContentLoaded.
+    ///
+    /// DOMContentLoaded listeners and their microtasks run before this
+    /// admission. Re-checking the exact owner here prevents a listener's
+    /// `document.open()` from retargeting old lifecycle work to the replacement
+    /// Document.
+    pub(crate) fn queue_main_document_post_parse_autofocus(
+        &mut self,
+        owner: FrameDocumentTaskOwner,
+    ) -> PostParseAutofocusAdmission {
+        if !self.main_document_task_owner_is_current(owner) {
+            return PostParseAutofocusAdmission::StaleOwner;
+        }
+        if !super::super::element::post_parse_autofocus_is_pending(self) {
+            return PostParseAutofocusAdmission::NotNeeded;
+        }
+        let target = WindowDocumentTaskTarget::new(
+            WindowDocumentOwner::Frame(owner),
+            OwnerDispatchScope::Top,
+        );
+        if self.queue_rendering_update(
+            target,
+            RendererPageRenderingUpdateTaskKind::PostParseAutofocus,
+            PendingRenderingUpdatePayload::PostParseAutofocus,
+        ) {
+            PostParseAutofocusAdmission::Published
+        } else {
+            PostParseAutofocusAdmission::RouteClosed
+        }
+    }
+
+    /// Queue the Document's pending `scroll` and `scrollend` entries into the
+    /// stable rendering source. Route closure retires the Host-local payload;
+    /// it never falls back to a timer or hidden drain.
+    pub(crate) fn queue_document_scroll_events(
+        &mut self,
+        scope: &mut v8::PinScope<'_, '_>,
+    ) -> bool {
+        let Some(target) = self.current_window_document_task_target(scope) else {
+            return false;
+        };
+        self.queue_rendering_update(
+            target,
+            RendererPageRenderingUpdateTaskKind::DocumentScrollEvents,
+            PendingRenderingUpdatePayload::DocumentScrollEvents,
+        )
+    }
+
+    /// Queue one lightweight CSS `animationstart` compatibility scan on the
+    /// owning Document's rendering source. Repeated listener registration for
+    /// the same event target coalesces until that scan is consumed.
+    pub(crate) fn queue_animation_start_scan(
+        &mut self,
+        scope: &mut v8::PinScope<'_, '_>,
+        event_target: EventTargetHandle,
+    ) -> bool {
+        let target = match event_target {
+            EventTargetHandle::Window => self.current_window_document_task_target(scope),
+            EventTargetHandle::Node(handle) => {
+                self.window_document_task_target_for_node(scope, handle)
+            }
+            EventTargetHandle::ChildWindow(_) => None,
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        self.queue_rendering_update(
+            target,
+            RendererPageRenderingUpdateTaskKind::AnimationStartScan,
+            PendingRenderingUpdatePayload::AnimationStartScan(event_target),
+        )
+    }
+
+    /// Capture each current Document before changing the native environment.
+    /// Repeated updates keep the first viewport/activity baseline; media lists
+    /// already retain their own last reported match.
+    pub(crate) fn queue_environment_change(&mut self) {
+        if self.layout_policy().is_realtime() {
+            // Screen commits sample and queue Realtime notifications. They
+            // must not also enter the immediate rendering-update FIFO.
+            return;
+        }
+        self.queue_environment_task(false);
+    }
+
+    pub(crate) fn queue_non_layout_environment_change(&mut self) {
+        self.queue_environment_task(self.layout_policy().is_realtime());
+    }
+
+    pub(crate) fn queue_viewport_change(
+        &mut self,
+        viewport: Option<crate::protocol_types::ViewportSurface>,
+    ) {
+        if !self.layout_policy().is_realtime() {
+            self.queue_environment_change();
+        } else if self
+            .viewport_surface()
+            .unwrap_or_default()
+            .screen_orientation
+            != viewport.unwrap_or_default().screen_orientation
+        {
+            // Like Blink's MiscPlatformAPI orientation task, this is separate
+            // from resize/media frame phases. Keep the existing owner route.
+            self.queue_non_layout_environment_change();
+        }
+    }
+
+    fn environment_window_size(
+        &self,
+        dispatch_scope: OwnerDispatchScope,
+    ) -> (Option<f64>, Option<f64>) {
+        if let OwnerDispatchScope::Child(handle) = dispatch_scope
+            && let Some(viewport) = super::super::element::iframe_handle_viewport(self, handle)
+        {
+            return (viewport.width, viewport.height);
+        }
+        let surface = self.viewport_surface().unwrap_or_default();
+        (
+            Some(f64::from(surface.inner_width)),
+            Some(f64::from(surface.inner_height)),
+        )
+    }
+
+    fn queue_environment_task(&mut self, exclude_layout_events: bool) {
+        let scopes = std::iter::once(OwnerDispatchScope::Top).chain(
+            self.child_browsing_context_handles_in_document_order()
+                .into_iter()
+                .map(OwnerDispatchScope::Child),
+        );
+        for dispatch_scope in scopes {
+            let Some(target) =
+                self.current_window_document_task_target_for_dispatch_scope(dispatch_scope)
+            else {
+                continue;
+            };
+            if self
+                .current_registered_window_execution_context_identity(dispatch_scope)
+                .is_none()
+                && (exclude_layout_events || !self.has_media_queries_for_target(target))
+            {
+                continue;
+            }
+            if self
+                .rendering_updates
+                .find_slot_index(
+                    target,
+                    RendererPageRenderingUpdateTaskKind::EnvironmentChange,
+                    |_| true,
+                )
+                .is_some()
+            {
+                if !exclude_layout_events {
+                    self.defer_media_query_samples(target);
+                }
+                continue;
+            }
+            let change = PendingEnvironmentChange {
+                previous_window_size: self.environment_window_size(dispatch_scope),
+                previous_visual_viewport: matches!(dispatch_scope, OwnerDispatchScope::Top).then(
+                    || {
+                        self.viewport_surface()
+                            .unwrap_or_default()
+                            .visual_viewport_geometry()
+                    },
+                ),
+                previous_activity: self.document_activity(),
+                previous_orientation: self
+                    .viewport_surface()
+                    .unwrap_or_default()
+                    .screen_orientation,
+            };
+            let payload = if exclude_layout_events {
+                PendingRenderingUpdatePayload::NonLayoutEnvironmentChange(change)
+            } else {
+                PendingRenderingUpdatePayload::EnvironmentChange(change)
+            };
+            if self.queue_rendering_update(
+                target,
+                RendererPageRenderingUpdateTaskKind::EnvironmentChange,
+                payload,
+            ) && !exclude_layout_events
+            {
+                self.defer_media_query_samples(target);
+            }
+        }
+    }
+
+    fn queue_rendering_update(
+        &mut self,
+        target: WindowDocumentTaskTarget,
+        kind: RendererPageRenderingUpdateTaskKind,
+        payload: PendingRenderingUpdatePayload,
+    ) -> bool {
+        if self.layout_policy().is_realtime()
+            && matches!(
+                kind,
+                RendererPageRenderingUpdateTaskKind::DocumentScrollEvents
+                    | RendererPageRenderingUpdateTaskKind::PostParseAutofocus
+                    | RendererPageRenderingUpdateTaskKind::AnimationStartScan
+            )
+        {
+            return self.queue_realtime_rendering_update(target, kind, payload);
+        }
+        if self
+            .rendering_updates
+            .find_slot_index(target, kind, |pending| pending == &payload)
+            .is_some()
+        {
+            return true;
+        }
+
+        let task_id = self
+            .rendering_updates
+            .allocate_task_id(RendererPageRenderingUpdateTaskId::from_raw);
+        self.rendering_updates
+            .push(PendingExactWindowDocumentTask::new(
+                task_id, target, kind, payload,
+            ));
+        if self
+            .page_rendering_update_sender()
+            .send(target, task_id, kind)
+            .is_ok()
+        {
+            return true;
+        }
+
+        let removed = self.rendering_updates.remove_exact(task_id, target, kind);
+        debug_assert_eq!(
+            removed.as_ref().map(|pending| pending.payload()),
+            Some(&payload)
+        );
+        tracing::debug!(
+            ?target,
+            ?task_id,
+            ?kind,
+            "retired rendering update after stable route closure"
+        );
+        false
+    }
+
+    pub(crate) fn current_pending_rendering_update_task(
+        &self,
+        task_id: RendererPageRenderingUpdateTaskId,
+    ) -> Option<(
+        WindowDocumentTaskTarget,
+        RendererPageRenderingUpdateTaskKind,
+    )> {
+        if matches!(task_id, RendererPageRenderingUpdateTaskId::Frame(_)) {
+            let (id, target) = self.current_realtime_rendering_opportunity()?;
+            return (id == task_id)
+                .then_some((target, RendererPageRenderingUpdateTaskKind::FrameLifecycle));
+        }
+        let pending = self.rendering_updates.pending(task_id)?;
+        let current_target = self.current_window_document_task_target_for_dispatch_scope(
+            pending.target().dispatch_scope(),
+        )?;
+        Some((current_target, pending.kind()))
+    }
+
+    /// Consume and apply one update already authorized against its exact
+    /// Window/Document owner. Removal happens before dispatch so reentrant work
+    /// always receives a distinct subsequent rendering turn.
+    pub(crate) fn apply_authorized_rendering_update(
+        &mut self,
+        scope: &mut v8::PinScope<'_, '_>,
+        host_ptr: *mut PageScriptHost,
+        task_id: RendererPageRenderingUpdateTaskId,
+        target: WindowDocumentTaskTarget,
+        kind: RendererPageRenderingUpdateTaskKind,
+    ) -> anyhow::Result<Option<bool>> {
+        let Some(payload) = self.rendering_updates.remove_exact(task_id, target, kind) else {
+            return Ok(None);
+        };
+        Ok(Some(match payload.into_payload() {
+            PendingRenderingUpdatePayload::DocumentScrollEvents => {
+                self.dispatch_authorized_document_scroll_events(scope, host_ptr, target)
+            }
+            PendingRenderingUpdatePayload::AnimationStartScan(event_target) => {
+                self.dispatch_authorized_animation_start_scan(scope, host_ptr, target, event_target)
+            }
+            PendingRenderingUpdatePayload::PostParseAutofocus => {
+                self.dispatch_authorized_post_parse_autofocus(scope, host_ptr, target)
+            }
+            PendingRenderingUpdatePayload::EnvironmentChange(change) => {
+                self.dispatch_authorized_environment_change(scope, host_ptr, target, change, true)?
+            }
+            PendingRenderingUpdatePayload::NonLayoutEnvironmentChange(change) => {
+                self.dispatch_authorized_environment_change(scope, host_ptr, target, change, false)?
+            }
+        }))
+    }
+
+    pub(crate) fn discard_pending_rendering_update_task(
+        &mut self,
+        task_id: RendererPageRenderingUpdateTaskId,
+    ) -> bool {
+        if matches!(task_id, RendererPageRenderingUpdateTaskId::Frame(_)) {
+            return self.discard_realtime_rendering_opportunity(task_id);
+        }
+        self.rendering_updates.remove(task_id).is_some()
+    }
+
+    pub(super) fn dispatch_authorized_animation_start_scan(
+        &mut self,
+        scope: &mut v8::PinScope<'_, '_>,
+        host_ptr: *mut PageScriptHost,
+        target: WindowDocumentTaskTarget,
+        event_target: EventTargetHandle,
+    ) -> bool {
+        let Some(resolved) = self.resolve_authorized_window_document_task_context(scope, target)
+        else {
+            return false;
+        };
+        let scope = &mut v8::ContextScope::new(scope, resolved.context);
+        let dispatch_scope = target.dispatch_scope();
+        let previous_scope = dispatch_scope.enter(scope);
+        let dispatched = super::super::element::dispatch_animation_start_scan(
+            scope,
+            host_ptr,
+            resolved.document_handle,
+            event_target,
+        );
+        dispatch_scope.restore(scope, previous_scope);
+        dispatched
+    }
+
+    pub(super) fn dispatch_authorized_post_parse_autofocus(
+        &mut self,
+        scope: &mut v8::PinScope<'_, '_>,
+        host_ptr: *mut PageScriptHost,
+        target: WindowDocumentTaskTarget,
+    ) -> bool {
+        let Some(resolved) = self.resolve_authorized_window_document_task_context(scope, target)
+        else {
+            return false;
+        };
+        let scope = &mut v8::ContextScope::new(scope, resolved.context);
+        let dispatch_scope = target.dispatch_scope();
+        let previous_scope = dispatch_scope.enter(scope);
+        let focused = super::super::element::process_post_parse_autofocus(scope, host_ptr);
+        dispatch_scope.restore(scope, previous_scope);
+        focused
+    }
+
+    fn dispatch_authorized_environment_change(
+        &mut self,
+        scope: &mut v8::PinScope<'_, '_>,
+        host_ptr: *mut PageScriptHost,
+        target: WindowDocumentTaskTarget,
+        change: PendingEnvironmentChange,
+        include_layout_events: bool,
+    ) -> anyhow::Result<bool> {
+        let Some(resolved) = self.resolve_authorized_window_document_task_context(scope, target)
+        else {
+            return Ok(false);
+        };
+        let context_scope = &mut v8::ContextScope::new(scope, resolved.context);
+        let previous_scope = target.dispatch_scope().enter(context_scope);
+        let global = context_scope.get_current_context().global(context_scope);
+        let current_window_size = self.environment_window_size(target.dispatch_scope());
+        let current_activity = self.document_activity();
+        // Resize precedes media reporting. Every listener can replace its
+        // Document, so abandon the remaining events as soon as the owner retires.
+        let dispatched = (|| -> anyhow::Result<bool> {
+            let mut dispatched = false;
+            let window_target = match target.dispatch_scope() {
+                OwnerDispatchScope::Child(handle) => {
+                    let Some(child_target) = self.current_child_window_event_target(handle) else {
+                        return Ok(false);
+                    };
+                    EventTargetHandle::ChildWindow(child_target)
+                }
+                _ => EventTargetHandle::Window,
+            };
+
+            let resized = change.previous_window_size != current_window_size;
+            let visual_resized = change.previous_visual_viewport.map_or(resized, |previous| {
+                previous
+                    != self
+                        .viewport_surface()
+                        .unwrap_or_default()
+                        .visual_viewport_geometry()
+            });
+            if include_layout_events
+                && resized
+                && let Ok(event) = crate::host::create_host_event(
+                    context_scope,
+                    "resize",
+                    global.into(),
+                    global.into(),
+                    false,
+                    false,
+                )
+            {
+                dispatched |= self
+                    .dispatch_public_event_best_effort(
+                        context_scope,
+                        host_ptr,
+                        window_target,
+                        event,
+                        "window resize event",
+                    )
+                    .is_ok();
+            }
+
+            if include_layout_events && visual_resized {
+                if !self.window_document_owner_is_current_for_dispatch_scope(
+                    target.owner(),
+                    target.dispatch_scope(),
+                ) {
+                    return Ok(dispatched);
+                }
+                dispatched |= crate::context_bootstrap::dispatch_window_visual_viewport_resize(
+                    context_scope,
+                    global,
+                );
+            }
+
+            if !self.window_document_owner_is_current_for_dispatch_scope(
+                target.owner(),
+                target.dispatch_scope(),
+            ) {
+                return Ok(dispatched);
+            }
+            if include_layout_events {
+                self.sample_media_queries(Some(target));
+                dispatched |= crate::context_bootstrap::dispatch_media_query_events(
+                    context_scope,
+                    host_ptr,
+                    || {
+                        unsafe { &*host_ptr }
+                            .current_window_document_task_target_for_dispatch_scope(
+                                target.dispatch_scope(),
+                            )
+                    },
+                )?;
+            }
+            if !self.window_document_owner_is_current_for_dispatch_scope(
+                target.owner(),
+                target.dispatch_scope(),
+            ) {
+                return Ok(dispatched);
+            }
+
+            if change.previous_orientation
+                != self
+                    .viewport_surface()
+                    .unwrap_or_default()
+                    .screen_orientation
+            {
+                dispatched |= crate::context_bootstrap::dispatch_screen_orientation_change(
+                    context_scope,
+                    global,
+                );
+                if !self.window_document_owner_is_current_for_dispatch_scope(
+                    target.owner(),
+                    target.dispatch_scope(),
+                ) {
+                    return Ok(dispatched);
+                }
+            }
+            // Losing focus precedes hiding; showing precedes gaining focus.
+            // Install each intermediate state before its event so callbacks
+            // observe that transition, including callbacks in child Documents.
+            let previous = change.previous_activity;
+            let transitions = [
+                (previous.focused && !current_activity.focused).then_some((
+                    "blur",
+                    moli_page_types::DocumentActivity {
+                        focused: false,
+                        visible: previous.visible,
+                    },
+                )),
+                (previous.visible != current_activity.visible).then_some((
+                    "visibilitychange",
+                    moli_page_types::DocumentActivity {
+                        focused: previous.focused && current_activity.focused,
+                        visible: current_activity.visible,
+                    },
+                )),
+                (!previous.focused && current_activity.focused)
+                    .then_some(("focus", current_activity)),
+            ];
+            for (event_type, activity) in transitions.into_iter().flatten() {
+                if !self.window_document_owner_is_current_for_dispatch_scope(
+                    target.owner(),
+                    target.dispatch_scope(),
+                ) {
+                    return Ok(dispatched);
+                }
+                self.set_document_activity(activity);
+                let (event_target, event) = if event_type == "visibilitychange" {
+                    let Ok(document) = crate::host::event_target_value(
+                        context_scope,
+                        host_ptr,
+                        EventTargetHandle::Node(resolved.document_handle),
+                    ) else {
+                        continue;
+                    };
+                    (
+                        EventTargetHandle::Node(resolved.document_handle),
+                        crate::host::create_host_event(
+                            context_scope,
+                            event_type,
+                            document,
+                            document,
+                            true,
+                            false,
+                        )
+                        .ok(),
+                    )
+                } else {
+                    (
+                        window_target,
+                        super::super::element::construct_focus_event(
+                            context_scope,
+                            event_type,
+                            None,
+                            false,
+                        ),
+                    )
+                };
+                if let Some(event) = event {
+                    dispatched |= self
+                        .dispatch_public_event_best_effort(
+                            context_scope,
+                            host_ptr,
+                            event_target,
+                            event,
+                            "document activity event",
+                        )
+                        .is_ok();
+                }
+            }
+
+            Ok(dispatched)
+        })();
+        // A listener can retire its Document midway through the transition.
+        // The browser's requested final activity still belongs to the Page.
+        self.set_document_activity(current_activity);
+        target
+            .dispatch_scope()
+            .restore(context_scope, previous_scope);
+        dispatched
+    }
+
+    /// Apply an already-authorized Document rendering update. Realm lookup is
+    /// resolution only: exact current/stale arbitration happened before this
+    /// method was called.
+    fn dispatch_authorized_document_scroll_events(
+        &mut self,
+        scope: &mut v8::PinScope<'_, '_>,
+        host_ptr: *mut PageScriptHost,
+        target: WindowDocumentTaskTarget,
+    ) -> bool {
+        let Some(resolved) = self.resolve_authorized_window_document_task_context(scope, target)
+        else {
+            return false;
+        };
+        let scope = &mut v8::ContextScope::new(scope, resolved.context);
+        self.dispatch_authorized_document_scroll_events_in_current_context(
+            scope,
+            host_ptr,
+            target,
+            resolved.document_handle,
+        )
+    }
+
+    fn dispatch_authorized_document_scroll_events_in_current_context(
+        &mut self,
+        scope: &mut v8::PinScope<'_, '_>,
+        host_ptr: *mut PageScriptHost,
+        target: WindowDocumentTaskTarget,
+        document_handle: crate::document_runtime::DomHandle,
+    ) -> bool {
+        if !crate::window_host::dispatch_document_event_for_handle(
+            scope,
+            host_ptr,
+            document_handle,
+            "scroll",
+        ) {
+            return false;
+        }
+
+        // A scroll handler can replace its Document. Never retarget the
+        // already-pending `scrollend` entry to that replacement.
+        if self.window_document_owner_is_current_for_dispatch_scope(
+            target.owner(),
+            target.dispatch_scope(),
+        ) {
+            let _ = crate::window_host::dispatch_document_event_for_handle(
+                scope,
+                host_ptr,
+                document_handle,
+                "scrollend",
+            );
+        }
+        true
+    }
+}

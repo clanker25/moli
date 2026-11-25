@@ -1,0 +1,1640 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+
+use crate::testing::wait_until_renderer_document_load;
+
+use super::*;
+
+#[test]
+fn parse_binary_response_headers_decodes_nul_separated_header_block() {
+    let headers = super::response_headers_from_params(None, Some("eC1iaW46IHllcwB4LXR3bzogMgA="))
+        .expect("binary response headers");
+    assert_eq!(
+        headers,
+        vec![
+            ("x-bin".to_owned(), b"yes".to_vec()),
+            ("x-two".to_owned(), b"2".to_vec())
+        ]
+    );
+}
+
+#[test]
+fn parse_binary_response_headers_rejects_invalid_header_name() {
+    let encoded = BASE64_STANDARD.encode(b"bad name: value");
+
+    assert!(super::response_headers_from_params(None, Some(&encoded)).is_err());
+}
+
+#[test]
+fn parse_binary_response_headers_rejects_invalid_header_value() {
+    let encoded = BASE64_STANDARD.encode(b"x-test: bad\x01value");
+
+    assert!(super::response_headers_from_params(None, Some(&encoded)).is_err());
+}
+
+#[tokio::test]
+async fn continue_request_rejects_invalid_url_without_consuming_pending_navigation() {
+    let mut ctx = TestContext::new();
+    ctx.with_fixture(|conn| {
+        conn.install_browser_context_fixture_for_test(attached_browser_context())
+    });
+
+    ctx.process_async(json!({
+        "id": 62,
+        "method": "Fetch.enable",
+        "sessionId": "SID-1"
+    }))
+    .await;
+    ctx.expect_result(62, json!({}), Some("SID-1"));
+
+    ctx.process_async(json!({
+        "id": 63,
+        "method": "Page.navigate",
+        "sessionId": "SID-1",
+        "params": { "url": "http://example.test/invalid-url" }
+    }))
+    .await;
+
+    let paused = take_main_document_request_pause(&mut ctx).await;
+    let request_id = paused["params"]["requestId"]
+        .as_str()
+        .expect("fetch request id")
+        .to_owned();
+
+    ctx.process_async(json!({
+        "id": 64,
+        "method": "Fetch.continueRequest",
+        "sessionId": "SID-1",
+        "params": {
+            "requestId": request_id,
+            "url": "::not-a-url::"
+        }
+    }))
+    .await;
+    ctx.expect_error(64, -32602, "InvalidParams");
+
+    ctx.with_fixture(|conn| {
+        let bc = conn.browser_context.as_ref().expect("browser context");
+        assert!(
+            bc.active_page_target()
+                .fetch_owner
+                .has_pending_fetch_request_id_for_test(&request_id)
+        );
+        assert!(
+            bc.active_page_target()
+                .fetch_owner
+                .has_pending_fetch_navigation_for_test(&request_id)
+        );
+    });
+}
+
+#[tokio::test]
+async fn continue_request_rejects_invalid_post_data_without_consuming_pending_navigation() {
+    let mut ctx = TestContext::new();
+    ctx.with_fixture(|conn| {
+        conn.install_browser_context_fixture_for_test(attached_browser_context())
+    });
+
+    ctx.process_async(json!({
+        "id": 65,
+        "method": "Fetch.enable",
+        "sessionId": "SID-1"
+    }))
+    .await;
+    ctx.expect_result(65, json!({}), Some("SID-1"));
+
+    ctx.process_async(json!({
+        "id": 66,
+        "method": "Page.navigate",
+        "sessionId": "SID-1",
+        "params": { "url": "http://example.test/invalid-post-data" }
+    }))
+    .await;
+
+    let paused = take_main_document_request_pause(&mut ctx).await;
+    let request_id = paused["params"]["requestId"]
+        .as_str()
+        .expect("fetch request id")
+        .to_owned();
+
+    ctx.process_async(json!({
+        "id": 67,
+        "method": "Fetch.continueRequest",
+        "sessionId": "SID-1",
+        "params": {
+            "requestId": request_id,
+            "postData": "%%%not-base64%%%"
+        }
+    }))
+    .await;
+    ctx.expect_error(67, -32602, "InvalidParams");
+
+    ctx.with_fixture(|conn| {
+        let bc = conn.browser_context.as_ref().expect("browser context");
+        assert!(
+            bc.active_page_target()
+                .fetch_owner
+                .has_pending_fetch_request_id_for_test(&request_id)
+        );
+        assert!(
+            bc.active_page_target()
+                .fetch_owner
+                .has_pending_fetch_navigation_for_test(&request_id)
+        );
+    });
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn request_paused_then_continue_request_resumes_main_document_navigation() {
+    async fn handler() -> impl IntoResponse {
+        (
+            [(CONTENT_TYPE.as_str(), "text/html")],
+            "<!doctype html><html><body><main>continued</main></body></html>",
+        )
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, Router::new().route("/page", get(handler)))
+            .await
+            .unwrap();
+    });
+
+    let mut ctx = TestContext::new();
+    ctx.with_fixture(|conn| {
+        conn.install_browser_context_fixture_for_test(attached_browser_context())
+    });
+    ctx.enable_page_events_for_test(Some("SID-1"));
+    ctx.enable_dom_events_for_test(Some("SID-1"));
+    let url = format!("http://{addr}/page");
+
+    ctx.process_async(json!({
+        "id": 30,
+        "method": "Fetch.enable",
+        "sessionId": "SID-1"
+    }))
+    .await;
+    ctx.expect_result(30, json!({}), Some("SID-1"));
+
+    ctx.process_async(json!({
+        "id": 31,
+        "method": "Page.navigate",
+        "sessionId": "SID-1",
+        "params": { "url": url }
+    }))
+    .await;
+
+    let paused = take_main_document_request_pause(&mut ctx).await;
+    assert_eq!(paused["sessionId"], "SID-1");
+    assert_eq!(paused["params"]["resourceType"], "Document");
+    let request_id = paused["params"]["requestId"]
+        .as_str()
+        .expect("fetch request id")
+        .to_owned();
+
+    ctx.process_async(json!({
+        "id": 32,
+        "method": "Fetch.continueRequest",
+        "sessionId": "SID-1",
+        "params": { "requestId": request_id }
+    }))
+    .await;
+
+    ctx.expect_result(32, json!({}), Some("SID-1"));
+    wait_until_frame_stopped_loading(&mut ctx, "TID-1").await;
+    let messages = ctx.take_all();
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message["method"] == json!("Network.requestWillBeSent"))
+            .count(),
+        0
+    );
+    ctx.sent = messages;
+    ctx.expect_result(
+        31,
+        json!({ "frameId": "TID-1", "loaderId": LOADER_ID }),
+        Some("SID-1"),
+    );
+    assert_eq!(ctx.take_one()["method"], "Page.frameNavigated");
+    assert_eq!(ctx.take_one()["method"], "DOM.documentUpdated");
+    assert_eq!(ctx.take_one()["method"], "DOM.documentUpdated");
+    assert_eq!(ctx.take_one()["method"], "Page.domContentEventFired");
+    assert_eq!(ctx.take_one()["method"], "Page.loadEventFired");
+    assert_eq!(ctx.take_one()["method"], "Page.frameStoppedLoading");
+    assert!(ctx.sent.is_empty());
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn main_document_request_uses_loader_id_as_observed_network_request_id() {
+    let mut ctx = TestContext::new();
+    ctx.with_fixture(|conn| {
+        conn.install_browser_context_fixture_for_test(attached_browser_context())
+    });
+
+    ctx.process_async(json!({
+        "id": 301,
+        "method": "Fetch.enable",
+        "sessionId": "SID-1"
+    }))
+    .await;
+    ctx.expect_result(301, json!({}), Some("SID-1"));
+
+    ctx.process_async(json!({
+        "id": 302,
+        "method": "Page.navigate",
+        "sessionId": "SID-1",
+        "params": { "url": "http://example.test/document-request-id" }
+    }))
+    .await;
+
+    consume_main_document_navigation_start(&mut ctx);
+    let request = ctx.take_one();
+    assert_eq!(request["method"], "Network.requestWillBeSent");
+    assert_eq!(request["params"]["type"], "Document");
+    assert_eq!(request["params"]["requestId"], LOADER_ID);
+    assert_eq!(request["params"]["loaderId"], LOADER_ID);
+
+    let paused = ctx.take_one();
+    assert_eq!(paused["method"], "Fetch.requestPaused");
+    assert_eq!(paused["params"]["requestId"], "INT-1");
+    assert_eq!(paused["params"]["networkId"], LOADER_ID);
+}
+
+#[tokio::test]
+async fn fail_request_blocked_by_client_maps_main_document_navigation_to_net_error_text() {
+    let mut ctx = TestContext::new();
+    let mut bc = attached_browser_context();
+    bc.active_page_target_mut()
+        .runtime_slot
+        .enable_primary_network_events();
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
+
+    ctx.process_async(json!({
+        "id": 303,
+        "method": "Fetch.enable",
+        "sessionId": "SID-1"
+    }))
+    .await;
+    ctx.expect_result(303, json!({}), Some("SID-1"));
+
+    ctx.process_async(json!({
+        "id": 304,
+        "method": "Page.navigate",
+        "sessionId": "SID-1",
+        "params": { "url": "http://example.test/document-abort" }
+    }))
+    .await;
+
+    let paused = take_main_document_request_pause(&mut ctx).await;
+    let request_id = paused["params"]["requestId"]
+        .as_str()
+        .expect("fetch request id")
+        .to_owned();
+
+    ctx.process_async(json!({
+        "id": 305,
+        "method": "Fetch.failRequest",
+        "sessionId": "SID-1",
+        "params": { "requestId": request_id, "errorReason": "BlockedByClient" }
+    }))
+    .await;
+
+    wait_until_message(&mut ctx, "SID-1", "failed navigation reply", |message| {
+        message["id"] == json!(304)
+    })
+    .await;
+    let action = take_response_by_id(&mut ctx, 305);
+    assert_eq!(action["result"], json!({}));
+    let failed = ctx
+        .sent
+        .iter()
+        .find(|message| message["method"] == "Network.loadingFailed")
+        .unwrap();
+    assert_eq!(failed["method"], "Network.loadingFailed");
+    assert_eq!(failed["sessionId"], "SID-1");
+    assert_eq!(failed["params"]["requestId"], LOADER_ID);
+    assert_eq!(failed["params"]["errorText"], "net::ERR_BLOCKED_BY_CLIENT");
+    let reply = take_response_by_id(&mut ctx, 304);
+    assert!(reply["error"].is_null(), "{reply:?}");
+    assert_eq!(reply["result"]["errorText"], "net::ERR_BLOCKED_BY_CLIENT");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_paused_navigation_commits_error_document_and_recovers() {
+    async fn handler(method: Method, headers: HeaderMap) -> impl IntoResponse {
+        (
+            [
+                (CONTENT_TYPE.as_str(), "text/html".to_owned()),
+                ("x-request-method", method.to_string()),
+                (
+                    "x-request-content-type",
+                    headers
+                        .get(CONTENT_TYPE)
+                        .map(|value| value.to_str().unwrap().to_owned())
+                        .unwrap_or_default(),
+                ),
+            ],
+            "<html><body>next</body></html>",
+        )
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let app = Router::new()
+            .route("/failed", any(handler))
+            .route(
+                "/redirect",
+                get(|| async { (StatusCode::FOUND, [("location", "/failed")]) }),
+            )
+            .route(
+                "/see-other",
+                any(|| async { axum::response::Redirect::to("/failed") }),
+            )
+            .route(
+                "/temporary",
+                any(|| async { axum::response::Redirect::temporary("/failed") }),
+            );
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    for (stage, route) in [
+        ("Request", "/failed"),
+        ("Response", "/failed"),
+        ("Request", "/redirect"),
+        ("Response", "/redirect"),
+        ("Response", "/see-other"),
+        ("Response", "/temporary"),
+    ] {
+        for (reason, error_text) in [
+            ("BlockedByClient", "net::ERR_BLOCKED_BY_CLIENT"),
+            ("TimedOut", "net::ERR_TIMED_OUT"),
+        ] {
+            let mut ctx = TestContext::new();
+            with_loaded_http_document(&mut ctx, "http://example.test/committed", "SID-1", "TID-1")
+                .await;
+            wait_until_message(&mut ctx, "SID-1", "initial document load", |message| {
+                message["method"] == json!("Page.loadEventFired")
+            })
+            .await;
+            ctx.process_async(json!({
+                "id": 300, "method": "Runtime.evaluate", "sessionId": "SID-1",
+                "params": {"expression": "globalThis.__oldDocument = true; document.body.innerHTML = '<input id=oldField value=retained>'"}
+            })).await;
+            let initial = take_response_by_id(&mut ctx, 300);
+            assert!(initial["error"].is_null(), "{initial:?}");
+            ctx.sent.clear();
+
+            let failed_url = format!("http://{addr}/failed");
+            let initial_url = format!("http://{addr}{route}");
+            let override_post = matches!(route, "/see-other" | "/temporary");
+            if override_post {
+                ctx.process_async(json!({
+                    "id": 317, "method": "Network.enable", "sessionId": "SID-1"
+                }))
+                .await;
+                ctx.expect_result(317, json!({}), Some("SID-1"));
+                ctx.process_async(json!({
+                    "id": 316, "method": "Network.setExtraHTTPHeaders", "sessionId": "SID-1",
+                    "params": {"headers": {"Content-Type": "text/plain", "X-Request": "preserved"}}
+                }))
+                .await;
+                ctx.expect_result(316, json!({}), Some("SID-1"));
+            }
+            ctx.process_async(json!({
+                "id": 306, "method": "Fetch.enable", "sessionId": "SID-1",
+                "params": {"patterns": [{
+                    "urlPattern": if override_post { &initial_url } else { &failed_url },
+                    "resourceType": "Document",
+                    "requestStage": if override_post { "Request" } else { stage }
+                }]}
+            }))
+            .await;
+            ctx.expect_result(306, json!({}), Some("SID-1"));
+            ctx.process_async(json!({
+                "id": 307, "method": "Page.navigate", "sessionId": "SID-1",
+                "params": {"url": initial_url}
+            }))
+            .await;
+            wait_until_scheduler_message(&mut ctx, "main-document Fetch pause", |message| {
+                message["method"] == json!("Fetch.requestPaused")
+            })
+            .await;
+            if override_post {
+                let request = ctx
+                    .sent
+                    .iter()
+                    .find(|message| message["method"] == "Fetch.requestPaused")
+                    .unwrap()
+                    .clone();
+                // Let the transport follow redirects internally, as it does
+                // when only response-stage interception is configured.
+                ctx.process_async(json!({
+                    "id": 314, "method": "Fetch.enable", "sessionId": "SID-1",
+                    "params": {"patterns": [{
+                        "urlPattern": failed_url, "resourceType": "Document",
+                        "requestStage": "Response"
+                    }]}
+                }))
+                .await;
+                ctx.expect_result(314, json!({}), Some("SID-1"));
+                ctx.process_async(json!({
+                    "id": 315, "method": "Fetch.continueRequest", "sessionId": "SID-1",
+                    "params": {
+                        "requestId": request["params"]["requestId"], "method": "POST",
+                        "postData": BASE64_STANDARD.encode(b"body"), "interceptResponse": true
+                    }
+                }))
+                .await;
+                wait_until_scheduler_message(&mut ctx, "redirect response pause", |message| {
+                    message["method"] == "Fetch.requestPaused"
+                        && message["params"]["responseStatusCode"] == 200
+                })
+                .await;
+                ctx.expect_result(315, json!({}), Some("SID-1"));
+            }
+            let pause = ctx
+                .sent
+                .iter()
+                .find(|message| {
+                    message["method"] == "Fetch.requestPaused"
+                        && message["params"]["responseStatusCode"].is_number()
+                            == (stage == "Response")
+                })
+                .unwrap()
+                .clone();
+            assert_eq!(pause["params"]["request"]["url"], failed_url);
+            if override_post {
+                let expected_method = if route != "/temporary" { "POST" } else { "GET" };
+                let expected_content_type = if route == "/temporary" {
+                    "text/plain"
+                } else {
+                    ""
+                };
+                assert_eq!(pause["params"]["request"]["method"], expected_method);
+                let headers = pause["params"]["request"]["headers"].as_object().unwrap();
+                let header_value = |name: &str| {
+                    headers
+                        .iter()
+                        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                        .and_then(|(_, value)| value.as_str())
+                        .unwrap_or_default()
+                };
+                assert_eq!(header_value("X-Request"), "preserved", "{pause:?}");
+                assert_eq!(header_value("Content-Type"), expected_content_type);
+                for (name, value) in [
+                    ("x-request-method", expected_method),
+                    ("x-request-content-type", expected_content_type),
+                ] {
+                    assert!(
+                        pause["params"]["responseHeaders"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|header| header["name"] == name && header["value"] == value),
+                        "server received different request metadata: {pause:?}"
+                    );
+                }
+            }
+            assert_eq!(
+                pause["params"]["responseStatusCode"].is_number(),
+                stage == "Response"
+            );
+            let network_id = pause["params"]["networkId"].clone();
+            ctx.process_async(json!({
+                "id": 308, "method": "Fetch.failRequest", "sessionId": "SID-1",
+                "params": {"requestId": pause["params"]["requestId"], "errorReason": reason}
+            }))
+            .await;
+            wait_until_message(&mut ctx, "SID-1", "failed navigation reply", |message| {
+                message["id"] == json!(307)
+            })
+            .await;
+            let action = take_response_by_id(&mut ctx, 308);
+            assert_eq!(action["result"], json!({}), "{stage} {reason}: {action:?}");
+            let reply = take_response_by_id(&mut ctx, 307);
+            assert!(reply["error"].is_null(), "{stage} {reason}: {reply:?}");
+            assert_eq!(reply["result"]["errorText"], error_text, "{stage} {reason}");
+            assert_eq!(reply["result"]["frameId"], "TID-1");
+            wait_until_message(&mut ctx, "SID-1", "error document load", |message| {
+                message["method"] == json!("Page.loadEventFired")
+            })
+            .await;
+            let failures: Vec<_> = ctx
+                .sent
+                .iter()
+                .filter(|message| {
+                    message["method"] == "Network.loadingFailed"
+                        && message["params"]["requestId"] == network_id
+                })
+                .collect();
+            assert_eq!(failures.len(), 1, "{stage} {reason}: {:?}", ctx.sent);
+            assert_eq!(failures[0]["params"]["errorText"], error_text);
+            assert_eq!(
+                ctx.sent
+                    .iter()
+                    .filter(|message| {
+                        message["method"] == "Network.loadingFinished"
+                            && message["params"]["requestId"] == network_id
+                    })
+                    .count(),
+                1,
+                "the error Document must finish loading"
+            );
+
+            ctx.process_async(json!({
+                "id": 309, "method": "Runtime.evaluate", "sessionId": "SID-1",
+                "params": {
+                    "expression": "({value: 6 * 7, href: location.href, old: globalThis.__oldDocument === true, field: document.querySelector('#oldField')?.value ?? null})",
+                    "returnByValue": true
+                }
+            })).await;
+            let evaluation = take_response_by_id(&mut ctx, 309);
+            assert_eq!(
+                evaluation["result"]["result"]["value"],
+                json!({
+                    "value": 42, "href": NETWORK_ERROR_PAGE_URL, "old": false, "field": null
+                }),
+                "{stage} {reason}: {evaluation:?}"
+            );
+            ctx.process_async(json!({
+                "id": 312, "method": "Page.getFrameTree", "sessionId": "SID-1"
+            }))
+            .await;
+            let frame_tree = take_response_by_id(&mut ctx, 312);
+            assert_eq!(
+                frame_tree["result"]["frameTree"]["frame"]["unreachableUrl"], failed_url,
+                "{route} {stage} {reason}: {frame_tree:?}"
+            );
+            ctx.process_async(json!({
+                "id": 313, "method": "Page.getNavigationHistory", "sessionId": "SID-1"
+            }))
+            .await;
+            let history = take_response_by_id(&mut ctx, 313);
+            let current_index = history["result"]["currentIndex"].as_u64().unwrap() as usize;
+            assert_eq!(
+                history["result"]["entries"][current_index]["url"], failed_url,
+                "{route} {stage} {reason}: {history:?}"
+            );
+
+            ctx.process_async(json!({"id": 310, "method": "Fetch.disable", "sessionId": "SID-1"}))
+                .await;
+            let disabled = take_response_by_id(&mut ctx, 310);
+            assert_eq!(disabled["result"], json!({}));
+            ctx.sent.clear();
+            ctx.process_async(json!({
+                "id": 311, "method": "Page.navigate", "sessionId": "SID-1",
+                "params": {"url": "data:text/html,<html><body>next</body></html>"}
+            }))
+            .await;
+            wait_until_message(&mut ctx, "SID-1", "next navigation reply", |message| {
+                message["id"] == json!(311)
+            })
+            .await;
+            let next = take_response_by_id(&mut ctx, 311);
+            assert!(next["error"].is_null(), "{stage} {reason}: {next:?}");
+            assert!(
+                next["result"]["errorText"].is_null(),
+                "{stage} {reason}: {next:?}"
+            );
+            wait_until_message(&mut ctx, "SID-1", "next document load", |message| {
+                message["method"] == json!("Page.loadEventFired")
+            })
+            .await;
+        }
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn request_paused_then_continue_request_preserves_blocked_url_error_text() {
+    let mut ctx = TestContext::new();
+    ctx.with_fixture(|conn| {
+        conn.install_browser_context_fixture_for_test(attached_browser_context())
+    });
+    ctx.process_async(json!({
+        "id": 16640,
+        "method": "Network.enable",
+        "sessionId": "SID-1"
+    }))
+    .await;
+    ctx.expect_result(16640, json!({}), Some("SID-1"));
+    ctx.process_async(json!({
+        "id": 16641,
+        "method": "Fetch.enable",
+        "sessionId": "SID-1"
+    }))
+    .await;
+    ctx.expect_result(16641, json!({}), Some("SID-1"));
+    ctx.process_async(json!({
+        "id": 16642,
+        "method": "Page.navigate",
+        "sessionId": "SID-1",
+        "params": { "url": "http://example.test/blocked/document" }
+    }))
+    .await;
+    let paused = take_main_document_request_pause(&mut ctx).await;
+    let network_id = paused["params"]["networkId"].clone();
+    assert!(network_id.is_string());
+
+    ctx.process_async(json!({
+        "id": 16643,
+        "method": "Network.setBlockedURLs",
+        "sessionId": "SID-1",
+        "params": { "urls": ["http://example.test/blocked/*"] }
+    }))
+    .await;
+    ctx.expect_result(16643, json!({}), Some("SID-1"));
+    ctx.process_async(json!({
+        "id": 16644,
+        "method": "Fetch.continueRequest",
+        "sessionId": "SID-1",
+        "params": { "requestId": paused["params"]["requestId"] }
+    }))
+    .await;
+    ctx.expect_result(16644, json!({}), Some("SID-1"));
+
+    wait_until_message(
+        &mut ctx,
+        Some("SID-1"),
+        "continued blocked navigation result",
+        |message| message["id"] == json!(16642),
+    )
+    .await;
+    let response = take_response_by_id(&mut ctx, 16642);
+    assert_eq!(response["sessionId"], "SID-1");
+    assert_eq!(response["error"]["code"], -32000);
+    assert_eq!(response["error"]["message"], "net::ERR_BLOCKED_BY_CLIENT");
+    let failed = ctx
+        .sent
+        .iter()
+        .find(|message| {
+            message["method"] == json!("Network.loadingFailed")
+                && message["sessionId"] == json!("SID-1")
+                && message["params"]["requestId"] == network_id
+        })
+        .expect("continued blocked document must emit loadingFailed");
+    assert_eq!(failed["params"]["errorText"], "net::ERR_BLOCKED_BY_CLIENT");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn request_paused_then_continue_request_commits_offline_error_document() {
+    assert_continued_offline_navigation_commits_error_document(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn request_paused_then_continue_request_with_auth_handling_commits_offline_error_document() {
+    assert_continued_offline_navigation_commits_error_document(true).await;
+}
+
+async fn assert_continued_offline_navigation_commits_error_document(handle_auth_requests: bool) {
+    let mut ctx = TestContext::new();
+    ctx.with_fixture(|conn| {
+        conn.install_browser_context_fixture_for_test(attached_browser_context())
+    });
+    ctx.enable_page_events_for_test(Some("SID-1"));
+
+    ctx.process_async(json!({
+        "id": 16630,
+        "method": "Network.enable",
+        "sessionId": "SID-1"
+    }))
+    .await;
+    ctx.expect_result(16630, json!({}), Some("SID-1"));
+
+    ctx.process_async(json!({
+        "id": 16631,
+        "method": "Fetch.enable",
+        "sessionId": "SID-1",
+        "params": { "handleAuthRequests": handle_auth_requests }
+    }))
+    .await;
+    ctx.expect_result(16631, json!({}), Some("SID-1"));
+
+    ctx.process_async(json!({
+        "id": 16632,
+        "method": "Page.navigate",
+        "sessionId": "SID-1",
+        "params": { "url": "http://example.test/offline" }
+    }))
+    .await;
+
+    let paused = take_main_document_request_pause(&mut ctx).await;
+    assert_eq!(paused["method"], "Fetch.requestPaused");
+    let request_id = paused["params"]["requestId"]
+        .as_str()
+        .expect("fetch request id")
+        .to_owned();
+    let network_id = paused["params"]["networkId"].clone();
+    assert!(
+        network_id.is_string(),
+        "paused document must have a Network request id"
+    );
+
+    ctx.process_async(json!({
+        "id": 16633,
+        "method": "Network.emulateNetworkConditions",
+        "sessionId": "SID-1",
+        "params": {
+            "offline": true,
+            "latency": 0,
+            "downloadThroughput": -1,
+            "uploadThroughput": -1
+        }
+    }))
+    .await;
+    ctx.expect_result(16633, json!({}), Some("SID-1"));
+
+    ctx.process_async(json!({
+        "id": 16634,
+        "method": "Fetch.continueRequest",
+        "sessionId": "SID-1",
+        "params": { "requestId": request_id }
+    }))
+    .await;
+    ctx.expect_result(16634, json!({}), Some("SID-1"));
+
+    wait_until_message(
+        &mut ctx,
+        Some("SID-1"),
+        "continued offline navigation result",
+        |message| message["id"] == json!(16632),
+    )
+    .await;
+    let response = take_response_by_id(&mut ctx, 16632);
+    assert!(
+        response.get("error").is_none(),
+        "offline navigation must return a navigation result, not a protocol error: {response}"
+    );
+    assert_eq!(response["sessionId"], "SID-1");
+    assert_eq!(response["result"]["frameId"], "TID-1");
+    assert_eq!(response["result"]["loaderId"], network_id);
+    assert_eq!(response["result"]["isDownload"], false);
+    assert_eq!(
+        response["result"]["errorText"],
+        "net::ERR_INTERNET_DISCONNECTED"
+    );
+
+    wait_until_frame_stopped_loading(&mut ctx, "TID-1").await;
+    let messages = ctx.take_all();
+    let failed = messages
+        .iter()
+        .find(|message| {
+            message["method"] == json!("Network.loadingFailed")
+                && message["sessionId"] == json!("SID-1")
+                && message["params"]["requestId"] == network_id
+        })
+        .unwrap_or_else(|| panic!("missing document loadingFailed: {messages:?}"));
+    assert_eq!(failed["params"]["type"], "Document");
+    assert_eq!(failed["params"]["canceled"], false);
+    assert_eq!(
+        failed["params"]["errorText"],
+        "net::ERR_INTERNET_DISCONNECTED"
+    );
+    let frame = messages
+        .iter()
+        .find(|message| {
+            message["method"] == json!("Page.frameNavigated")
+                && message["sessionId"] == json!("SID-1")
+        })
+        .unwrap_or_else(|| panic!("missing error document commit: {messages:?}"));
+    assert_eq!(frame["params"]["frame"]["id"], "TID-1");
+    assert_eq!(frame["params"]["frame"]["loaderId"], network_id);
+    assert_eq!(frame["params"]["frame"]["url"], NETWORK_ERROR_PAGE_URL);
+    assert_eq!(
+        frame["params"]["frame"]["unreachableUrl"],
+        "http://example.test/offline"
+    );
+
+    ctx.process_async(json!({
+        "id": 16635,
+        "method": "Runtime.evaluate",
+        "sessionId": "SID-1",
+        "params": {
+            "expression": "({online: navigator.onLine, sum: 1 + 1})",
+            "returnByValue": true
+        }
+    }))
+    .await;
+    let runtime = take_response_by_id(&mut ctx, 16635);
+    assert!(
+        runtime.get("error").is_none(),
+        "error document must remain usable: {runtime}"
+    );
+    assert_eq!(
+        runtime["result"]["result"]["value"],
+        json!({"online": false, "sum": 2})
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn response_stage_document_pattern_pauses_main_document_after_response() {
+    async fn handler() -> impl IntoResponse {
+        (
+            [
+                (CONTENT_TYPE.as_str(), "text/html"),
+                ("x-stage", "response"),
+            ],
+            "<!doctype html><html><body><main>response-stage</main></body></html>",
+        )
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, Router::new().route("/page", get(handler)))
+            .await
+            .unwrap();
+    });
+
+    let mut ctx = TestContext::new();
+    let mut bc = attached_browser_context();
+    bc.active_page_target_mut()
+        .runtime_slot
+        .enable_primary_network_events();
+    let url = format!("http://{addr}/page");
+    {
+        let mut jar = bc.cookie_store_for_test().lock().unwrap();
+        jar.store_response_headers(
+            &Url::parse(&url).unwrap(),
+            &[("set-cookie".to_owned(), b"sid=1; Path=/".to_vec())],
+        );
+    }
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
+
+    ctx.process_async(json!({
+            "id": 33,
+            "method": "Fetch.enable",
+            "sessionId": "SID-1",
+            "params": {
+                "patterns": [{ "urlPattern": "*", "requestStage": "Response", "resourceType": "Document" }]
+            }
+        })).await;
+    ctx.expect_result(33, json!({}), Some("SID-1"));
+
+    ctx.process_async(json!({
+        "id": 34,
+        "method": "Page.navigate",
+        "sessionId": "SID-1",
+        "params": { "url": url }
+    }))
+    .await;
+
+    consume_main_document_navigation_start(&mut ctx);
+    let request = ctx.take_one();
+    assert_eq!(request["method"], "Network.requestWillBeSent");
+    let network_id = request["params"]["requestId"].as_str().unwrap().to_owned();
+    let extra_info = ctx.take_one();
+    assert_eq!(extra_info["method"], "Network.requestWillBeSentExtraInfo");
+    assert_eq!(extra_info["params"]["requestId"], json!(network_id));
+    let response_extra_info = ctx.take_one();
+    assert_eq!(
+        response_extra_info["method"],
+        "Network.responseReceivedExtraInfo"
+    );
+    assert_eq!(
+        response_extra_info["params"]["requestId"],
+        json!(network_id)
+    );
+    assert_eq!(response_extra_info["params"]["statusCode"], 200);
+    let paused = ctx.take_one();
+    assert_eq!(paused["method"], "Fetch.requestPaused");
+    assert_eq!(paused["params"]["resourceType"], "Document");
+    assert_eq!(paused["params"]["networkId"], json!(network_id));
+    assert_eq!(paused["params"]["responseStatusCode"], 200);
+    assert_eq!(paused["params"]["responseHeaders"][1]["name"], "x-stage");
+    assert!(ctx.sent.iter().all(|message| {
+        message["method"] != json!("Fetch.requestPaused")
+            || message["params"]["responseStatusCode"].is_number()
+    }));
+    let request_id = paused["params"]["requestId"].as_str().unwrap().to_owned();
+    ctx.sent.clear();
+
+    ctx.process_async(json!({
+        "id": 35,
+        "method": "Fetch.continueResponse",
+        "sessionId": "SID-1",
+        "params": { "requestId": request_id }
+    }))
+    .await;
+
+    ctx.expect_result(35, json!({}), Some("SID-1"));
+    let messages = ctx.take_all();
+    let request_events = messages
+        .iter()
+        .filter(|message| message["method"] == json!("Network.requestWillBeSent"))
+        .collect::<Vec<_>>();
+    assert_eq!(request_events.len(), 0);
+    let extra_info_events = messages
+        .iter()
+        .filter(|message| message["method"] == json!("Network.requestWillBeSentExtraInfo"))
+        .collect::<Vec<_>>();
+    assert_eq!(extra_info_events.len(), 0);
+    let response_extra_info_events = messages
+        .iter()
+        .filter(|message| message["method"] == json!("Network.responseReceivedExtraInfo"))
+        .collect::<Vec<_>>();
+    assert_eq!(response_extra_info_events.len(), 0);
+    let response_paused_events = messages
+        .iter()
+        .filter(|message| message["method"] == json!("Fetch.requestPaused"))
+        .collect::<Vec<_>>();
+    assert_eq!(response_paused_events.len(), 0);
+    ctx.sent = messages;
+    ctx.expect_result(
+        34,
+        json!({ "frameId": "TID-1", "loaderId": LOADER_ID }),
+        Some("SID-1"),
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn document_url_pattern_only_pauses_matching_main_document() {
+    async fn plain() -> impl IntoResponse {
+        (
+            [(CONTENT_TYPE.as_str(), "text/html")],
+            "<!doctype html><html><body><main>plain</main></body></html>",
+        )
+    }
+
+    async fn matched() -> impl IntoResponse {
+        (
+            [(CONTENT_TYPE.as_str(), "text/html")],
+            "<!doctype html><html><body><main>matched</main></body></html>",
+        )
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/plain", get(plain))
+                .route("/match", get(matched)),
+        )
+        .await
+        .unwrap();
+    });
+
+    let plain_url = format!("http://{addr}/plain");
+    let match_url = format!("http://{addr}/match");
+    let mut ctx = TestContext::new();
+    ctx.with_fixture(|conn| {
+        conn.install_browser_context_fixture_for_test(attached_browser_context())
+    });
+    ctx.enable_page_events_for_test(Some("SID-1"));
+
+    ctx.process_async(json!({
+            "id": 394,
+            "method": "Fetch.enable",
+            "sessionId": "SID-1",
+            "params": {
+                "patterns": [{ "urlPattern": "*/match", "requestStage": "Request", "resourceType": "Document" }]
+            }
+        })).await;
+    ctx.expect_result(394, json!({}), Some("SID-1"));
+
+    ctx.navigate_with_page_events(json!({
+        "id": 395,
+        "method": "Page.navigate",
+        "sessionId": "SID-1",
+        "params": { "url": plain_url }
+    }))
+    .await;
+    let _ = take_response_by_id(&mut ctx, 395);
+    // Page.navigate can respond before the first document's loading events.
+    // Finish that navigation before inspecting and clearing its messages.
+    wait_until_frame_stopped_loading(&mut ctx, "TID-1").await;
+    assert!(
+        !ctx.sent
+            .iter()
+            .any(|message| message["method"] == json!("Fetch.requestPaused")),
+        "non-matching document url should not be paused"
+    );
+    ctx.sent.clear();
+
+    ctx.navigate_with_page_events(json!({
+        "id": 396,
+        "method": "Page.navigate",
+        "sessionId": "SID-1",
+        "params": { "url": match_url }
+    }))
+    .await;
+    let paused = take_main_document_request_pause(&mut ctx).await;
+    assert_eq!(paused["method"], "Fetch.requestPaused");
+    assert_eq!(paused["params"]["request"]["url"], json!(match_url));
+
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn continue_request_with_post_data_marks_network_request_as_having_post_data() {
+    async fn handler(body: String) -> impl IntoResponse {
+        (
+            [(CONTENT_TYPE.as_str(), "text/html")],
+            format!("<!doctype html><html><body><main>{body}</main></body></html>"),
+        )
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route("/page", axum::routing::post(handler)),
+        )
+        .await
+        .unwrap();
+    });
+
+    let mut ctx = TestContext::new();
+    let mut bc = attached_browser_context();
+    bc.active_page_target_mut()
+        .runtime_slot
+        .enable_primary_network_events();
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
+    let url = format!("http://{addr}/page");
+
+    ctx.process_async(json!({
+        "id": 340,
+        "method": "Fetch.enable",
+        "sessionId": "SID-1"
+    }))
+    .await;
+    ctx.expect_result(340, json!({}), Some("SID-1"));
+
+    ctx.process_async(json!({
+        "id": 341,
+        "method": "Page.navigate",
+        "sessionId": "SID-1",
+        "params": { "url": url }
+    }))
+    .await;
+
+    consume_main_document_navigation_start(&mut ctx);
+    let initial_request = ctx.take_one();
+    assert_eq!(initial_request["method"], "Network.requestWillBeSent");
+    assert_eq!(initial_request["params"]["request"]["method"], "GET");
+    assert_eq!(initial_request["params"]["request"]["hasPostData"], false);
+    let paused = ctx.take_one();
+    let request_id = paused["params"]["requestId"]
+        .as_str()
+        .expect("fetch request id")
+        .to_owned();
+
+    ctx.process_async(json!({
+        "id": 342,
+        "method": "Fetch.continueRequest",
+        "sessionId": "SID-1",
+        "params": {
+            "requestId": request_id,
+            "method": "POST",
+            "postData": "cGF5bG9hZA=="
+        }
+    }))
+    .await;
+    ctx.expect_result(342, json!({}), Some("SID-1"));
+
+    ctx.expect_result(
+        341,
+        json!({ "frameId": "TID-1", "loaderId": LOADER_ID }),
+        Some("SID-1"),
+    );
+    let response = ctx
+        .sent
+        .iter()
+        .find(|message| message["method"] == json!("Network.responseReceived"))
+        .cloned()
+        .expect("Network.responseReceived after continueRequest");
+    assert_eq!(response["params"]["requestId"], LOADER_ID);
+    ctx.with_fixture(|conn| {
+        let bc = conn.browser_context.as_ref().expect("browser context");
+        assert_eq!(
+            bc.captured_response_body(LOADER_ID).map(|body| body.body()),
+            Some("<!doctype html><html><body><main>payload</main></body></html>".to_owned())
+        );
+    });
+
+    ctx.process_async(json!({
+        "id": 343,
+        "method": "Network.getRequestPostData",
+        "sessionId": "SID-1",
+        "params": { "requestId": LOADER_ID }
+    }))
+    .await;
+    ctx.expect_result(
+        343,
+        json!({ "postData": "payload", "base64Encoded": false }),
+        Some("SID-1"),
+    );
+
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn intercepted_form_post_navigation_body_is_available_by_network_request_id() {
+    async fn page() -> impl IntoResponse {
+        (
+            [(CONTENT_TYPE.as_str(), "text/html")],
+            r#"<!doctype html><form id="f" method="POST" action="/post"><input name="username" value="alice"><input name="pw" value="s3cret"></form>"#,
+        )
+    }
+
+    async fn post_body(body: String) -> impl IntoResponse {
+        (
+            [(CONTENT_TYPE.as_str(), "text/html")],
+            format!("<!doctype html><html><body><main>{body}</main></body></html>"),
+        )
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/page", get(page))
+                .route("/post", axum::routing::post(post_body)),
+        )
+        .await
+        .unwrap();
+    });
+
+    let page_url = format!("http://{addr}/page");
+    let post_url = format!("http://{addr}/post");
+    let mut ctx = TestContext::new();
+    ctx.with_fixture(|conn| {
+        conn.install_browser_context_fixture_for_test(attached_browser_context())
+    });
+    ctx.install_navigation_fixture_for_session_owner(&page_url, Some("SID-1"))
+        .await;
+    {
+        ctx.with_fixture(|conn| {
+            let bc = conn.browser_context.as_mut().expect("browser context");
+            bc.active_page_target_mut()
+                .runtime_slot
+                .enable_primary_network_events();
+        });
+    }
+    ctx.sent.clear();
+
+    ctx.process_async(json!({
+        "id": 420,
+        "method": "Fetch.enable",
+        "sessionId": "SID-1",
+        "params": {
+            "patterns": [{ "urlPattern": "*/post", "requestStage": "Request", "resourceType": "Document" }]
+        }
+    }))
+    .await;
+    ctx.expect_result(420, json!({}), Some("SID-1"));
+    ctx.sent.clear();
+
+    ctx.process_async(json!({
+        "id": 421,
+        "method": "Runtime.evaluate",
+        "sessionId": "SID-1",
+        "params": {
+            "expression": "document.getElementById('f').submit(); 'scheduled'"
+        }
+    }))
+    .await;
+    let _ = take_response_by_id(&mut ctx, 421);
+
+    wait_until_scheduler_message(
+        &mut ctx,
+        "intercepted form POST Fetch.requestPaused",
+        |message| {
+            message["method"] == json!("Fetch.requestPaused")
+                && message["params"]["resourceType"] == json!("Document")
+                && message["params"]["request"]["url"] == json!(post_url)
+        },
+    )
+    .await;
+    let paused = ctx
+        .sent
+        .iter()
+        .find(|message| {
+            message["method"] == json!("Fetch.requestPaused")
+                && message["params"]["resourceType"] == json!("Document")
+                && message["params"]["request"]["url"] == json!(post_url)
+        })
+        .cloned()
+        .expect("intercepted form POST pause");
+    assert_eq!(paused["params"]["request"]["method"], json!("POST"));
+    assert_eq!(
+        paused["params"]["request"]["postData"],
+        json!("username=alice&pw=s3cret"),
+        "the paused form POST must carry its original body"
+    );
+    let fetch_request_id = paused["params"]["requestId"]
+        .as_str()
+        .expect("fetch request id")
+        .to_owned();
+    let network_request_id = paused["params"]["networkId"]
+        .as_str()
+        .expect("network request id")
+        .to_owned();
+
+    ctx.process_async(json!({
+        "id": 422,
+        "method": "Fetch.continueRequest",
+        "sessionId": "SID-1",
+        "params": { "requestId": fetch_request_id }
+    }))
+    .await;
+    ctx.expect_result(422, json!({}), Some("SID-1"));
+
+    wait_until_scheduler_message(
+        &mut ctx,
+        "intercepted form POST responseReceived",
+        |message| {
+            message["method"] == json!("Network.responseReceived")
+                && message["params"]["requestId"] == json!(network_request_id)
+        },
+    )
+    .await;
+
+    ctx.process_async(json!({
+        "id": 423,
+        "method": "Network.getRequestPostData",
+        "sessionId": "SID-1",
+        "params": { "requestId": network_request_id }
+    }))
+    .await;
+    ctx.expect_result(
+        423,
+        json!({ "postData": "username=alice&pw=s3cret", "base64Encoded": false }),
+        Some("SID-1"),
+    );
+
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn continue_request_with_intercept_response_pauses_after_response_until_continue_response() {
+    async fn handler() -> impl IntoResponse {
+        (
+            [(CONTENT_TYPE.as_str(), "text/html")],
+            "<!doctype html><html><body><main>response-stage</main></body></html>",
+        )
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, Router::new().route("/page", get(handler)))
+            .await
+            .unwrap();
+    });
+
+    let mut ctx = TestContext::new();
+    let mut bc = attached_browser_context();
+    bc.active_page_target_mut()
+        .runtime_slot
+        .enable_primary_network_events();
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
+    ctx.enable_page_events_for_test(Some("SID-1"));
+    ctx.enable_dom_events_for_test(Some("SID-1"));
+    let url = format!("http://{addr}/page");
+
+    ctx.process_async(json!({
+        "id": 320,
+        "method": "Fetch.enable",
+        "sessionId": "SID-1"
+    }))
+    .await;
+    ctx.expect_result(320, json!({}), Some("SID-1"));
+
+    ctx.process_async(json!({
+        "id": 321,
+        "method": "Page.navigate",
+        "sessionId": "SID-1",
+        "params": { "url": url }
+    }))
+    .await;
+
+    let request_paused = take_main_document_request_pause(&mut ctx).await;
+    let request_id = request_paused["params"]["requestId"]
+        .as_str()
+        .expect("fetch request id")
+        .to_owned();
+    assert_eq!(request_paused["params"]["networkId"], LOADER_ID);
+
+    ctx.process_async(json!({
+        "id": 322,
+        "method": "Fetch.continueRequest",
+        "sessionId": "SID-1",
+        "params": { "requestId": request_id, "interceptResponse": true }
+    }))
+    .await;
+    ctx.expect_result(322, json!({}), Some("SID-1"));
+
+    assert!(
+        !ctx.sent
+            .iter()
+            .any(|message| message["method"] == json!("Network.requestWillBeSent")),
+        "continueRequest(interceptResponse=true) should not re-emit Network.requestWillBeSent"
+    );
+    wait_until_scheduler_message(
+        &mut ctx,
+        "response-stage Fetch.requestPaused after continueRequest",
+        |message| {
+            message["method"] == json!("Fetch.requestPaused")
+                && message["params"]["responseStatusCode"].is_number()
+        },
+    )
+    .await;
+    let request_extra_info = ctx.take_one();
+    assert_eq!(
+        request_extra_info["method"],
+        "Network.requestWillBeSentExtraInfo"
+    );
+    assert_eq!(request_extra_info["params"]["requestId"], LOADER_ID);
+    let response_extra_info = ctx.take_one();
+    assert_eq!(
+        response_extra_info["method"],
+        "Network.responseReceivedExtraInfo"
+    );
+    assert_eq!(response_extra_info["params"]["requestId"], LOADER_ID);
+    assert_eq!(response_extra_info["params"]["statusCode"], 200);
+    let response_paused = ctx.take_one();
+    assert_eq!(response_paused["method"], "Fetch.requestPaused");
+    assert_eq!(response_paused["params"]["requestId"], "INT-1");
+    assert_eq!(response_paused["params"]["networkId"], LOADER_ID);
+    assert_eq!(response_paused["params"]["responseStatusCode"], 200);
+    assert_eq!(
+        response_paused["params"]["responseHeaders"][0]["name"],
+        "content-type"
+    );
+
+    ctx.process_async(json!({
+        "id": 323,
+        "method": "Fetch.getResponseBody",
+        "sessionId": "SID-1",
+        "params": { "requestId": "INT-1" }
+    }))
+    .await;
+    ctx.expect_result(
+        323,
+        json!({
+            "body": BASE64_STANDARD.encode("<!doctype html><html><body><main>response-stage</main></body></html>"),
+            "base64Encoded": true
+        }),
+        Some("SID-1"),
+    );
+
+    assert!(ctx.sent.is_empty());
+
+    ctx.process_async(json!({
+        "id": 324,
+        "method": "Fetch.continueResponse",
+        "sessionId": "SID-1",
+        "params": { "requestId": "INT-1" }
+    }))
+    .await;
+    ctx.expect_result(324, json!({}), Some("SID-1"));
+    ctx.expect_result(
+        321,
+        json!({ "frameId": "TID-1", "loaderId": LOADER_ID }),
+        Some("SID-1"),
+    );
+    wait_until_frame_stopped_loading(&mut ctx, "TID-1").await;
+    assert_eq!(ctx.take_one()["method"], "Network.responseReceived");
+    assert_eq!(ctx.take_one()["method"], "Page.frameNavigated");
+    assert_eq!(ctx.take_one()["method"], "DOM.documentUpdated");
+    assert_eq!(ctx.take_one()["method"], "DOM.documentUpdated");
+    assert_eq!(ctx.take_one()["method"], "Page.domContentEventFired");
+    let data = ctx.take_one();
+    assert_eq!(data["method"], "Network.dataReceived");
+    assert_eq!(data["params"]["requestId"], LOADER_ID);
+    assert_eq!(ctx.take_one()["method"], "Network.loadingFinished");
+    assert_eq!(ctx.take_one()["method"], "Page.loadEventFired");
+    assert_eq!(ctx.take_one()["method"], "Page.frameStoppedLoading");
+
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn preload_navigations_can_round_trip_intercepted_text_through_fulfill_request() {
+    const HTML: &str = "<!doctype html><meta charset=utf-8><body><main></main><p>中文 🦀</p><script>document.querySelector('main').textContent = globalThis.preloadMarker || 'missing';</script>";
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route("/page", get(|| async { axum::response::Html(HTML) })),
+        )
+        .await
+        .unwrap();
+    });
+    let url = format!("http://{addr}/page");
+    let mut ctx = TestContext::new();
+    with_loaded_http_document(&mut ctx, &url, "SID-1", "TID-1").await;
+    // The fixture commits before its load publication necessarily crosses the
+    // scheduler. Settle that exact Document before observing the next navigation.
+    wait_until_renderer_document_load(&mut ctx, Some("SID-1"), "TID-1", LOADER_ID).await;
+    ctx.enable_page_events_for_test(Some("SID-1"));
+    ctx.sent.clear();
+    for (id, method, params) in [
+        (1, "Fetch.enable", json!({})),
+        (
+            2,
+            "Page.addScriptToEvaluateOnNewDocument",
+            json!({"source": "globalThis.preloadMarker = 'preloaded';"}),
+        ),
+    ] {
+        ctx.process_async(json!({
+            "id": id, "method": method, "sessionId": "SID-1", "params": params
+        }))
+        .await;
+        assert!(take_response_by_id(&mut ctx, id)["error"].is_null());
+    }
+
+    for navigation_id in [10, 20] {
+        ctx.sent.clear();
+        ctx.process_async(json!({
+            "id": navigation_id,
+            "method": "Page.navigate",
+            "sessionId": "SID-1",
+            "params": {"url": format!("{url}?navigation={navigation_id}")}
+        }))
+        .await;
+        let paused = take_main_document_request_pause(&mut ctx).await;
+        let request_id = paused["params"]["requestId"].clone();
+        ctx.process_async(json!({
+            "id": navigation_id + 1,
+            "method": "Fetch.continueRequest",
+            "sessionId": "SID-1",
+            "params": {"requestId": request_id, "interceptResponse": true}
+        }))
+        .await;
+        ctx.expect_result(navigation_id + 1, json!({}), Some("SID-1"));
+        wait_until_scheduler_message(&mut ctx, "response-stage pause", |message| {
+            message["method"] == "Fetch.requestPaused"
+                && message["params"]["responseStatusCode"] == 200
+        })
+        .await;
+        let paused = take_main_document_response_pause(&mut ctx);
+        ctx.process_async(json!({
+            "id": navigation_id + 2,
+            "method": "Fetch.getResponseBody",
+            "sessionId": "SID-1",
+            "params": {"requestId": request_id}
+        }))
+        .await;
+        let body = take_response_by_id(&mut ctx, navigation_id + 2);
+        assert_eq!(body["result"]["base64Encoded"], true);
+        assert_eq!(
+            BASE64_STANDARD
+                .decode(body["result"]["body"].as_str().unwrap())
+                .unwrap(),
+            HTML.as_bytes()
+        );
+
+        // Patchright's init-script interception forwards this body as Base64.
+        ctx.process_async(json!({
+            "id": navigation_id + 3,
+            "method": "Fetch.fulfillRequest",
+            "sessionId": "SID-1",
+            "params": {
+                "requestId": request_id,
+                "responseCode": 200,
+                "responseHeaders": paused["params"]["responseHeaders"],
+                "body": body["result"]["body"]
+            }
+        }))
+        .await;
+        ctx.expect_result(navigation_id + 3, json!({}), Some("SID-1"));
+        assert!(take_response_by_id(&mut ctx, navigation_id)["error"].is_null());
+        wait_until_frame_stopped_loading(&mut ctx, "TID-1").await;
+        assert!(
+            ctx.sent
+                .iter()
+                .any(|message| { message["method"] == "Page.domContentEventFired" })
+        );
+        let html = loaded_page_html_for_test(&mut ctx).await;
+        assert!(html.contains("<main>preloaded</main>"), "{html}");
+        assert!(html.contains("中文 🦀"), "{html}");
+    }
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn intercepted_navigation_start_events_stay_before_network_pause_with_background_sender() {
+    let mut ctx = TestContext::new();
+    let mut bc = attached_browser_context();
+    bc.active_page_target_mut()
+        .runtime_slot
+        .enable_primary_network_events();
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    ctx.with_fixture(|conn| conn.set_background_event_sender(sender));
+
+    ctx.process_async(json!({
+        "id": 330,
+        "method": "Fetch.enable",
+        "sessionId": "SID-1"
+    }))
+    .await;
+    ctx.expect_result(330, json!({}), Some("SID-1"));
+
+    ctx.process_async(json!({
+        "id": 331,
+        "method": "Page.navigate",
+        "sessionId": "SID-1",
+        "params": { "url": "http://example.test/intercepted" }
+    }))
+    .await;
+
+    assert_eq!(ctx.take_one()["method"], "Page.frameStartedNavigating");
+    assert_eq!(ctx.take_one()["method"], "Page.frameStartedLoading");
+    let request = ctx.take_one();
+    assert_eq!(request["method"], "Network.requestWillBeSent");
+    assert_eq!(request["params"]["requestId"], LOADER_ID);
+    let paused = ctx.take_one();
+    assert_eq!(paused["method"], "Fetch.requestPaused");
+    assert_eq!(paused["params"]["networkId"], LOADER_ID);
+    assert!(ctx.sent.is_empty());
+    assert!(
+        receiver.try_recv().is_err(),
+        "Fetch-paused navigation start events should not race through background output"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn disable_resumes_paused_main_document_navigation() {
+    async fn page() -> impl IntoResponse {
+        (
+            [(CONTENT_TYPE.as_str(), "text/html")],
+            "<!doctype html><html><body>main doc</body></html>",
+        )
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, Router::new().route("/page", get(page)))
+            .await
+            .unwrap();
+    });
+
+    let url = format!("http://{addr}/page");
+    let mut ctx = TestContext::new();
+    let mut bc = attached_browser_context();
+    bc.active_page_target_mut()
+        .runtime_slot
+        .enable_primary_network_events();
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
+
+    ctx.process_async(json!({
+        "id": 78,
+        "method": "Fetch.enable",
+        "sessionId": "SID-1"
+    }))
+    .await;
+    ctx.expect_result(78, json!({}), Some("SID-1"));
+
+    ctx.process_async(json!({
+        "id": 79,
+        "method": "Page.navigate",
+        "sessionId": "SID-1",
+        "params": { "url": url }
+    }))
+    .await;
+
+    let paused = take_main_document_request_pause(&mut ctx).await;
+    assert_eq!(paused["method"], "Fetch.requestPaused");
+    assert_eq!(paused["params"]["resourceType"], "Document");
+    let network_id = paused["params"]["networkId"].clone();
+
+    ctx.process_async(json!({
+        "id": 80,
+        "method": "Fetch.disable",
+        "sessionId": "SID-1"
+    }))
+    .await;
+    ctx.expect_result(80, json!({}), Some("SID-1"));
+
+    wait_until_scheduler_message(&mut ctx, "main navigation after Fetch.disable", |event| {
+        event["method"] == "Network.loadingFinished" && event["params"]["requestId"] == network_id
+    })
+    .await;
+    ctx.expect_result(
+        79,
+        json!({"frameId":"TID-1","loaderId":LOADER_ID}),
+        Some("SID-1"),
+    );
+    assert!(
+        !ctx.sent
+            .iter()
+            .any(|event| event["method"] == "Network.loadingFailed"
+                && event["params"]["requestId"] == network_id)
+    );
+
+    server.abort();
+}

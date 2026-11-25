@@ -1,0 +1,20 @@
+[package]
+license.workspace = true
+name = "moli-indexeddb"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+moli-indexeddb-types = { path = "../moli-types/moli-indexeddb-types", features = ["sqlite-errors"] }
+parking_lot = "0.12.5"
+moli-file-api = { path = "../moli-file-api" }
+moli-crypto = { path = "../moli-crypto" }
+moli-sqlite = { path = "../moli-sqlite" }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+strum = { version = "0.28.0", features = ["derive"] }
+
+tokio = { version = "1.53.1", features = ["rt", "sync", "time", "macros"] }
+
+[lints]
+workspace = true

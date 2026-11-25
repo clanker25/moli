@@ -1,0 +1,161 @@
+use super::*;
+
+/// The renderer has already created this exact initial Page synchronously.
+/// Protocol adoption consumes its reservation without constructing a second
+/// Document or transferring any V8 handle between threads.
+#[derive(Clone, Debug)]
+pub struct RendererPendingAuxiliaryPage {
+    inner: Arc<PendingAuxiliaryPageReservation>,
+}
+
+#[derive(Debug)]
+struct PendingAuxiliaryPageReservation {
+    reservation: RendererPageReservationToken,
+    popup_id: u64,
+    runtime: Arc<dyn super::page::RendererRuntimeLease>,
+    output_journal: std::sync::OnceLock<RendererTurnOutputJournal>,
+}
+
+impl Drop for PendingAuxiliaryPageReservation {
+    fn drop(&mut self) {
+        // Cancellation is owner-local and idempotent after adoption. No V8
+        // handles or PageVm destructors run on the protocol thread.
+        self.runtime.cancel_pending_auxiliary_page(self.reservation);
+    }
+}
+
+impl PartialEq for RendererPendingAuxiliaryPage {
+    fn eq(&self, other: &Self) -> bool {
+        self.page_reservation() == other.page_reservation() && self.popup_id() == other.popup_id()
+    }
+}
+
+impl Eq for RendererPendingAuxiliaryPage {}
+
+impl RendererPendingAuxiliaryPage {
+    pub(crate) fn retain_output_journal(&self, journal: RendererTurnOutputJournal) {
+        self.inner
+            .output_journal
+            .set(journal)
+            .expect("one journal per auxiliary Page");
+    }
+
+    /// Called after protocol reserves this exact Page's output owner. Modal
+    /// prefixes must reach that owner before V8 adoption can run on the paused
+    /// renderer thread. Binding the journal requires no V8 or Page access.
+    pub fn bind_protocol_output(&self) {
+        if let Some(transport) = self
+            .renderer_runtime()
+            .browser_context_runtime()
+            .renderer_output_transport_sender()
+        {
+            self.inner
+                .output_journal
+                .get()
+                .expect("staged auxiliary Page has a journal")
+                .reserve_transport_for_initial_context(transport);
+        }
+    }
+
+    pub fn page_reservation(&self) -> RendererPageReservationToken {
+        self.inner.reservation
+    }
+
+    pub fn popup_id(&self) -> u64 {
+        self.inner.popup_id
+    }
+
+    pub fn renderer_runtime(&self) -> JsRuntime {
+        self.inner.runtime.clone().into_runtime()
+    }
+}
+
+pub(crate) struct RendererRelatedInitialEmptyPageInit {
+    pub(crate) dom_host: crate::dom::native::DomHost,
+    pub(crate) loader: ResourceRequestClient,
+    pub(crate) env: PageVmEnvConfig,
+    pub(crate) inherited_origin: String,
+    pub(crate) inherited_security_token: v8::Global<v8::Value>,
+    pub(crate) opener: Option<v8::Global<v8::Object>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct RendererAuxiliaryPageAllocator {
+    owner: owner_local_store::RendererOwnerLocalContext,
+    source_page: PageId,
+}
+
+impl RendererAuxiliaryPageAllocator {
+    pub(crate) fn capture_document_environment(
+        &self,
+        source_environment: &crate::script_vm::RendererPageScriptEnvironment,
+        environment: crate::script_vm::ScriptVmInitialDocumentEnvironment,
+        is_secure_context: bool,
+    ) -> Result<RendererCapturedDocumentEnvironment> {
+        ensure!(
+            source_environment.page_id() == self.source_page.as_u64(),
+            "document environment must use its exact initiator's allocator"
+        );
+        Ok(RendererCapturedDocumentEnvironment::capture(
+            &self.owner,
+            source_environment.capture_initial_document_environment(environment),
+            is_secure_context,
+        ))
+    }
+
+    pub(in crate::runtime) fn new(
+        owner: owner_local_store::RendererOwnerLocalContext,
+        source_page: PageId,
+    ) -> Self {
+        Self { owner, source_page }
+    }
+
+    pub(crate) fn stage_in_scope<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        source_environment: &crate::script_vm::RendererPageScriptEnvironment,
+        source_bindings: &crate::native_bridge::bindings::NativeBridgeBindings,
+        init: RendererRelatedInitialEmptyPageInit,
+    ) -> Result<(RendererPendingAuxiliaryPage, v8::Local<'s, v8::Object>)> {
+        ensure!(
+            source_environment.page_id() == self.source_page.as_u64(),
+            "an auxiliary Page must use its exact creator's allocator"
+        );
+        let page_id = PageId::new(
+            self.owner
+                .owner_state
+                .next_page_id
+                .fetch_add(1, Ordering::Relaxed),
+        );
+        let pending = RendererPendingAuxiliaryPage {
+            inner: Arc::new(PendingAuxiliaryPageReservation {
+                reservation: RendererPageReservationToken::new(self.owner.local_host_id, page_id),
+                popup_id: init
+                    .env
+                    .window_identity
+                    .auxiliary_window()
+                    .expect("auxiliary Page identity")
+                    .id(),
+                runtime: self
+                    .owner
+                    .owner_state
+                    .runtime_handle
+                    .get()
+                    .and_then(super::page::RendererProducerShutdownHandle::upgrade_runtime)
+                    .ok_or_else(|| anyhow!("auxiliary creator renderer is shutting down"))?,
+                output_journal: std::sync::OnceLock::new(),
+            }),
+        };
+        let environment =
+            owner_local_store::stage_related_initial_empty_page_on_bound_owner_local_store(
+                &self.owner,
+                scope,
+                &pending,
+                source_environment,
+                source_bindings,
+                init,
+            )?;
+        let window = environment.window_proxy_in_scope(scope)?;
+        Ok((pending, window))
+    }
+}

@@ -1,0 +1,73 @@
+<!doctype html>
+<meta charset="utf-8">
+<div id="dropzone" style="width:200px;height:200px">drop</div>
+<script src="/wpt/resources/testharness.js"></script>
+<script src="/wpt/resources/testharnessreport.js"></script>
+<script src="/wpt/resources/moli-wpt-adapter.js"></script>
+<script>
+const dropzone = document.getElementById("dropzone");
+let dropped = null;
+let captured = null;
+let resolveDrop = null;
+
+const dropPromise = new Promise(function (resolve) {
+  resolveDrop = resolve;
+});
+
+dropzone.addEventListener("dragover", function (event) {
+  event.preventDefault();
+});
+
+dropzone.addEventListener("drop", function (event) {
+  event.preventDefault();
+  dropped = event.dataTransfer;
+  const item = dropped.items[0];
+  captured = {
+    item,
+    itemCount: dropped.items.length,
+    types: Array.from(dropped.types),
+    fileCount: dropped.files.length,
+    kind: item.kind,
+    type: item.type,
+    file: item.getAsFile(),
+    entry: item.webkitGetAsEntry(),
+    repeatedEntry: item.webkitGetAsEntry(),
+  };
+  resolveDrop();
+});
+
+promise_test(async function () {
+  await dropPromise;
+  // A microtask still runs inside drop dispatch; the next task observes its cleanup.
+  await new Promise(resolve => step_timeout(resolve, 0));
+
+  assert_equals(captured.itemCount, 1, "directory payload should expose one item during drop");
+  assert_array_equals(captured.types, ["Files"], "directory payload should expose Files type");
+  assert_equals(captured.fileCount, 0, "directory payload should not expose a File object");
+
+  assert_equals(captured.kind, "file", "directory item still uses file kind");
+  assert_equals(captured.type, "", "directory item has no MIME type");
+  assert_equals(captured.file, null, "directory item does not expose getAsFile");
+  assert_equals(dropped.items.length, 0, "retained data store is disabled after drop");
+  assert_array_equals(Array.from(dropped.types), [], "disabled data store exposes no types");
+  assert_equals(captured.item.kind, "", "retained directory item is disabled after drop");
+  assert_equals(captured.item.webkitGetAsEntry(), null, "disabled item cannot expose its entry again");
+
+  const entry = captured.entry;
+  assert_true(entry instanceof FileSystemEntry, "directory entry inherits FileSystemEntry");
+  assert_true(entry instanceof FileSystemDirectoryEntry, "directory item returns a directory entry");
+  assert_false(entry instanceof FileSystemFileEntry, "directory entry is not a file entry");
+  assert_false(entry.isFile, "directory entry reports not isFile");
+  assert_true(entry.isDirectory, "directory entry reports isDirectory");
+  assert_equals(entry.name, "photos", "directory entry name");
+  assert_equals(entry.fullPath, "/photos", "directory entry fullPath");
+  assert_equals(entry, captured.repeatedEntry, "webkitGetAsEntry returns a stable entry wrapper during drop");
+
+  const reader = entry.createReader();
+  assert_equals(typeof reader.readEntries, "function", "directory reader exposes readEntries");
+  const entries = await new Promise(function (resolve) {
+    reader.readEntries(resolve);
+  });
+  assert_array_equals(entries, [], "empty manifest directory has no child entries");
+}, "Input.dispatchDragEvent exposes dropped directories through webkitGetAsEntry");
+</script>

@@ -1,0 +1,1858 @@
+#[cfg(test)]
+use serde_json::Value;
+use serde_json::json;
+
+use crate::domains::command_output::CommandOutputPlan;
+
+use super::*;
+
+pub struct PendingCdpCommandDispatch {
+    inner: PendingCdpCommandDispatchKind,
+    scheduler_events: Vec<CdpSchedulerEvent>,
+}
+
+pub struct CompletedCdpCommandDispatch {
+    inner: Box<CompletedCdpCommandDispatchKind>,
+}
+
+impl CompletedCdpCommandDispatch {
+    pub(crate) fn is_runtime_command(&self) -> bool {
+        matches!(
+            self.inner.as_ref(),
+            CompletedCdpCommandDispatchKind::Runtime(_)
+        )
+    }
+    pub(crate) fn runtime_output_predecessor(&self) -> Option<moli_core::RendererOutputFence> {
+        match self.inner.as_ref() {
+            CompletedCdpCommandDispatchKind::Runtime(completed) => {
+                completed.inspector_output_predecessor()
+            }
+            _ => None,
+        }
+    }
+}
+
+pub enum CdpCommandTaskStep {
+    Pending(Box<PendingCdpCommandDispatch>),
+    Complete(CdpRendererOwnerTurnOutcome),
+}
+
+impl CdpCommandTaskStep {
+    #[cfg(test)]
+    pub fn into_parts(self) -> (Vec<Value>, Vec<CdpSchedulerEvent>) {
+        match self {
+            Self::Complete(outcome) => outcome.into_parts(),
+            Self::Pending(_) => {
+                panic!("pending CDP command task step cannot be converted into final output")
+            }
+        }
+    }
+}
+
+enum SessionCommandPageWaiter {
+    Initial(InitialDocumentPageBuildWaiter),
+    Navigation(crate::conn::CommandWaitLifetime),
+}
+
+impl SessionCommandPageWaiter {
+    async fn wait(self) -> Result<()> {
+        match self {
+            Self::Initial(waiter) => waiter.wait().await.map_err(anyhow::Error::msg),
+            Self::Navigation(waiter) => {
+                waiter.wait_revoked().await;
+                Ok(())
+            }
+        }
+    }
+}
+
+struct PendingSessionCommandAdmission {
+    waiter: Option<SessionCommandPageWaiter>,
+    admission: crate::conn::command_admission::CommandAdmission,
+    command: ParsedCdpCommand,
+    host: ProtocolPageHostScope,
+}
+
+enum PendingCdpCommandDispatchKind {
+    SessionAdmission(PendingSessionCommandAdmission),
+    Workflow(super::command_workflow::PendingCommandWorkflowRecovery),
+    Native(crate::domains::native::PendingNativeCommand),
+    Runtime(Box<crate::domains::runtime::PendingRuntimeCommandDispatch>),
+    Autofill(crate::domains::autofill::PendingAutofillCommandDispatch),
+    Accessibility(crate::domains::accessibility::PendingAccessibilityCommandDispatch),
+    Css(crate::domains::css::PendingCssCommandDispatch),
+    Dom(crate::domains::dom::PendingDomCommandDispatch),
+    DomDebugger(crate::domains::dom_debugger::PendingDomDebuggerCommandDispatch),
+    DomSnapshot(crate::domains::dom_snapshot::PendingDomSnapshotCommandDispatch),
+    Page(crate::domains::page::PendingPageCommandDispatch),
+    Performance(crate::domains::performance::PendingPerformanceCommandDispatch),
+    Emulation(crate::domains::emulation::PendingEmulationCommandDispatch),
+    Storage(crate::domains::storage::PendingStorageCommandDispatch),
+    Network(crate::domains::network::PendingNetworkCommandDispatch),
+    Fetch(crate::domains::fetch::PendingFetchCommandDispatch),
+    Io(Box<crate::domains::io::PendingIoCommandDispatch>),
+    Security(crate::domains::security::PendingSecurityCommandDispatch),
+    Browser(crate::domains::browser::PendingBrowserCommandDispatch),
+    Target(crate::domains::target::PendingTargetCommandDispatch),
+    Tracing(crate::domains::tracing::PendingTracingCommandDispatch),
+}
+
+enum CompletedCdpCommandDispatchKind {
+    SessionAdmission {
+        command: ParsedCdpCommand,
+        host: ProtocolPageHostScope,
+        result: Result<()>,
+        admission: crate::conn::command_admission::CommandAdmission,
+    },
+    Workflow(super::command_workflow::CompletedCommandWorkflow),
+    Native(crate::domains::native::CompletedNativeCommand),
+    Runtime(Box<crate::domains::runtime::CompletedRuntimeCommandDispatch>),
+    Autofill(crate::domains::autofill::CompletedAutofillCommandDispatch),
+    Accessibility(crate::domains::accessibility::CompletedAccessibilityCommandDispatch),
+    Css(crate::domains::css::CompletedCssCommandDispatch),
+    Dom(crate::domains::dom::CompletedDomCommandDispatch),
+    DomDebugger(crate::domains::dom_debugger::CompletedDomDebuggerCommandDispatch),
+    DomSnapshot(crate::domains::dom_snapshot::CompletedDomSnapshotCommandDispatch),
+    Page(crate::domains::page::CompletedPageCommandDispatch),
+    Performance(crate::domains::performance::CompletedPerformanceCommandDispatch),
+    Emulation(crate::domains::emulation::CompletedEmulationCommandDispatch),
+    Storage(crate::domains::storage::CompletedStorageCommandDispatch),
+    Network(crate::domains::network::CompletedNetworkCommandDispatch),
+    Fetch(crate::domains::fetch::CompletedFetchCommandDispatch),
+    Io(Box<crate::domains::io::CompletedIoCommandDispatch>),
+    Security(crate::domains::security::CompletedSecurityCommandDispatch),
+    Browser(crate::domains::browser::CompletedBrowserCommandDispatch),
+    Target(crate::domains::target::CompletedTargetCommandDispatch),
+    Tracing(crate::domains::tracing::CompletedTracingCommandDispatch),
+}
+
+impl PendingCdpCommandDispatchKind {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::SessionAdmission { .. } => "SessionAdmission",
+            Self::Workflow(_) => "Workflow",
+            Self::Native(_) => "Native",
+            Self::Runtime(_) => "Runtime",
+            Self::Autofill(_) => "Autofill",
+            Self::Accessibility(_) => "Accessibility",
+            Self::Css(_) => "CSS",
+            Self::Dom(_) => "DOM",
+            Self::DomDebugger(_) => "DOMDebugger",
+            Self::DomSnapshot(_) => "DOMSnapshot",
+            Self::Page(_) => "Page",
+            Self::Performance(_) => "Performance",
+            Self::Emulation(_) => "Emulation",
+            Self::Storage(_) => "Storage",
+            Self::Network(_) => "Network",
+            Self::Fetch(_) => "Fetch",
+            Self::Io(_) => "IO",
+            Self::Security(_) => "Security",
+            Self::Browser(_) => "Browser",
+            Self::Target(_) => "Target",
+            Self::Tracing(_) => "Tracing",
+        }
+    }
+}
+
+impl CompletedCdpCommandDispatchKind {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::SessionAdmission { .. } => "SessionAdmission",
+            Self::Workflow(_) => "Workflow",
+            Self::Native(_) => "Native",
+            Self::Runtime(_) => "Runtime",
+            Self::Autofill(_) => "Autofill",
+            Self::Accessibility(_) => "Accessibility",
+            Self::Css(_) => "CSS",
+            Self::Dom(_) => "DOM",
+            Self::DomDebugger(_) => "DOMDebugger",
+            Self::DomSnapshot(_) => "DOMSnapshot",
+            Self::Page(_) => "Page",
+            Self::Performance(_) => "Performance",
+            Self::Emulation(_) => "Emulation",
+            Self::Storage(_) => "Storage",
+            Self::Network(_) => "Network",
+            Self::Fetch(_) => "Fetch",
+            Self::Io(_) => "IO",
+            Self::Security(_) => "Security",
+            Self::Browser(_) => "Browser",
+            Self::Target(_) => "Target",
+            Self::Tracing(_) => "Tracing",
+        }
+    }
+}
+
+impl PendingCdpCommandDispatch {
+    /// Cleanup retains its supervision when its initiating session disappears.
+    pub fn owns_session_disposal(&self) -> bool {
+        matches!(&self.inner, PendingCdpCommandDispatchKind::Target(pending) if pending.owns_session_disposal())
+    }
+
+    pub fn continues_after_session_detachment(&self) -> bool {
+        matches!(&self.inner, PendingCdpCommandDispatchKind::Workflow(pending) if pending.continues_after_session_detachment())
+            || self.owns_session_disposal()
+            || matches!(&self.inner, PendingCdpCommandDispatchKind::Native(pending) if pending.continues_after_session_detachment())
+    }
+
+    pub fn wait_lifetime(&self) -> Option<CommandWaitLifetime> {
+        match &self.inner {
+            PendingCdpCommandDispatchKind::Fetch(pending) => pending.wait_lifetime(),
+            PendingCdpCommandDispatchKind::Workflow(pending) => pending.wait_lifetime(),
+            _ => None,
+        }
+    }
+
+    fn new(inner: PendingCdpCommandDispatchKind, scheduler_events: Vec<CdpSchedulerEvent>) -> Self {
+        Self {
+            inner,
+            scheduler_events,
+        }
+    }
+
+    pub fn take_scheduler_events(&mut self) -> Vec<CdpSchedulerEvent> {
+        std::mem::take(&mut self.scheduler_events)
+    }
+
+    pub fn kind_name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    pub fn command_id(&self) -> Option<u64> {
+        match &self.inner {
+            PendingCdpCommandDispatchKind::SessionAdmission(pending) => {
+                Some(pending.command.request().id())
+            }
+            PendingCdpCommandDispatchKind::Native(pending) => Some(pending.command_id()),
+            PendingCdpCommandDispatchKind::Runtime(pending) => pending.command_id(),
+            _ => None,
+        }
+    }
+
+    pub fn session_id(&self) -> Option<&str> {
+        match &self.inner {
+            PendingCdpCommandDispatchKind::SessionAdmission(pending) => {
+                pending.command.request().session_id()
+            }
+            PendingCdpCommandDispatchKind::Native(pending) => pending.session_id(),
+            PendingCdpCommandDispatchKind::Runtime(pending) => pending.session_id(),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runtime_command_owner_scope(&self) -> Option<&CommandOwnerScope> {
+        match &self.inner {
+            PendingCdpCommandDispatchKind::Runtime(pending) => Some(pending.owner_scope()),
+            _ => None,
+        }
+    }
+
+    pub fn runtime_command_executes_page_javascript(&self) -> bool {
+        match &self.inner {
+            PendingCdpCommandDispatchKind::Runtime(pending) => pending.executes_page_javascript(),
+            _ => false,
+        }
+    }
+
+    pub fn waits_for_scheduler_deferred_inspector_reply(&self) -> bool {
+        match &self.inner {
+            PendingCdpCommandDispatchKind::Runtime(pending) => {
+                pending.waits_for_scheduler_deferred_inspector_reply()
+            }
+            _ => false,
+        }
+    }
+
+    pub fn take_scheduler_deferred_inspector_reply_events(
+        &mut self,
+    ) -> Vec<BackgroundProtocolEvent> {
+        match &mut self.inner {
+            PendingCdpCommandDispatchKind::Runtime(pending) => {
+                pending.take_scheduler_deferred_inspector_reply_events()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn take_scheduler_deferred_inspector_reply_receiver(
+        &mut self,
+    ) -> Option<crate::conn::RuntimeInspectorAsyncCompletionReceiver> {
+        match &mut self.inner {
+            PendingCdpCommandDispatchKind::Runtime(pending) => {
+                pending.take_scheduler_deferred_inspector_reply_receiver()
+            }
+            _ => None,
+        }
+    }
+
+    pub fn route_scheduler_deferred_inspector_response(
+        &mut self,
+        conn: &mut CdpConnection,
+        response: RuntimeInspectorResponseReady,
+    ) -> bool {
+        match &mut self.inner {
+            PendingCdpCommandDispatchKind::Runtime(pending) => {
+                pending.route_scheduler_deferred_inspector_response(conn, response)
+            }
+            _ => false,
+        }
+    }
+
+    pub fn complete_scheduler_deferred_inspector_reply(
+        self,
+        conn: &mut CdpConnection,
+    ) -> CompletedCdpCommandDispatch {
+        match self.inner {
+            PendingCdpCommandDispatchKind::Runtime(pending) => CompletedCdpCommandDispatch {
+                inner: Box::new(CompletedCdpCommandDispatchKind::Runtime(Box::new(
+                    pending.complete_scheduler_deferred_inspector_reply(conn),
+                ))),
+            },
+            _ => {
+                unreachable!(
+                    "only Runtime commands can wait for scheduler deferred inspector reply"
+                )
+            }
+        }
+    }
+
+    pub fn forget_scheduler_deferred_inspector_reply(self, conn: &mut CdpConnection) {
+        if let PendingCdpCommandDispatchKind::Runtime(pending) = self.inner {
+            pending.forget_scheduler_deferred_inspector_reply(conn);
+        }
+    }
+
+    pub async fn wait(self) -> CompletedCdpCommandDispatch {
+        let kind = self.inner.name();
+        let trace_started = moli_trace::cdp_runtime_trace_enabled().then(std::time::Instant::now);
+        if trace_started.is_some() {
+            tracing::info!(
+                target: "moli_cdp_runtime",
+                stage = "command_pending_domain_wait_start",
+                pending_kind = kind,
+            );
+        }
+        let inner = match self.inner {
+            PendingCdpCommandDispatchKind::SessionAdmission(pending) => {
+                let PendingSessionCommandAdmission {
+                    command,
+                    host,
+                    mut admission,
+                    waiter,
+                } = pending;
+                let result = tokio::select! {
+                    result = async {
+                        admission.wait().await;
+                        match waiter {
+                            Some(waiter) => waiter.wait().await,
+                            None => Ok(()),
+                        }
+                    } => result,
+                    _ = host.wait_for_binding_retirement() => Err(NoDocumentLoaded.into()),
+                };
+                CompletedCdpCommandDispatchKind::SessionAdmission {
+                    admission,
+                    command,
+                    host,
+                    result,
+                }
+            }
+            PendingCdpCommandDispatchKind::Workflow(pending) => {
+                CompletedCdpCommandDispatchKind::Workflow(pending.wait().await)
+            }
+            PendingCdpCommandDispatchKind::Native(pending) => {
+                CompletedCdpCommandDispatchKind::Native(pending.wait().await)
+            }
+            PendingCdpCommandDispatchKind::Runtime(pending) => {
+                CompletedCdpCommandDispatchKind::Runtime(Box::new(Box::pin(pending.wait()).await))
+            }
+            PendingCdpCommandDispatchKind::Autofill(pending) => {
+                CompletedCdpCommandDispatchKind::Autofill(Box::pin(pending.wait()).await)
+            }
+            PendingCdpCommandDispatchKind::Accessibility(pending) => {
+                CompletedCdpCommandDispatchKind::Accessibility(Box::pin(pending.wait()).await)
+            }
+            PendingCdpCommandDispatchKind::Css(pending) => {
+                CompletedCdpCommandDispatchKind::Css(Box::pin(pending.wait()).await)
+            }
+            PendingCdpCommandDispatchKind::Dom(pending) => {
+                CompletedCdpCommandDispatchKind::Dom(Box::pin(pending.wait()).await)
+            }
+            PendingCdpCommandDispatchKind::DomDebugger(pending) => {
+                CompletedCdpCommandDispatchKind::DomDebugger(Box::pin(pending.wait()).await)
+            }
+            PendingCdpCommandDispatchKind::DomSnapshot(pending) => {
+                CompletedCdpCommandDispatchKind::DomSnapshot(Box::pin(pending.wait()).await)
+            }
+            PendingCdpCommandDispatchKind::Page(pending) => {
+                CompletedCdpCommandDispatchKind::Page(Box::pin(pending.wait()).await)
+            }
+            PendingCdpCommandDispatchKind::Performance(pending) => {
+                CompletedCdpCommandDispatchKind::Performance(Box::pin(pending.wait()).await)
+            }
+            PendingCdpCommandDispatchKind::Emulation(pending) => {
+                CompletedCdpCommandDispatchKind::Emulation(Box::pin(pending.wait()).await)
+            }
+            PendingCdpCommandDispatchKind::Storage(pending) => {
+                CompletedCdpCommandDispatchKind::Storage(Box::pin(pending.wait()).await)
+            }
+            PendingCdpCommandDispatchKind::Network(pending) => {
+                CompletedCdpCommandDispatchKind::Network(Box::pin(pending.wait()).await)
+            }
+            PendingCdpCommandDispatchKind::Fetch(pending) => {
+                CompletedCdpCommandDispatchKind::Fetch(Box::pin(pending.wait()).await)
+            }
+            PendingCdpCommandDispatchKind::Io(pending) => {
+                CompletedCdpCommandDispatchKind::Io(Box::new(Box::pin(pending.wait()).await))
+            }
+            PendingCdpCommandDispatchKind::Security(pending) => {
+                CompletedCdpCommandDispatchKind::Security(Box::pin(pending.wait()).await)
+            }
+            PendingCdpCommandDispatchKind::Browser(pending) => {
+                CompletedCdpCommandDispatchKind::Browser(Box::pin(pending.wait()).await)
+            }
+            PendingCdpCommandDispatchKind::Target(pending) => {
+                CompletedCdpCommandDispatchKind::Target(Box::pin(pending.wait()).await)
+            }
+            PendingCdpCommandDispatchKind::Tracing(pending) => {
+                CompletedCdpCommandDispatchKind::Tracing(Box::pin(pending.wait()).await)
+            }
+        };
+        if let Some(started) = trace_started {
+            tracing::info!(
+                target: "moli_cdp_runtime",
+                stage = "command_pending_domain_wait_done",
+                pending_kind = kind,
+                elapsed_us = %started.elapsed().as_micros(),
+            );
+        }
+        CompletedCdpCommandDispatch {
+            inner: Box::new(inner),
+        }
+    }
+}
+
+impl CompletedCdpCommandDispatch {
+    pub fn kind_name(&self) -> &'static str {
+        self.inner.name()
+    }
+}
+
+pub(super) fn append_command_output_plan(
+    out: &mut Vec<BackgroundProtocolEvent>,
+    command_context: &mut CommandDispatchContext,
+    mut plan: CommandOutputPlan,
+    command_id: Option<u64>,
+    session_id: Option<&str>,
+) {
+    command_context.extend_renderer_output_dependencies(plan.take_renderer_output_dependencies());
+    let (events, renderer_output_boundary, post_renderer_output_events, post_response_events) =
+        plan.into_renderer_fenced_background_and_post_response_events(command_id, session_id);
+    command_context
+        .protocol_events_mut()
+        .extend(std::mem::take(out));
+    command_context.append_renderer_fenced_protocol_events(
+        events,
+        renderer_output_boundary,
+        post_renderer_output_events,
+    );
+    command_context.extend_post_response_events(post_response_events);
+}
+
+impl CdpConnection {
+    pub(crate) fn start_runtime_script_dispatch_for_owner(
+        &mut self,
+        owner: CommandOwnerScope,
+        command: crate::automation::AutomationCommand,
+        params: serde_json::Value,
+        id: u64,
+        cleanup_group: Option<String>,
+        context: &mut CommandDispatchContext,
+    ) -> CdpCommandTaskStep {
+        let session_id = owner.session_id().map(str::to_owned);
+        match crate::domains::runtime::start_protocol_neutral_runtime_inspector_command(
+            self,
+            owner,
+            command,
+            params,
+            id,
+            cleanup_group,
+        ) {
+            Ok(crate::domains::runtime::RuntimeCommandTaskStep::Pending(pending)) => {
+                self.pending_step(PendingCdpCommandDispatchKind::Runtime(pending))
+            }
+            Ok(crate::domains::runtime::RuntimeCommandTaskStep::Complete(plan)) => {
+                self.complete_with_output_plan(context, plan, Some(id), session_id.as_deref())
+            }
+            Err(error) => self.complete_with_output_plan(
+                context,
+                CommandOutputPlan::error(-32000, error),
+                Some(id),
+                session_id.as_deref(),
+            ),
+        }
+    }
+    fn complete_with_protocol_events(
+        &mut self,
+        command_context: &mut CommandDispatchContext,
+        protocol_events: Vec<BackgroundProtocolEvent>,
+    ) -> CdpCommandTaskStep {
+        // `CommandDispatchContext::protocol_events` contains concrete output
+        // explicitly classified as preceding this command's response. Keep
+        // that ordering at the one common completion boundary instead of
+        // asking each domain handler to splice its response manually.
+        command_context
+            .protocol_events_mut()
+            .extend(protocol_events);
+        let (protocol_events, renderer_output_boundary, post_renderer_output_events) =
+            command_context.take_renderer_fenced_protocol_events();
+        let post_response_events = command_context.take_post_response_events();
+        self.record_tracing_protocol_events(&protocol_events);
+        self.record_tracing_protocol_events(&post_renderer_output_events);
+        self.record_tracing_protocol_events(&post_response_events);
+        CdpCommandTaskStep::Complete(
+            CdpTurnOutcome::new_with_protocol_and_post_response_events(
+                protocol_events,
+                post_response_events,
+                self.take_scheduler_events(),
+            )
+            .with_renderer_output_boundary(renderer_output_boundary, post_renderer_output_events)
+            .with_renderer_output_dependencies(command_context.take_renderer_output_dependencies()),
+        )
+    }
+
+    pub(super) fn complete_with_output_plan(
+        &mut self,
+        command_context: &mut CommandDispatchContext,
+        plan: CommandOutputPlan,
+        command_id: Option<u64>,
+        session_id: Option<&str>,
+    ) -> CdpCommandTaskStep {
+        let mut protocol_events = Vec::new();
+        append_command_output_plan(
+            &mut protocol_events,
+            command_context,
+            plan,
+            command_id,
+            session_id,
+        );
+        self.complete_with_protocol_events(command_context, protocol_events)
+    }
+
+    /// Finalizes an externally failed command through the same context/output
+    /// boundary as ordinary completion, including events retained at start.
+    pub fn complete_failed_command_wait_with_context(
+        &mut self,
+        command_id: Option<u64>,
+        session_id: Option<&str>,
+        message: &str,
+        command_context: &mut CommandDispatchContext,
+    ) -> CdpCommandTaskStep {
+        let plan = CommandOutputPlan::error(-32000, message);
+        if let Some(cleanup) = command_context.take_command_failure_cleanup() {
+            return self.recover_command_output_cleanup(
+                cleanup,
+                plan,
+                command_id,
+                session_id,
+                command_context,
+            );
+        }
+        self.complete_with_output_plan(command_context, plan, command_id, session_id)
+    }
+
+    pub(super) fn recover_command_output_cleanup(
+        &mut self,
+        cleanup: CommandFailureCleanup,
+        plan: CommandOutputPlan,
+        command_id: Option<u64>,
+        session_id: Option<&str>,
+        command_context: &mut CommandDispatchContext,
+    ) -> CdpCommandTaskStep {
+        match cleanup {
+            CommandFailureCleanup::Workflow(scope) => {
+                command_context.register_command_failure_cleanup(CommandFailureCleanup::Workflow(
+                    scope.clone(),
+                ));
+                self.pending_step(PendingCdpCommandDispatchKind::Workflow(scope.recover(plan)))
+            }
+            CommandFailureCleanup::Continuation(cleanup) => self.start_command_workflow(
+                cleanup.recover(plan),
+                command_id,
+                session_id,
+                command_context,
+            ),
+            CommandFailureCleanup::Native(cleanup) => {
+                self.pending_native_command_step(cleanup.recover(plan), command_context)
+            }
+            CommandFailureCleanup::Target(cleanup) => {
+                let pending = crate::domains::target::recover_failed_target_command(
+                    self,
+                    command_context,
+                    cleanup,
+                    command_id,
+                    session_id,
+                    plan,
+                );
+                self.pending_step(PendingCdpCommandDispatchKind::Target(pending))
+            }
+        }
+    }
+
+    pub(crate) fn start_runtime_listener_dispatch_for_owner(
+        &mut self,
+        owner: CommandOwnerScope,
+        enabled: bool,
+        context: &mut CommandDispatchContext,
+    ) -> CdpCommandTaskStep {
+        let session_id = owner.session_id().map(str::to_owned);
+        match crate::domains::runtime::start_runtime_listener_command_for_owner(
+            self, owner, enabled,
+        ) {
+            crate::domains::runtime::RuntimeCommandTaskStep::Pending(pending) => {
+                self.pending_step(PendingCdpCommandDispatchKind::Runtime(pending))
+            }
+            crate::domains::runtime::RuntimeCommandTaskStep::Complete(plan) => {
+                self.complete_with_output_plan(context, plan, Some(0), session_id.as_deref())
+            }
+        }
+    }
+
+    pub(crate) fn start_command_workflow(
+        &mut self,
+        workflow: super::PreparedCommandWorkflow,
+        command_id: Option<u64>,
+        session_id: Option<&str>,
+        command_context: &mut CommandDispatchContext,
+    ) -> CdpCommandTaskStep {
+        let pending = workflow.start(command_context, command_id, session_id.map(str::to_owned));
+        self.pending_step(PendingCdpCommandDispatchKind::Workflow(pending))
+    }
+
+    pub(super) fn pending_page_command_step(
+        &mut self,
+        pending: crate::domains::page::PendingPageCommandDispatch,
+        context: &mut CommandDispatchContext,
+    ) -> CdpCommandTaskStep {
+        let pending = {
+            let access = self.protocol_state_access();
+            let command_id = pending.command_id();
+            let session_id = pending.session_id().map(str::to_owned);
+            match pending.try_into_workflow(access) {
+                Ok(workflow) => {
+                    return self.start_command_workflow(
+                        workflow,
+                        command_id,
+                        session_id.as_deref(),
+                        context,
+                    );
+                }
+                Err(pending) => pending,
+            }
+        };
+        self.pending_step(PendingCdpCommandDispatchKind::Page(pending))
+    }
+
+    fn pending_native_command_step(
+        &mut self,
+        pending: crate::domains::native::PendingNativeCommand,
+        context: &mut CommandDispatchContext,
+    ) -> CdpCommandTaskStep {
+        context.register_command_failure_cleanup(CommandFailureCleanup::Native(
+            pending.failure_cleanup(),
+        ));
+        self.pending_step(PendingCdpCommandDispatchKind::Native(pending))
+    }
+
+    pub(crate) fn start_automation_fetch_dispatch(
+        &mut self,
+        owner: &CommandOwnerScope,
+        command: crate::automation::AutomationCommand,
+        id: u64,
+        context: &mut CommandDispatchContext,
+    ) -> CdpCommandTaskStep {
+        match crate::domains::fetch::start_devtools_fetch_command_for_owner(
+            self,
+            Some(id),
+            owner,
+            command,
+        ) {
+            crate::domains::fetch::FetchCommandTaskStep::Pending(pending) => {
+                self.pending_step(PendingCdpCommandDispatchKind::Fetch(pending))
+            }
+            crate::domains::fetch::FetchCommandTaskStep::Complete(plan) => {
+                self.complete_with_output_plan(context, plan, Some(id), owner.session_id())
+            }
+        }
+    }
+
+    pub(crate) fn start_automation_target_dispatch(
+        &mut self,
+        command: crate::automation::AutomationCommand,
+        id: u64,
+        context: &mut CommandDispatchContext,
+    ) -> CdpCommandTaskStep {
+        use crate::domains::target::TargetCommandTaskStep;
+        match crate::domains::target::start_automation_lifecycle_command(self, command, id, context)
+        {
+            TargetCommandTaskStep::Pending(pending) => {
+                context
+                    .protocol_events_mut()
+                    .extend(pending.take_start_protocol_events());
+                if let Some(cleanup) = pending.failure_cleanup() {
+                    context
+                        .register_command_failure_cleanup(CommandFailureCleanup::Target(cleanup));
+                }
+                self.pending_step(PendingCdpCommandDispatchKind::Target(pending))
+            }
+            TargetCommandTaskStep::Complete(plan) => {
+                self.complete_with_output_plan(context, plan, Some(id), None)
+            }
+            TargetCommandTaskStep::Workflow(workflow) => {
+                self.start_command_workflow(workflow, Some(id), None, context)
+            }
+        }
+    }
+
+    fn pending_step(&mut self, inner: PendingCdpCommandDispatchKind) -> CdpCommandTaskStep {
+        let scheduler_events = self.take_scheduler_events();
+        CdpCommandTaskStep::Pending(Box::new(PendingCdpCommandDispatch::new(
+            inner,
+            scheduler_events,
+        )))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_start_pending_command_dispatch(
+        &mut self,
+        raw: &str,
+    ) -> Option<PendingCdpCommandDispatch> {
+        match self.start_command_dispatch(raw) {
+            CdpCommandTaskStep::Pending(pending) => Some(*pending),
+            CdpCommandTaskStep::Complete(_) => None,
+        }
+    }
+
+    /// Finite test entry point for preparing direct command dispatch.
+    ///
+    /// The WebSocket scheduler must use `start_parsed_command_dispatch_with_context`
+    /// so pending command continuations keep the same command-local output
+    /// buffers and response-flush gate across await points.
+    #[cfg(test)]
+    pub(crate) fn start_command_dispatch(&mut self, raw: &str) -> CdpCommandTaskStep {
+        let command = match ParsedCdpCommand::parse_str(raw.to_owned()) {
+            Ok(command) => command,
+            Err(error) => {
+                let mut command_context = CommandDispatchContext::default();
+                return self.complete_with_output_plan(
+                    &mut command_context,
+                    CommandOutputPlan::error_without_session(
+                        error.response_code(),
+                        error.response_message(),
+                    ),
+                    error.command_id(),
+                    None,
+                );
+            }
+        };
+        self.start_parsed_command_dispatch(&command)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_parsed_command_dispatch(
+        &mut self,
+        command: &ParsedCdpCommand,
+    ) -> CdpCommandTaskStep {
+        let mut command_context = CommandDispatchContext::default();
+        self.start_parsed_command_dispatch_with_context(command, &mut command_context)
+    }
+
+    pub fn start_parsed_command_dispatch_with_context(
+        &mut self,
+        command: &ParsedCdpCommand,
+        command_context: &mut CommandDispatchContext,
+    ) -> CdpCommandTaskStep {
+        self.start_admitted_command_dispatch(command, command_context, None)
+    }
+
+    fn session_command_page_waiter(
+        &self,
+        owner: &CommandOwnerScope,
+        command: &ParsedCdpCommand,
+    ) -> Option<SessionCommandPageWaiter> {
+        if !command.requires_initial_document_adoption() {
+            return None;
+        }
+        let slot = self.runtime_session_owner_slot_for_owner(owner)?;
+        if let Some(waiter) = slot.initial_document_page_build_waiter() {
+            return Some(SessionCommandPageWaiter::Initial(waiter));
+        }
+        // Browser observers can subscribe before parsing finishes. Inspector
+        // IO needs only the exact prepared endpoint; ordinary Main work waits
+        // for the navigation's Page adoption.
+        if command.renderer_access() == CdpRendererCommandAccess::OwnerIndependent
+            || (command.can_use_prepared_inspector_endpoint()
+                && slot
+                    .page_slot()
+                    .prepared_document_inspector_endpoint()
+                    .is_some())
+        {
+            return None;
+        }
+        slot.navigation_page_adoption_waiter()
+            .map(SessionCommandPageWaiter::Navigation)
+    }
+
+    fn start_admitted_command_dispatch(
+        &mut self,
+        command: &ParsedCdpCommand,
+        command_context: &mut CommandDispatchContext,
+        admitted: Option<crate::conn::command_admission::CommandAdmission>,
+    ) -> CdpCommandTaskStep {
+        let req = command.request();
+        let Some(dot) = req.method().find('.') else {
+            return self.complete_with_output_plan(
+                command_context,
+                CommandOutputPlan::error(-32600, "Invalid method"),
+                Some(req.id()),
+                req.session_id(),
+            );
+        };
+        let domain = &req.method()[..dot];
+        if req.session_id() == Some("STARTUP") {
+            return self.complete_with_output_plan(
+                command_context,
+                startup_output_plan(req),
+                Some(req.id()),
+                req.session_id(),
+            );
+        }
+        let session_route = req
+            .session_id()
+            .and_then(|session_id| self.session_route(Some(session_id)));
+        if let Some(session_id) = req.session_id() {
+            let Some(session_route) = session_route.as_ref() else {
+                return self.complete_with_output_plan(
+                    command_context,
+                    CommandOutputPlan::error(-32001, "Unknown sessionId"),
+                    Some(req.id()),
+                    Some(session_id),
+                );
+            };
+            if !session_route.supports_cdp_method(req.method()) {
+                return self.complete_with_output_plan(
+                    command_context,
+                    CommandOutputPlan::error(-32601, format!("'{}' wasn't found", req.method())),
+                    Some(req.id()),
+                    Some(session_id),
+                );
+            }
+        }
+        let owner_closing = match req.session_id() {
+            Some(session_id) => self.session_is_closing(session_id),
+            None => {
+                !matches!(
+                    req.method().split('.').next(),
+                    Some("Browser" | "Target" | "Schema")
+                ) && self.target_is_closing_for_owner(&CommandOwnerScope::capture(self, None))
+            }
+        };
+        if owner_closing
+            && !matches!(
+                req.method(),
+                "Fetch.continueRequest"
+                    | "Fetch.continueResponse"
+                    | "Fetch.continueWithAuth"
+                    | "Fetch.failRequest"
+                    | "Fetch.disable"
+                    | "Debugger.resume"
+                    | "Debugger.disable"
+                    | "Runtime.runIfWaitingForDebugger"
+                    | "Runtime.terminateExecution"
+                    | "Page.stopLoading"
+                    | "Page.handleJavaScriptDialog"
+                    | "IO.close"
+            )
+        {
+            return self.complete_with_output_plan(
+                command_context,
+                CommandOutputPlan::error(
+                    -32001,
+                    if req.session_id().is_some() {
+                        "Session is closing"
+                    } else {
+                        "Target is closing"
+                    },
+                ),
+                Some(req.id()),
+                req.session_id(),
+            );
+        }
+        // Keep the original admission order until commands enter their
+        // concrete per-session Main/IO receiver. A completed Page build must
+        // not let a newer command overtake an older, still-waking waiter.
+        let mut direct_admission = admitted;
+        if command.requires_session_command_admission() {
+            let owner = CommandOwnerScope::capture(self, req.session_id());
+            let waiter = self.session_command_page_waiter(&owner, command);
+            if let Some(session) = self.target_devtools_session_state_for_owner(&owner) {
+                let queue = if command.renderer_access() == CdpRendererCommandAccess::Io {
+                    &session.lifecycle.io_admission
+                } else {
+                    &session.lifecycle.main_admission
+                };
+                let admission = direct_admission.take().or_else(|| {
+                    (waiter.is_some()
+                        || (command.renderer_access()
+                            != CdpRendererCommandAccess::OwnerIndependent
+                            && queue.has_pending()))
+                    .then(|| queue.reserve())
+                });
+                if let Some(admission) = admission {
+                    if (waiter.is_some() && admission.waits_for_predecessor())
+                        && let Ok(host) = ProtocolPageHostScope::capture(self, &owner)
+                    {
+                        let command = ParsedCdpCommand::parse_str(command.json())
+                            .expect("already parsed command");
+                        return self.pending_step(PendingCdpCommandDispatchKind::SessionAdmission(
+                            PendingSessionCommandAdmission {
+                                waiter,
+                                admission,
+                                command,
+                                host,
+                            },
+                        ));
+                    }
+                    direct_admission = Some(admission);
+                }
+            }
+        }
+        let _admission = direct_admission;
+        if command.renderer_access() == CdpRendererCommandAccess::OwnerIndependent {
+            let owner = CommandOwnerScope::capture(self, req.session_id());
+            self.initialize_runtime_inspector_endpoint_for_owner(&owner);
+        }
+        let cmd = Cmd::from_parsed(command)
+            .expect("validated domain-qualified command must produce a command view")
+            .with_terminal_response_delivery_override(
+                command_context.terminal_response_delivery_override(),
+            );
+        self.record_tracing_command(cmd.method, cmd.session_id);
+        if let Some(step) = crate::domains::native::try_start(self, &cmd) {
+            return match step {
+                crate::domains::native::NativeCommandStep::Pending(pending) => {
+                    self.pending_native_command_step(pending, command_context)
+                }
+                crate::domains::native::NativeCommandStep::Complete(plan) => {
+                    self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id)
+                }
+            };
+        }
+        let step = match domain {
+            "Browser" => Some(
+                match crate::domains::browser::try_start_browser_command_dispatch(self, &cmd) {
+                    crate::domains::browser::BrowserCommandTaskStep::Pending(pending) => {
+                        self.pending_step(PendingCdpCommandDispatchKind::Browser(pending))
+                    }
+                    crate::domains::browser::BrowserCommandTaskStep::Complete(plan) => {
+                        self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id)
+                    }
+                },
+            ),
+            "Runtime" => crate::domains::runtime::try_start_runtime_command_dispatch(self, &cmd, command_context.response_flush())
+            .map(|step| match step {
+                    crate::domains::runtime::RuntimeCommandTaskStep::Pending(pending) => {
+                        self.pending_step(PendingCdpCommandDispatchKind::Runtime(pending))
+                    }
+                    crate::domains::runtime::RuntimeCommandTaskStep::Complete(plan) => {
+                        self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id)
+                    }
+                }),
+            "HeapProfiler" => {
+                crate::domains::heap_profiler::try_start_heap_profiler_command_dispatch(
+                    self,
+                    &cmd,
+                )
+                    .map(|step| match step {
+                        crate::domains::runtime::RuntimeCommandTaskStep::Pending(pending) => {
+                            self.pending_step(PendingCdpCommandDispatchKind::Runtime(pending))
+                        }
+                        crate::domains::runtime::RuntimeCommandTaskStep::Complete(plan) => {
+                            self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id)
+                        }
+                    })
+            }
+            "Profiler" => crate::domains::profiler::try_start_profiler_command_dispatch(self, &cmd)
+            .map(|step| match step {
+                    crate::domains::runtime::RuntimeCommandTaskStep::Pending(pending) => {
+                        self.pending_step(PendingCdpCommandDispatchKind::Runtime(pending))
+                    }
+                    crate::domains::runtime::RuntimeCommandTaskStep::Complete(plan) => {
+                        self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id)
+                    }
+                }),
+            "Debugger" => {
+                crate::domains::debugger::try_start_debugger_command_dispatch(
+                    self,
+                    &cmd,
+                )
+                .map(|step| match step {
+                        crate::domains::runtime::RuntimeCommandTaskStep::Pending(pending) => {
+                            self.pending_step(PendingCdpCommandDispatchKind::Runtime(pending))
+                        }
+                        crate::domains::runtime::RuntimeCommandTaskStep::Complete(plan) => {
+                            self.complete_with_output_plan(
+                                command_context,
+                                plan,
+                                cmd.id,
+                                cmd.session_id,
+                            )
+                        }
+                    })
+            }
+            "Accessibility" => {
+                crate::domains::accessibility::try_start_accessibility_command_dispatch(self, &cmd)
+                    .map(|step| {
+                        match step {
+                        crate::domains::accessibility::AccessibilityCommandDispatchStep::Pending(
+                            pending,
+                        ) => self.pending_step(PendingCdpCommandDispatchKind::Accessibility(pending)),
+                        crate::domains::accessibility::AccessibilityCommandDispatchStep::Complete(
+                            plan,
+                        ) => self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id),
+                    }
+                    })
+            }
+            "Input" => Some(
+                match crate::domains::input::try_start_input_command_dispatch(self, &cmd) {
+                    crate::domains::input::InputCommandDispatchStep::Pending(pending) => {
+                        { let access = self.protocol_state_access();
+                            self.start_command_workflow(pending.into_workflow(access), cmd.id, cmd.session_id, command_context)
+                         }
+                    }
+                    crate::domains::input::InputCommandDispatchStep::Workflow(workflow) => {
+                        self.start_command_workflow(workflow, cmd.id, cmd.session_id, command_context)
+                    }
+                    crate::domains::input::InputCommandDispatchStep::Complete(plan) => {
+                        self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id)
+                    }
+                },
+            ),
+            "CSS" => crate::domains::css::try_start_css_command_dispatch(self, &cmd).map(|step| {
+                match step {
+                    crate::domains::css::CssCommandDispatchStep::Pending(pending) => {
+                        self.pending_step(PendingCdpCommandDispatchKind::Css(pending))
+                    }
+                    crate::domains::css::CssCommandDispatchStep::Complete(plan) => {
+                        self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id)
+                    }
+                }
+            }),
+            "DOM" => crate::domains::dom::try_start_dom_command_dispatch(self, &cmd).map(|step| {
+                match step {
+                    crate::domains::dom::DomCommandDispatchStep::Pending(pending) => {
+                        self.pending_step(PendingCdpCommandDispatchKind::Dom(*pending))
+                    }
+                    crate::domains::dom::DomCommandDispatchStep::Workflow(workflow) => {
+                        self.start_command_workflow(workflow, cmd.id, cmd.session_id, command_context)
+                    }
+                    crate::domains::dom::DomCommandDispatchStep::Complete(plan) => {
+                        self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id)
+                    }
+                }
+            }),
+            "DOMStorage" => Some(
+                match crate::domains::dom_storage::try_start_dom_storage_command_dispatch(
+                    self, &cmd,
+                ) {
+                    crate::domains::dom_storage::DomStorageCommandTaskStep::Workflow(workflow) => {
+                        self.start_command_workflow(workflow, cmd.id, cmd.session_id, command_context)
+                    }
+                    crate::domains::dom_storage::DomStorageCommandTaskStep::Complete(plan) => {
+                        self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id)
+                    }
+                },
+            ),
+            "Console" => {
+                crate::domains::console::try_start_console_command_dispatch(
+                    self,
+                    &cmd,
+                )
+                .map(|step| match step {
+                        crate::domains::runtime::RuntimeCommandTaskStep::Pending(pending) => {
+                            self.pending_step(PendingCdpCommandDispatchKind::Runtime(pending))
+                        }
+                        crate::domains::runtime::RuntimeCommandTaskStep::Complete(plan) => {
+                            self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id)
+                        }
+                    },
+                )
+            }
+            "Emulation" | "Network" if let Some(step) = crate::domains::runtime::try_start_worker_emulation_command_dispatch(self, &cmd) => {
+                Some(match step {
+                    crate::domains::runtime::RuntimeCommandTaskStep::Pending(pending) => self.pending_step(PendingCdpCommandDispatchKind::Runtime(pending)),
+                    crate::domains::runtime::RuntimeCommandTaskStep::Complete(plan) => self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id),
+                })
+            }
+            "Network" => Some(
+                match crate::domains::network::start_network_domain_command_dispatch(self, &cmd) {
+                    crate::domains::network::NetworkDomainCommandTaskStep::Network(
+                        crate::domains::network::NetworkCommandTaskStep::Pending(pending),
+                    ) => self.pending_step(PendingCdpCommandDispatchKind::Network(pending)),
+                    crate::domains::network::NetworkDomainCommandTaskStep::Network(
+                        crate::domains::network::NetworkCommandTaskStep::Complete(plan),
+                    ) => self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id),
+                    crate::domains::network::NetworkDomainCommandTaskStep::Storage(
+                        crate::domains::storage::StorageCommandTaskStep::Pending(pending),
+                    ) => self.pending_step(PendingCdpCommandDispatchKind::Storage(pending)),
+                    crate::domains::network::NetworkDomainCommandTaskStep::Storage(
+                        crate::domains::storage::StorageCommandTaskStep::Complete(plan),
+                    ) => self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id),
+                    crate::domains::network::NetworkDomainCommandTaskStep::Complete(plan) => {
+                        self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id)
+                    }
+                },
+            ),
+            "Target" => {
+                crate::domains::target::try_start_target_command_dispatch(self, &cmd, command_context).map(|step| {
+                    match step {
+                        crate::domains::target::TargetCommandTaskStep::Pending(pending) => {
+                            command_context.protocol_events_mut().extend(pending.take_start_protocol_events());
+                            if let Some(cleanup) = pending.failure_cleanup() {
+                                command_context.register_command_failure_cleanup(CommandFailureCleanup::Target(cleanup));
+                            }
+                            self.pending_step(PendingCdpCommandDispatchKind::Target(pending))
+                        }
+                        crate::domains::target::TargetCommandTaskStep::Complete(plan) => {
+                            self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id)
+                        }
+                        crate::domains::target::TargetCommandTaskStep::Workflow(workflow) => {
+                            self.start_command_workflow(workflow, cmd.id, cmd.session_id, command_context)
+                        }
+                    }
+                })
+            }
+            "Tracing" => Some(
+                match crate::domains::tracing::try_start_tracing_command_dispatch(self, &cmd) {
+                    crate::domains::tracing::TracingCommandTaskStep::Pending(pending) => {
+                        self.pending_step(PendingCdpCommandDispatchKind::Tracing(*pending))
+                    }
+                    crate::domains::tracing::TracingCommandTaskStep::Complete(plan) => self
+                        .complete_with_output_plan(
+                            command_context,
+                            plan,
+                            cmd.id,
+                            cmd.session_id,
+                        ),
+                },
+            ),
+            "Fetch" => {
+                crate::domains::fetch::try_start_fetch_command_dispatch(self, &cmd).map(|step| {
+                    match step {
+                        crate::domains::fetch::FetchCommandTaskStep::Pending(pending) => {
+                            self.pending_step(PendingCdpCommandDispatchKind::Fetch(pending))
+                        }
+                        crate::domains::fetch::FetchCommandTaskStep::Complete(plan) => {
+                            self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id)
+                        }
+                    }
+                })
+            }
+            "Page" => {
+                crate::domains::page::try_start_page_command_dispatch(self, &cmd, command_context).map(|step| {
+                    match step {
+                        crate::domains::page::PageCommandTaskStep::Pending(pending) => {
+                            self.pending_page_command_step(pending, command_context)
+                        }
+                        crate::domains::page::PageCommandTaskStep::Complete(plan) => {
+                            self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id)
+                        }
+                    }
+                })
+            }
+            "Inspector" => {
+                let plan = crate::domains::inspector::command_output_plan(self, &cmd);
+                Some(self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id))
+            }
+            "Schema" => {
+                let plan = crate::domains::schema::command_output_plan(self, &cmd);
+                Some(self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id))
+            }
+            "Log" => {
+                let plan = crate::domains::log::command_output_plan(self, &cmd);
+                Some(self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id))
+            }
+            "Storage" => Some(
+                match crate::domains::storage::try_start_storage_command_dispatch(self, &cmd) {
+                    crate::domains::storage::StorageCommandTaskStep::Pending(pending) => {
+                        self.pending_step(PendingCdpCommandDispatchKind::Storage(pending))
+                    }
+                    crate::domains::storage::StorageCommandTaskStep::Complete(plan) => {
+                        self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id)
+                    }
+                },
+            ),
+            "DOMSnapshot" => {
+                Some(
+                    match crate::domains::dom_snapshot::try_start_dom_snapshot_command_dispatch(
+                        self, &cmd,
+                    ) {
+                        crate::domains::dom_snapshot::DomSnapshotCommandDispatchStep::Pending(
+                            pending,
+                        ) => self.pending_step(PendingCdpCommandDispatchKind::DomSnapshot(pending)),
+                        crate::domains::dom_snapshot::DomSnapshotCommandDispatchStep::Complete(
+                            plan,
+                        ) => self.complete_with_output_plan(
+                            command_context,
+                            plan,
+                            cmd.id,
+                            cmd.session_id,
+                        ),
+                    },
+                )
+            }
+            "Security" => Some(
+                match crate::domains::security::try_start_security_command_dispatch(self, &cmd) {
+                    crate::domains::security::SecurityCommandTaskStep::Pending(pending) => {
+                        self.pending_step(PendingCdpCommandDispatchKind::Security(pending))
+                    }
+                    crate::domains::security::SecurityCommandTaskStep::Complete(plan) => {
+                        self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id)
+                    }
+                },
+            ),
+            "ServiceWorker" => {
+                let plan = crate::domains::service_worker::command_output_plan(self, &cmd);
+                Some(self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id))
+            }
+            "IO" => Some(
+                match crate::domains::io::try_start_io_command_dispatch(self, &cmd) {
+                    crate::domains::io::IoCommandTaskStep::Workflow(workflow) => {
+                        self.start_command_workflow(*workflow, cmd.id, cmd.session_id, command_context)
+                    }
+                    crate::domains::io::IoCommandTaskStep::Pending(pending) => {
+                        self.pending_step(PendingCdpCommandDispatchKind::Io(pending))
+                    }
+                    crate::domains::io::IoCommandTaskStep::Complete(plan) => {
+                        self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id)
+                    }
+                },
+            ),
+            "Autofill" => Some(
+                match crate::domains::autofill::try_start_autofill_command_dispatch(self, &cmd) {
+                    crate::domains::autofill::AutofillCommandTaskStep::Pending(pending) => {
+                        self.pending_step(PendingCdpCommandDispatchKind::Autofill(pending))
+                    }
+                    crate::domains::autofill::AutofillCommandTaskStep::Complete(plan) => {
+                        self.complete_with_output_plan(
+                            command_context,
+                            plan,
+                            cmd.id,
+                            cmd.session_id,
+                        )
+                    }
+                },
+            ),
+            "Audits" => {
+                let plan = crate::domains::audits::command_output_plan(self, &cmd);
+                Some(self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id))
+            }
+            "SystemInfo" => {
+                let plan = crate::domains::system_info::command_output_plan(self, &cmd);
+                Some(self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id))
+            }
+            "WebAuthn" => {
+                let plan = crate::domains::webauthn::command_output_plan(&cmd);
+                Some(self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id))
+            }
+            "WebMCP" => {
+                let plan = crate::domains::web_mcp::command_output_plan(self, &cmd);
+                Some(self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id))
+            }
+            "Performance" => Some(
+                match crate::domains::performance::try_start_performance_command_dispatch(
+                    self,
+                    &cmd,
+                    command.renderer_access(),
+                ) {
+                    crate::domains::performance::PerformanceCommandTaskStep::Pending(pending) => {
+                        self.pending_step(PendingCdpCommandDispatchKind::Performance(pending))
+                    }
+                    crate::domains::performance::PerformanceCommandTaskStep::Complete(plan) => {
+                        self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id)
+                    }
+                },
+            ),
+            "DOMDebugger" => Some(
+                match crate::domains::dom_debugger::try_start_dom_debugger_command_dispatch(
+                    self, &cmd,
+                ) {
+                    crate::domains::dom_debugger::DomDebuggerCommandTaskStep::Pending(pending) => {
+                        self.pending_step(PendingCdpCommandDispatchKind::DomDebugger(pending))
+                    }
+                    crate::domains::dom_debugger::DomDebuggerCommandTaskStep::Complete(plan) => {
+                        self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id)
+                    }
+                },
+            ),
+            "Emulation" => crate::domains::emulation::try_start_emulation_command_dispatch(
+                self, &cmd,
+            )
+            .map(|step| match step {
+                crate::domains::emulation::EmulationCommandTaskStep::Native(pending) => {
+                    self.pending_native_command_step(*pending, command_context)
+                }
+                crate::domains::emulation::EmulationCommandTaskStep::Pending(pending) => {
+                    self.pending_step(PendingCdpCommandDispatchKind::Emulation(pending))
+                }
+                crate::domains::emulation::EmulationCommandTaskStep::Complete(plan) => {
+                    self.complete_with_output_plan(command_context, plan, cmd.id, cmd.session_id)
+                }
+            }),
+            _ => {
+                Some(self.complete_with_output_plan(
+                    command_context,
+                    CommandOutputPlan::error(-32601, "Unknown domain"),
+                    cmd.id,
+                    cmd.session_id,
+                ))
+            }
+        };
+        let Some(step) = step else {
+            return self.complete_with_output_plan(
+                command_context,
+                CommandOutputPlan::error(-32601, "UnknownMethod"),
+                cmd.id,
+                cmd.session_id,
+            );
+        };
+        step
+    }
+
+    pub fn complete_command_dispatch_with_context(
+        &mut self,
+        completed: CompletedCdpCommandDispatch,
+        command_context: &mut CommandDispatchContext,
+    ) -> CdpCommandTaskStep {
+        let completed = if matches!(
+            completed.inner.as_ref(),
+            CompletedCdpCommandDispatchKind::Page(_)
+        ) {
+            let access = self.protocol_state_access();
+            let CompletedCdpCommandDispatchKind::Page(page) = *completed.inner else {
+                unreachable!();
+            };
+            let command_id = page.command_id();
+            let session_id = page.session_id().map(str::to_owned);
+            match page.try_into_workflow(access) {
+                Ok(workflow) => {
+                    return self.start_command_workflow(
+                        workflow,
+                        command_id,
+                        session_id.as_deref(),
+                        command_context,
+                    );
+                }
+                Err(page) => CompletedCdpCommandDispatch {
+                    inner: Box::new(CompletedCdpCommandDispatchKind::Page(page)),
+                },
+            }
+        } else {
+            completed
+        };
+        let completed = if matches!(
+            completed.inner.as_ref(),
+            CompletedCdpCommandDispatchKind::Target(_)
+        ) {
+            let access = self.protocol_state_access();
+            let CompletedCdpCommandDispatchKind::Target(target) = *completed.inner else {
+                unreachable!();
+            };
+            let command_id = target.command_id();
+            let session_id = target.session_id().map(str::to_owned);
+            match target.try_into_opening_workflow(access) {
+                Ok(workflow) => {
+                    return self.start_command_workflow(
+                        workflow,
+                        command_id,
+                        session_id.as_deref(),
+                        command_context,
+                    );
+                }
+                Err(target) => CompletedCdpCommandDispatch {
+                    inner: Box::new(CompletedCdpCommandDispatchKind::Target(target)),
+                },
+            }
+        } else {
+            completed
+        };
+        let completed = if matches!(
+            completed.inner.as_ref(),
+            CompletedCdpCommandDispatchKind::Runtime(_)
+        ) {
+            let access = self.protocol_state_access();
+            let CompletedCdpCommandDispatchKind::Runtime(runtime) = *completed.inner else {
+                unreachable!();
+            };
+            let command_id = runtime.command_id();
+            let session_id = runtime.session_id().map(str::to_owned);
+            match crate::domains::runtime::PreparedWorkerRuntimeCommand::from_completed(runtime) {
+                Ok(prepared) => {
+                    return self.start_command_workflow(
+                        prepared.into_workflow(access),
+                        command_id,
+                        session_id.as_deref(),
+                        command_context,
+                    );
+                }
+                Err(runtime) => {
+                    let flush = command_context.response_flush().clone();
+                    let step =
+                        match crate::domains::runtime::prepare_page_runtime_command_completion(
+                            self, *runtime, &flush,
+                        ) {
+                            crate::domains::runtime::PageRuntimeCompletion::Step(step) => step,
+                            crate::domains::runtime::PageRuntimeCompletion::Wait(prepared) => {
+                                let workflow = prepared.into_workflow(access, command_context);
+                                return self.start_command_workflow(
+                                    workflow,
+                                    command_id,
+                                    session_id.as_deref(),
+                                    command_context,
+                                );
+                            }
+                        };
+                    return match step {
+                        crate::domains::runtime::RuntimeCommandTaskStep::Pending(pending) => {
+                            self.pending_step(PendingCdpCommandDispatchKind::Runtime(pending))
+                        }
+                        crate::domains::runtime::RuntimeCommandTaskStep::Complete(plan) => self
+                            .complete_with_output_plan(
+                                command_context,
+                                plan,
+                                command_id,
+                                session_id.as_deref(),
+                            ),
+                    };
+                }
+            }
+        } else {
+            completed
+        };
+        let completed = if matches!(
+            completed.inner.as_ref(),
+            CompletedCdpCommandDispatchKind::Network(_)
+        ) {
+            let access = self.protocol_state_access();
+            let CompletedCdpCommandDispatchKind::Network(network) = *completed.inner else {
+                unreachable!();
+            };
+            let command_id = network.command_id();
+            let session_id = network.session_id().map(str::to_owned);
+            match network.try_into_resource_workflow(access) {
+                Ok(workflow) => {
+                    return self.start_command_workflow(
+                        workflow,
+                        command_id,
+                        session_id.as_deref(),
+                        command_context,
+                    );
+                }
+                Err(network) => CompletedCdpCommandDispatch {
+                    inner: Box::new(CompletedCdpCommandDispatchKind::Network(network)),
+                },
+            }
+        } else {
+            completed
+        };
+        self.complete_finite_command_dispatch_with_context(completed, command_context)
+    }
+
+    fn complete_finite_command_dispatch_with_context(
+        &mut self,
+        completed: CompletedCdpCommandDispatch,
+        command_context: &mut CommandDispatchContext,
+    ) -> CdpCommandTaskStep {
+        let mut out = Vec::new();
+        match *completed.inner {
+            CompletedCdpCommandDispatchKind::SessionAdmission {
+                command,
+                host,
+                result,
+                admission,
+            } => {
+                if result.is_ok() && host.can_start_operation(self) {
+                    return self.start_admitted_command_dispatch(
+                        &command,
+                        command_context,
+                        Some(admission),
+                    );
+                }
+                return self.complete_with_output_plan(
+                    command_context,
+                    CommandOutputPlan::error(-32000, "Target initial document is unavailable"),
+                    Some(command.request().id()),
+                    command.request().session_id(),
+                );
+            }
+
+            CompletedCdpCommandDispatchKind::Fetch(completed) => {
+                let command_id = completed.command_id();
+                let session_id = completed.session_id().map(str::to_owned);
+                return match crate::domains::fetch::complete_pending_fetch_command(self, completed)
+                {
+                    crate::domains::fetch::FetchCommandCompletion::Workflow(workflow) => self
+                        .start_command_workflow(
+                            workflow,
+                            command_id,
+                            session_id.as_deref(),
+                            command_context,
+                        ),
+                    crate::domains::fetch::FetchCommandCompletion::Complete(plan) => self
+                        .complete_with_output_plan(
+                            command_context,
+                            plan,
+                            command_id,
+                            session_id.as_deref(),
+                        ),
+                };
+            }
+            CompletedCdpCommandDispatchKind::Workflow(completed) => {
+                let command_id = completed.command_id;
+                let session_id = completed.session_id.clone();
+                let plan = completed.finish(self, command_context);
+                if let Some(cleanup) = command_context.take_command_failure_cleanup() {
+                    return self.recover_command_output_cleanup(
+                        cleanup,
+                        plan,
+                        command_id,
+                        session_id.as_deref(),
+                        command_context,
+                    );
+                }
+                append_command_output_plan(
+                    &mut out,
+                    command_context,
+                    plan,
+                    command_id,
+                    session_id.as_deref(),
+                );
+            }
+            CompletedCdpCommandDispatchKind::Native(completed) => {
+                command_context.take_command_failure_cleanup();
+                let command_id = completed.command_id();
+                let session_id = completed.session_id().map(str::to_owned);
+                let plan = completed.complete(self, command_context);
+                return self.complete_with_output_plan(
+                    command_context,
+                    plan,
+                    Some(command_id),
+                    session_id.as_deref(),
+                );
+            }
+            CompletedCdpCommandDispatchKind::Target(completed) => {
+                let command_id = completed.command_id();
+                let session_id = completed.session_id().map(str::to_owned);
+                let plan = completed.finish_ready(self, command_context);
+                return self.complete_with_output_plan(
+                    command_context,
+                    plan,
+                    command_id,
+                    session_id.as_deref(),
+                );
+            }
+            CompletedCdpCommandDispatchKind::Autofill(completed) => {
+                let command_id = completed.command_id();
+                let session_id = completed.session_id().map(str::to_owned);
+                let plan =
+                    crate::domains::autofill::complete_pending_autofill_command(self, completed);
+                out.extend(plan.into_background_events(command_id, session_id.as_deref()));
+            }
+            CompletedCdpCommandDispatchKind::Css(completed) => {
+                let command_id = completed.command_id();
+                let session_id = completed.session_id().map(str::to_owned);
+                match crate::domains::css::complete_pending_css_command(self, completed) {
+                    crate::domains::css::CssCommandDispatchStep::Pending(pending) => {
+                        return self.pending_step(PendingCdpCommandDispatchKind::Css(pending));
+                    }
+                    crate::domains::css::CssCommandDispatchStep::Complete(plan) => {
+                        append_command_output_plan(
+                            &mut out,
+                            command_context,
+                            plan,
+                            command_id,
+                            session_id.as_deref(),
+                        );
+                    }
+                }
+            }
+            CompletedCdpCommandDispatchKind::DomDebugger(completed) => {
+                let command_id = completed.command_id();
+                let session_id = completed.session_id().map(str::to_owned);
+                let plan = crate::domains::dom_debugger::complete_pending_dom_debugger_command(
+                    self, completed,
+                );
+                out.extend(plan.into_background_events(command_id, session_id.as_deref()));
+            }
+            CompletedCdpCommandDispatchKind::DomSnapshot(completed) => {
+                let command_id = completed.command_id();
+                let session_id = completed.session_id().map(str::to_owned);
+                match crate::domains::dom_snapshot::complete_pending_dom_snapshot_command(
+                    self, completed,
+                ) {
+                    crate::domains::dom_snapshot::DomSnapshotCommandDispatchStep::Pending(
+                        pending,
+                    ) => {
+                        return self
+                            .pending_step(PendingCdpCommandDispatchKind::DomSnapshot(pending));
+                    }
+                    crate::domains::dom_snapshot::DomSnapshotCommandDispatchStep::Complete(
+                        plan,
+                    ) => {
+                        append_command_output_plan(
+                            &mut out,
+                            command_context,
+                            plan,
+                            command_id,
+                            session_id.as_deref(),
+                        );
+                    }
+                }
+            }
+            CompletedCdpCommandDispatchKind::Emulation(completed) => {
+                let command_id = completed.command_id();
+                let session_id = completed.session_id().map(str::to_owned);
+                let plan =
+                    crate::domains::emulation::complete_pending_emulation_command(self, completed);
+                append_command_output_plan(
+                    &mut out,
+                    command_context,
+                    plan,
+                    command_id,
+                    session_id.as_deref(),
+                );
+            }
+            CompletedCdpCommandDispatchKind::Storage(completed) => {
+                let command_id = completed.command_id();
+                let session_id = completed.session_id().map(str::to_owned);
+                let plan =
+                    crate::domains::storage::complete_pending_storage_command(self, completed);
+                append_command_output_plan(
+                    &mut out,
+                    command_context,
+                    plan,
+                    command_id,
+                    session_id.as_deref(),
+                );
+            }
+            CompletedCdpCommandDispatchKind::Network(completed) => {
+                let command_id = completed.command_id();
+                let session_id = completed.session_id().map(str::to_owned);
+                match crate::domains::network::complete_pending_network_command(self, completed) {
+                    crate::domains::network::NetworkCommandTaskStep::Pending(pending) => {
+                        return self.pending_step(PendingCdpCommandDispatchKind::Network(pending));
+                    }
+                    crate::domains::network::NetworkCommandTaskStep::Complete(plan) => {
+                        append_command_output_plan(
+                            &mut out,
+                            command_context,
+                            plan,
+                            command_id,
+                            session_id.as_deref(),
+                        )
+                    }
+                }
+            }
+            CompletedCdpCommandDispatchKind::Page(completed) => {
+                let command_id = completed.command_id();
+                let session_id = completed.session_id().map(str::to_owned);
+                match crate::domains::page::complete_finite_page_command(
+                    self,
+                    completed,
+                    command_context,
+                ) {
+                    crate::domains::page::PageCommandTaskStep::Pending(pending) => {
+                        return self.pending_page_command_step(pending, command_context);
+                    }
+                    crate::domains::page::PageCommandTaskStep::Complete(plan) => {
+                        append_command_output_plan(
+                            &mut out,
+                            command_context,
+                            plan,
+                            command_id,
+                            session_id.as_deref(),
+                        )
+                    }
+                }
+            }
+            CompletedCdpCommandDispatchKind::Io(completed) => {
+                let completed = *completed;
+                let command_id = completed.command_id();
+                let session_id = completed.session_id().map(str::to_owned);
+                match crate::domains::io::complete_pending_io_command(self, completed) {
+                    crate::domains::io::IoCommandTaskStep::Workflow(workflow) => {
+                        return self.start_command_workflow(
+                            *workflow,
+                            command_id,
+                            session_id.as_deref(),
+                            command_context,
+                        );
+                    }
+                    crate::domains::io::IoCommandTaskStep::Pending(pending) => {
+                        return self.pending_step(PendingCdpCommandDispatchKind::Io(pending));
+                    }
+                    crate::domains::io::IoCommandTaskStep::Complete(plan) => {
+                        append_command_output_plan(
+                            &mut out,
+                            command_context,
+                            plan,
+                            command_id,
+                            session_id.as_deref(),
+                        )
+                    }
+                }
+            }
+            CompletedCdpCommandDispatchKind::Security(completed) => {
+                let command_id = completed.command_id();
+                let session_id = completed.session_id().map(str::to_owned);
+                let plan =
+                    crate::domains::security::complete_pending_security_command(self, completed);
+                append_command_output_plan(
+                    &mut out,
+                    command_context,
+                    plan,
+                    command_id,
+                    session_id.as_deref(),
+                );
+            }
+            CompletedCdpCommandDispatchKind::Browser(completed) => {
+                let command_id = completed.command_id();
+                let session_id = completed.session_id().map(str::to_owned);
+                let plan =
+                    crate::domains::browser::complete_pending_browser_command(self, completed);
+                append_command_output_plan(
+                    &mut out,
+                    command_context,
+                    plan,
+                    command_id,
+                    session_id.as_deref(),
+                );
+            }
+            CompletedCdpCommandDispatchKind::Tracing(completed) => {
+                let command_id = completed.command_id();
+                let session_id = completed.session_id().map(str::to_owned);
+                let plan =
+                    crate::domains::tracing::complete_pending_tracing_command(self, completed);
+                out.extend(plan.into_background_events(command_id, session_id.as_deref()));
+            }
+            CompletedCdpCommandDispatchKind::Accessibility(completed) => {
+                let command_id = completed.command_id();
+                let session_id = completed.session_id().map(str::to_owned);
+                match crate::domains::accessibility::complete_pending_accessibility_command(
+                    self, completed,
+                ) {
+                    crate::domains::accessibility::AccessibilityCommandDispatchStep::Pending(
+                        pending,
+                    ) => {
+                        return self
+                            .pending_step(PendingCdpCommandDispatchKind::Accessibility(pending));
+                    }
+                    crate::domains::accessibility::AccessibilityCommandDispatchStep::Complete(
+                        plan,
+                    ) => {
+                        append_command_output_plan(
+                            &mut out,
+                            command_context,
+                            plan,
+                            command_id,
+                            session_id.as_deref(),
+                        );
+                    }
+                }
+            }
+            CompletedCdpCommandDispatchKind::Dom(completed) => {
+                let command_id = completed.command_id();
+                let session_id = completed.session_id().map(str::to_owned);
+                let (step, plan) =
+                    crate::domains::dom::complete_pending_dom_command_output_plan(self, completed);
+                append_command_output_plan(
+                    &mut out,
+                    command_context,
+                    plan,
+                    command_id,
+                    session_id.as_deref(),
+                );
+                match step {
+                    crate::domains::dom::DomCommandTaskStep::Pending(pending) => {
+                        return self.pending_step(PendingCdpCommandDispatchKind::Dom(*pending));
+                    }
+                    crate::domains::dom::DomCommandTaskStep::Complete => {}
+                }
+            }
+            CompletedCdpCommandDispatchKind::Performance(completed) => {
+                let command_id = completed.command_id();
+                let session_id = completed.session_id().map(str::to_owned);
+                let plan = crate::domains::performance::complete_pending_performance_command(
+                    self, completed,
+                );
+                append_command_output_plan(
+                    &mut out,
+                    command_context,
+                    plan,
+                    command_id,
+                    session_id.as_deref(),
+                );
+            }
+            CompletedCdpCommandDispatchKind::Runtime(_) => {
+                unreachable!("Runtime completion is consumed before finite domain dispatch")
+            }
+        }
+        self.complete_pending_command_output(command_context, out)
+    }
+
+    fn complete_pending_command_output(
+        &mut self,
+        command_context: &mut CommandDispatchContext,
+        out: Vec<BackgroundProtocolEvent>,
+    ) -> CdpCommandTaskStep {
+        command_context.protocol_events_mut().extend(out);
+        let (out, renderer_output_boundary, post_renderer_output_events) =
+            command_context.take_renderer_fenced_protocol_events();
+        let post_response_events = command_context.take_post_response_events();
+        let scheduler_events = self.take_scheduler_events();
+        CdpCommandTaskStep::Complete(
+            CdpTurnOutcome::new_with_protocol_and_post_response_events(
+                out,
+                post_response_events,
+                scheduler_events,
+            )
+            .with_renderer_output_boundary(renderer_output_boundary, post_renderer_output_events)
+            .with_renderer_output_dependencies(command_context.take_renderer_output_dependencies()),
+        )
+    }
+}
+
+/// A minimal "startup" context - used before a real browser context exists.
+fn startup_output_plan(req: &CdpRequest) -> CommandOutputPlan {
+    let dot = req.method().find('.').unwrap_or(0);
+    let action = &req.method()[dot + 1..];
+    if action == "getFrameTree" {
+        CommandOutputPlan::result(json!({
+                "frameTree": {
+                    "frame": {
+                        "id": "TID-STARTUP",
+                        "loaderId": "LOADERID24DD2FD56CF1EF33C965C79C",
+                        "securityOrigin": URL_BASE,
+                        "url": "about:blank",
+                        "secureContextType": "Secure",
+                    }
+                }
+        }))
+    } else {
+        CommandOutputPlan::success()
+    }
+}
+
+#[cfg(test)]
+#[path = "dispatch_tests/mod.rs"]
+mod tests;

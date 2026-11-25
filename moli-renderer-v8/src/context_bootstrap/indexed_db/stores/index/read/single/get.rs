@@ -1,0 +1,49 @@
+use super::*;
+
+#[derive(webidl::WebIdlArgs)]
+#[webidl(prefix = "IDBIndex.get")]
+struct IdbIndexGetArgs<'s> {
+    #[webidl(required, converter = "raw")]
+    query: v8::Local<'s, v8::Value>,
+}
+
+pub(in crate::context_bootstrap::indexed_db) fn idb_index_get_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'s, v8::Value>,
+) {
+    let Some(parsed) = webidl::parse_args::<IdbIndexGetArgs<'s>>(scope, &args) else {
+        return;
+    };
+    let index = args.this();
+    let Some(transaction) = index_active_transaction(scope, index) else {
+        return;
+    };
+    let query = match parse_key_or_range(scope, parsed.query) {
+        Ok(Some(query)) => query,
+        Ok(None) => {
+            let error = dom_exception_value(
+                scope,
+                "Failed to execute 'get': the query is not a valid key or key range.",
+                "DataError",
+            );
+            scope.throw_exception(error);
+            return;
+        }
+        Err(error) => {
+            error.throw(scope);
+            return;
+        }
+    };
+    let Some(request) = create_operation_request(scope, index, transaction) else {
+        return;
+    };
+    schedule_transaction_operation(
+        scope,
+        transaction,
+        index,
+        request,
+        IndexedDbTransactionOperation::IndexGet { query },
+    );
+    rv.set(request.into());
+}

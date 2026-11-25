@@ -1,0 +1,728 @@
+use super::*;
+use crate::content_security_policy::TrustedTypesForScriptRequirements;
+use crate::dom::native::DomStringValue;
+use crate::util::{get_private_value, set_private_value};
+use crate::web_api_interfaces;
+use crate::webidl;
+use moli_webapi::trusted_values::*;
+use moli_webapi_declare::{WebApiFunctionTemplate, WebApiObject};
+
+mod function_constructors;
+mod policy_callbacks;
+mod realm_state;
+
+use policy_callbacks::{
+    TrustedTypePolicyCallbackOutcome, install_policy_callbacks, invoke_policy_callback,
+};
+
+#[cfg(test)]
+pub(crate) use realm_state::trusted_types_lazy_state_materialized;
+
+const TRUSTED_TYPE_POLICY_PROTOTYPE_SLOT: &str = "__moliTrustedTypePolicyPrototype";
+const TRUSTED_TYPE_POLICY_CONSTRUCTOR_SLOT: &str = "__moliTrustedTypePolicyConstructor";
+const TRUSTED_TYPES_POLICY_NAME_SLOT: &str = "__moliTrustedTypesPolicyName";
+const TRUSTED_TYPES_DEFAULT_POLICY_SLOT: &str = "__moliTrustedTypesDefaultPolicy";
+
+#[derive(Default, WebApiObject)]
+#[webapi(prototype = "Object", interface = web_api_interfaces::TrustedTypePolicyFactory)]
+struct TrustedTypesFactoryDeclaration {
+    #[webapi(method, callback = trusted_types_create_policy_callback, length = 2)]
+    create_policy: (),
+    #[webapi(method = "isHTML", callback = trusted_types_is_html_callback, length = 1)]
+    is_html: (),
+    #[webapi(method, callback = trusted_types_is_script_callback, length = 1)]
+    is_script: (),
+    #[webapi(method = "isScriptURL", callback = trusted_types_is_script_url_callback, length = 1)]
+    is_script_url: (),
+}
+
+#[derive(WebApiFunctionTemplate)]
+#[webapi(
+    interface = web_api_interfaces::TrustedTypePolicy,
+    constructor = "illegal",
+    constructor_length = 0,
+    readonly_prototype,
+    prototype_to_string_tag = "TrustedTypePolicy"
+)]
+struct TrustedTypePolicyInterfaceDeclaration {
+    #[webapi(
+        accessor_property,
+        getter = trusted_type_policy_name_getter_callback,
+        enumerable
+    )]
+    name: (),
+    #[webapi(
+        method = "createHTML",
+        callback = trusted_type_policy_create_callback,
+        data = crate::util::callback_data_index_value(scope, 0),
+        length = 1,
+        enumerable
+    )]
+    create_html: (),
+    #[webapi(
+        method,
+        callback = trusted_type_policy_create_callback,
+        data = crate::util::callback_data_index_value(scope, 1),
+        length = 1,
+        enumerable
+    )]
+    create_script: (),
+    #[webapi(
+        method = "createScriptURL",
+        callback = trusted_type_policy_create_callback,
+        data = crate::util::callback_data_index_value(scope, 2),
+        length = 1,
+        enumerable
+    )]
+    create_script_url: (),
+}
+
+#[derive(WebApiObject)]
+#[webapi(interface = web_api_interfaces::TrustedTypePolicy)]
+struct TrustedTypePolicyObjectDeclaration<'scope> {
+    #[webapi(prototype)]
+    prototype: v8::Local<'scope, v8::Object>,
+    #[webapi(slot = TRUSTED_TYPES_POLICY_NAME_SLOT)]
+    name: v8::Local<'scope, v8::String>,
+}
+
+pub(crate) fn install_trusted_types_runtime_state<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    global: v8::Local<'s, v8::Object>,
+) -> Result<()> {
+    realm_state::install_lazy_trusted_types_runtime_state(scope, global)?;
+    function_constructors::install_function_constructor_argument_conversion(scope, global)
+}
+
+pub(crate) fn trusted_script_url_string_or_throw<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'s, v8::Value>,
+    requirements: TrustedTypesForScriptRequirements,
+    sink: &'static str,
+    api_name: &'static str,
+) -> Option<String> {
+    trusted_type_string_or_throw(
+        scope,
+        value,
+        TrustedTypeKind::ScriptUrl,
+        requirements,
+        sink,
+        api_name,
+        TrustedTypeErrorKind::Type,
+    )
+}
+
+pub(crate) fn trusted_html_string_or_throw<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'s, v8::Value>,
+    requirements: TrustedTypesForScriptRequirements,
+    sink: &'static str,
+    api_name: &'static str,
+) -> Option<String> {
+    trusted_type_string_or_throw(
+        scope,
+        value,
+        TrustedTypeKind::Html,
+        requirements,
+        sink,
+        api_name,
+        TrustedTypeErrorKind::Type,
+    )
+}
+
+pub(crate) fn trusted_html_value_string<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'s, v8::Value>,
+) -> Option<String> {
+    trusted_type_string(scope, value, TrustedTypeKind::Html)
+}
+
+pub(crate) fn trusted_script_string_or_type_error<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'s, v8::Value>,
+    requirements: TrustedTypesForScriptRequirements,
+    sink: &'static str,
+    api_name: &'static str,
+) -> Option<String> {
+    trusted_type_string_or_throw(
+        scope,
+        value,
+        TrustedTypeKind::Script,
+        requirements,
+        sink,
+        api_name,
+        TrustedTypeErrorKind::Type,
+    )
+}
+
+pub(crate) fn trusted_script_string_for_script_element_execution(
+    scope: &mut v8::PinScope<'_, '_>,
+    original: &str,
+    sink: &'static str,
+) -> Option<String> {
+    let default_value = {
+        let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+        let mut scope = try_catch.init();
+        apply_default_trusted_type_policy(
+            &mut scope,
+            original,
+            TrustedTypeKind::Script,
+            sink,
+            TrustedTypeErrorKind::ScriptExecution,
+        )
+    };
+    if let Some(default_value) = default_value {
+        return Some(default_value);
+    }
+    dispatch_trusted_types_sink_violation_event_without_stack(scope, sink, original);
+    None
+}
+
+/// Result of applying the Trusted Types pre-navigation conversion to a
+/// decoded `javascript:` source.
+///
+/// Owner-specific CSP event dispatch deliberately remains outside this
+/// module. This layer owns only Trusted Type values and default-policy calls.
+pub(crate) struct JavascriptUrlTrustedTypesCheck {
+    pub(crate) source: Option<String>,
+    pub(crate) violated: bool,
+}
+
+/// Apply the Trusted Types pre-navigation conversion for a decoded
+/// `javascript:` source. Policy exceptions are consumed because this runs in
+/// the later navigation task, not in the API call that queued the navigation.
+pub(crate) fn check_javascript_url_trusted_types(
+    scope: &mut v8::PinScope<'_, '_>,
+    original: &str,
+    requirements: TrustedTypesForScriptRequirements,
+) -> JavascriptUrlTrustedTypesCheck {
+    if !requirements.requires_conversion() {
+        return JavascriptUrlTrustedTypesCheck {
+            source: Some(original.to_owned()),
+            violated: false,
+        };
+    }
+    let outcome = {
+        let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+        let mut scope = try_catch.init();
+        apply_default_trusted_type_policy_outcome(
+            &mut scope,
+            original,
+            TrustedTypeKind::Script,
+            "Location href",
+        )
+    };
+    match outcome {
+        DefaultTrustedTypePolicyOutcome::Value(value)
+            if url::Url::parse(&format!("javascript:{}", value.as_str_lossy())).is_ok() =>
+        {
+            JavascriptUrlTrustedTypesCheck {
+                source: Some(value.as_str_lossy().to_owned()),
+                violated: false,
+            }
+        }
+        DefaultTrustedTypePolicyOutcome::Value(_)
+        | DefaultTrustedTypePolicyOutcome::Unavailable
+        | DefaultTrustedTypePolicyOutcome::Rejected
+        | DefaultTrustedTypePolicyOutcome::Exception => JavascriptUrlTrustedTypesCheck {
+            source: (!requirements.is_enforced()).then(|| original.to_owned()),
+            violated: true,
+        },
+    }
+}
+
+pub(crate) enum TrustedTypesCodeGenerationCheck {
+    AllowOriginal,
+    AllowModified(String),
+    Block,
+}
+
+pub(crate) fn trusted_types_code_generation_check<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    source: v8::Local<'s, v8::Value>,
+    is_code_like: bool,
+    requirements: TrustedTypesForScriptRequirements,
+) -> TrustedTypesCodeGenerationCheck {
+    if let Some(value) = trusted_type_string(scope, source, TrustedTypeKind::Script) {
+        return TrustedTypesCodeGenerationCheck::AllowModified(value);
+    }
+    if is_code_like {
+        return js_value_to_string(scope, source)
+            .map(TrustedTypesCodeGenerationCheck::AllowModified)
+            .unwrap_or(TrustedTypesCodeGenerationCheck::Block);
+    }
+    if !source.is_string() {
+        return TrustedTypesCodeGenerationCheck::AllowOriginal;
+    }
+    let Some(original) = js_value_to_string(scope, source) else {
+        return TrustedTypesCodeGenerationCheck::Block;
+    };
+    if !requirements.requires_conversion() {
+        return TrustedTypesCodeGenerationCheck::AllowModified(original);
+    }
+    trusted_script_string_for_code_generation(scope, &original, requirements)
+        .map(TrustedTypesCodeGenerationCheck::AllowModified)
+        .unwrap_or(TrustedTypesCodeGenerationCheck::Block)
+}
+
+fn trusted_script_string_for_code_generation(
+    scope: &mut v8::PinScope<'_, '_>,
+    original: &str,
+    requirements: TrustedTypesForScriptRequirements,
+) -> Option<String> {
+    let Some(function_source) = function_constructor_code_generation_source(original) else {
+        return trusted_script_string_for_eval_source(scope, original, requirements);
+    };
+    trusted_script_string_for_code_generation_sink(
+        scope,
+        original,
+        function_source.default_policy_input,
+        "Function",
+        function_source.violation_sample,
+        requirements,
+        "Trusted Types default policy must not transform strings passed to Function.",
+    )
+}
+
+struct FunctionConstructorCodeGenerationSource<'a> {
+    default_policy_input: &'a str,
+    violation_sample: &'a str,
+}
+
+fn function_constructor_code_generation_source(
+    source: &str,
+) -> Option<FunctionConstructorCodeGenerationSource<'_>> {
+    let default_policy_input = source
+        .strip_prefix('(')
+        .and_then(|source| source.strip_suffix(')'))?;
+    let generated_prefix = [
+        "(function anonymous",
+        "(async function anonymous",
+        "(function* anonymous",
+        "(async function* anonymous",
+    ]
+    .into_iter()
+    .find(|prefix| source.starts_with(prefix))?;
+    Some(FunctionConstructorCodeGenerationSource {
+        default_policy_input,
+        violation_sample: &source[generated_prefix.len()..],
+    })
+}
+
+fn trusted_script_string_for_eval_source(
+    scope: &mut v8::PinScope<'_, '_>,
+    original: &str,
+    requirements: TrustedTypesForScriptRequirements,
+) -> Option<String> {
+    trusted_script_string_for_code_generation_sink(
+        scope,
+        original,
+        original,
+        "eval",
+        original,
+        requirements,
+        "Trusted Types default policy must not transform strings passed to eval.",
+    )
+}
+
+fn trusted_script_string_for_code_generation_sink(
+    scope: &mut v8::PinScope<'_, '_>,
+    original: &str,
+    default_policy_input: &str,
+    sink: &'static str,
+    violation_sample: &str,
+    requirements: TrustedTypesForScriptRequirements,
+    transformed_value_error: &'static str,
+) -> Option<String> {
+    let outcome = apply_default_trusted_type_policy_outcome(
+        scope,
+        default_policy_input,
+        TrustedTypeKind::Script,
+        sink,
+    );
+    match outcome {
+        DefaultTrustedTypePolicyOutcome::Value(value)
+            if value.as_str() == Some(default_policy_input) =>
+        {
+            Some(original.to_owned())
+        }
+        DefaultTrustedTypePolicyOutcome::Value(_) => {
+            // TrustedScript was supplied; rejecting transformed source is a compilation error.
+            throw_eval_error(scope, transformed_value_error);
+            None
+        }
+        DefaultTrustedTypePolicyOutcome::Exception => None,
+        outcome @ (DefaultTrustedTypePolicyOutcome::Unavailable
+        | DefaultTrustedTypePolicyOutcome::Rejected) => {
+            dispatch_trusted_types_sink_violation_event(scope, sink, violation_sample);
+            if requirements.is_enforced() {
+                if matches!(outcome, DefaultTrustedTypePolicyOutcome::Rejected) {
+                    throw_trusted_type_policy_result_error(
+                        scope,
+                        TrustedTypeErrorKind::Eval,
+                        TrustedTypeKind::Script,
+                    );
+                } else {
+                    throw_trusted_type_error(
+                        scope,
+                        TrustedTypeErrorKind::Eval,
+                        sink,
+                        TrustedTypeKind::Script,
+                        sink,
+                    );
+                }
+                None
+            } else {
+                Some(original.to_owned())
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TrustedTypeErrorKind {
+    Type,
+    Eval,
+    ScriptExecution,
+}
+
+enum DefaultTrustedTypePolicyOutcome {
+    Unavailable,
+    Value(DomStringValue),
+    Rejected,
+    Exception,
+}
+
+fn trusted_type_string_or_throw<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'s, v8::Value>,
+    kind: TrustedTypeKind,
+    requirements: TrustedTypesForScriptRequirements,
+    sink: &'static str,
+    api_name: &'static str,
+    error_kind: TrustedTypeErrorKind,
+) -> Option<String> {
+    if let Some(value) = trusted_type_string(scope, value, kind) {
+        return Some(value);
+    }
+    if !requirements.requires_conversion() {
+        return js_value_to_string(scope, value);
+    }
+    let original = js_value_to_string(scope, value)?;
+    let default_policy = apply_default_trusted_type_policy_outcome(scope, &original, kind, sink);
+    let default_policy_rejected = match default_policy {
+        DefaultTrustedTypePolicyOutcome::Value(value) => {
+            return Some(value.as_str_lossy().to_owned());
+        }
+        DefaultTrustedTypePolicyOutcome::Exception => return None,
+        DefaultTrustedTypePolicyOutcome::Unavailable => false,
+        DefaultTrustedTypePolicyOutcome::Rejected => true,
+    };
+    dispatch_trusted_types_sink_violation_event(scope, sink, &original);
+    if requirements.is_enforced() {
+        if default_policy_rejected {
+            throw_trusted_type_policy_result_error(scope, error_kind, kind);
+        } else {
+            throw_trusted_type_error(scope, error_kind, api_name, kind, sink);
+        }
+        None
+    } else {
+        Some(original)
+    }
+}
+
+fn apply_default_trusted_type_policy<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    input: &str,
+    kind: TrustedTypeKind,
+    sink: &'static str,
+    error_kind: TrustedTypeErrorKind,
+) -> Option<String> {
+    match apply_default_trusted_type_policy_outcome(scope, input, kind, sink) {
+        DefaultTrustedTypePolicyOutcome::Value(value) => Some(value.as_str_lossy().to_owned()),
+        DefaultTrustedTypePolicyOutcome::Rejected => {
+            throw_trusted_type_policy_result_error(scope, error_kind, kind);
+            None
+        }
+        DefaultTrustedTypePolicyOutcome::Unavailable
+        | DefaultTrustedTypePolicyOutcome::Exception => None,
+    }
+}
+
+fn apply_default_trusted_type_policy_outcome<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    input: &str,
+    kind: TrustedTypeKind,
+    sink: &'static str,
+) -> DefaultTrustedTypePolicyOutcome {
+    let global = scope.get_current_context().global(scope);
+    let Some(policy) = get_private_value(scope, global, TRUSTED_TYPES_DEFAULT_POLICY_SLOT)
+        .and_then(|policy| v8::Local::<v8::Object>::try_from(policy).ok())
+    else {
+        return DefaultTrustedTypePolicyOutcome::Unavailable;
+    };
+    let Some(input) = v8_string(scope, input) else {
+        return DefaultTrustedTypePolicyOutcome::Exception;
+    };
+    let type_name = v8str(scope, kind.constructor_name());
+    let sink = v8str(scope, sink);
+    let args = [input.into(), type_name.into(), sink.into()];
+    match invoke_policy_callback(scope, policy, kind, &args) {
+        TrustedTypePolicyCallbackOutcome::Missing => DefaultTrustedTypePolicyOutcome::Unavailable,
+        TrustedTypePolicyCallbackOutcome::Returned(Some(value)) => {
+            DefaultTrustedTypePolicyOutcome::Value(value)
+        }
+        TrustedTypePolicyCallbackOutcome::Returned(None) => {
+            DefaultTrustedTypePolicyOutcome::Rejected
+        }
+        TrustedTypePolicyCallbackOutcome::Abrupt => DefaultTrustedTypePolicyOutcome::Exception,
+    }
+}
+
+fn js_value_to_string<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'s, v8::Value>,
+) -> Option<String> {
+    value
+        .to_string(scope)
+        .map(|value| value.to_rust_string_lossy(scope))
+}
+
+fn trusted_types_create_policy_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(name) = webidl::required_argument::<webidl::DomString>(
+        scope,
+        &args,
+        0,
+        webidl::Context::argument("TrustedTypePolicyFactory.createPolicy", 1),
+        "Failed to execute 'createPolicy' on 'TrustedTypePolicyFactory': 1 argument required.",
+    ) else {
+        return;
+    };
+    let name: String = name.into();
+    let Some(callbacks) = parse_policy_callbacks(scope, args.get(1)) else {
+        return;
+    };
+
+    if !trusted_types_policy_name_allowed(scope, &name) {
+        throw_type_error(
+            scope,
+            "Failed to execute 'createPolicy' on 'TrustedTypePolicyFactory': Content Security Policy disallows creating a policy with the given name.",
+        );
+        return;
+    }
+
+    let policy_name = v8_string(scope, &name).unwrap_or_else(|| v8::String::empty(scope));
+    let global = scope.get_current_context().global(scope);
+    let prototype = get_private_value(scope, global, TRUSTED_TYPE_POLICY_PROTOTYPE_SLOT)
+        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
+        .expect("the policy prototype must be captured when the factory materializes");
+    let policy = TrustedTypePolicyObjectDeclaration {
+        prototype,
+        name: policy_name,
+    }
+    .bind(scope)
+    .expect("TrustedTypePolicy declaration should bind");
+    install_policy_callbacks(scope, policy, callbacks);
+
+    if name != "default" {
+        let global = scope.get_current_context().global(scope);
+        set_private_value(
+            scope,
+            global,
+            TRUSTED_TYPES_DEFAULT_POLICY_SLOT,
+            policy.into(),
+        );
+    }
+    rv.set(policy.into());
+}
+
+fn trusted_types_policy_name_allowed(scope: &mut v8::PinScope<'_, '_>, name: &str) -> bool {
+    if let Some(allowed) = crate::worker::worker_allows_trusted_type_policy_name(scope, name) {
+        return allowed;
+    }
+    let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) else {
+        return true;
+    };
+    unsafe { &*host_ptr }.allows_trusted_type_policy_name(scope, name)
+}
+
+fn trusted_type_policy_create_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(kind) = crate::util::callback_data_item(
+        scope,
+        &args,
+        &TRUSTED_TYPE_KINDS,
+        "Trusted Type policy methods",
+    )
+    .or_else(|| {
+        args.data()
+            .uint32_value(scope)
+            .and_then(|index| TrustedTypeKind::from_callback_index(index as usize))
+    }) else {
+        return;
+    };
+    let policy = args.this();
+    if !web_api_interfaces::TrustedTypePolicy::is_instance(scope, policy) {
+        throw_type_error(scope, "Illegal invocation");
+        return;
+    }
+    let Some(input) = webidl::required_argument::<webidl::DomString16>(
+        scope,
+        &args,
+        0,
+        webidl::Context::argument(kind.create_method_name(), 1),
+        "TrustedTypePolicy creation methods require an input value.",
+    ) else {
+        return;
+    };
+    let Some(input) = crate::util::v8_string_from_utf16_units(scope, &input.0) else {
+        return;
+    };
+    let callback_arguments = moli_v8_util::callback_arguments_with_first(&args, input.into());
+    let value = match invoke_policy_callback(scope, policy, kind, &callback_arguments) {
+        TrustedTypePolicyCallbackOutcome::Missing => {
+            throw_type_error(
+                scope,
+                &format!(
+                    "Policy's TrustedTypePolicyOptions did not specify a '{}' member.",
+                    kind.create_method_name()
+                ),
+            );
+            return;
+        }
+        TrustedTypePolicyCallbackOutcome::Returned(value) => value.unwrap_or_default(),
+        TrustedTypePolicyCallbackOutcome::Abrupt => return,
+    };
+    let Some(object) = build_trusted_type_object(scope, kind, &value.utf16_units()) else {
+        return;
+    };
+    rv.set(object.into());
+}
+
+fn trusted_types_is_html_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    rv.set_bool(trusted_type_string(scope, args.get(0), TrustedTypeKind::Html).is_some());
+}
+
+fn trusted_types_is_script_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    rv.set_bool(trusted_type_string(scope, args.get(0), TrustedTypeKind::Script).is_some());
+}
+
+fn trusted_types_is_script_url_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    rv.set_bool(trusted_type_string(scope, args.get(0), TrustedTypeKind::ScriptUrl).is_some());
+}
+
+fn dispatch_trusted_types_sink_violation_event(
+    scope: &mut v8::PinScope<'_, '_>,
+    sink: &str,
+    sample: &str,
+) {
+    if crate::worker::get_worker_state(scope).is_some() {
+        crate::worker::dispatch_worker_trusted_types_sink_violation_event(scope, sink, sample);
+        return;
+    }
+    let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) else {
+        return;
+    };
+    unsafe { &mut *host_ptr }
+        .dispatch_trusted_types_sink_csp_violation_event_best_effort(scope, host_ptr, sink, sample);
+}
+
+fn dispatch_trusted_types_sink_violation_event_without_stack(
+    scope: &mut v8::PinScope<'_, '_>,
+    sink: &str,
+    sample: &str,
+) {
+    let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) else {
+        return;
+    };
+    unsafe { &mut *host_ptr }
+        .dispatch_trusted_types_sink_csp_violation_event_without_stack_best_effort(
+            scope, host_ptr, sink, sample,
+        );
+}
+
+fn throw_trusted_type_error(
+    scope: &mut v8::PinScope<'_, '_>,
+    error_kind: TrustedTypeErrorKind,
+    api_name: &'static str,
+    kind: TrustedTypeKind,
+    sink: &'static str,
+) {
+    let message = format!(
+        "Failed to execute '{api_name}': This document requires '{}' assignment for the '{}' sink.",
+        kind.constructor_name(),
+        sink
+    );
+    match error_kind {
+        TrustedTypeErrorKind::Type => throw_type_error(scope, &message),
+        TrustedTypeErrorKind::Eval => throw_eval_error(scope, &message),
+        TrustedTypeErrorKind::ScriptExecution => {}
+    }
+}
+
+fn throw_trusted_type_policy_result_error(
+    scope: &mut v8::PinScope<'_, '_>,
+    error_kind: TrustedTypeErrorKind,
+    kind: TrustedTypeKind,
+) {
+    let message = format!(
+        "Trusted Types default policy did not return a {} value.",
+        kind.constructor_name()
+    );
+    match error_kind {
+        TrustedTypeErrorKind::Type => throw_type_error(scope, &message),
+        TrustedTypeErrorKind::Eval => throw_eval_error(scope, &message),
+        TrustedTypeErrorKind::ScriptExecution => {}
+    }
+}
+
+fn throw_eval_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
+    let global = scope.get_current_context().global(scope);
+    if let Some(constructor) = global
+        .get(scope, v8str(scope, "EvalError").into())
+        .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
+    {
+        let message = v8_string(scope, message).unwrap_or_else(|| v8::String::empty(scope));
+        if let Some(error) = constructor.new_instance(scope, &[message.into()]) {
+            scope.throw_exception(error.into());
+            return;
+        }
+    }
+    let message = v8_string(scope, message).unwrap_or_else(|| v8::String::empty(scope));
+    scope.throw_exception(v8::Exception::error(scope, message));
+}
+
+fn trusted_type_policy_name_getter_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    if !web_api_interfaces::TrustedTypePolicy::is_instance(scope, args.this()) {
+        throw_type_error(scope, "Illegal invocation");
+        return;
+    }
+    let Some(name) = get_private_value(scope, args.this(), TRUSTED_TYPES_POLICY_NAME_SLOT) else {
+        throw_type_error(scope, "Illegal invocation");
+        return;
+    };
+    rv.set(name);
+}

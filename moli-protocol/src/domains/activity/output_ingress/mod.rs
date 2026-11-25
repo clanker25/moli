@@ -1,0 +1,28 @@
+mod ordered_stream;
+mod prepared_outputs;
+mod projection;
+mod renderer;
+pub(crate) use projection::RendererOutputProjection;
+
+pub(crate) use ordered_stream::{
+    AdmittedRendererOutputPublication, OrderedRendererOutputIngress, RendererOutputIngressAdmission,
+};
+pub(crate) use prepared_outputs::{PreparedProtocolOutputs, ProtocolOutputProjectionMode};
+
+use crate::conn::{CdpConnection, CommandDispatchContext, CommandOwnerScope};
+
+/// Projects protocol-owned output accumulated at a command boundary.
+///
+/// DOMStorage subscriptions are owned by the protocol BrowserContext rather
+/// than by a renderer output stream. They therefore keep an explicit
+/// command-local flush, while renderer output must arrive exclusively through
+/// concrete publications and exact cursor fences.
+pub(crate) fn project_protocol_local_command_outputs(
+    conn: &CdpConnection,
+    owner: &CommandOwnerScope,
+    command: &mut CommandDispatchContext,
+) {
+    command.protocol_events_mut().extend(
+        crate::domains::dom_storage::take_pending_dom_storage_outputs_for_owner(conn, owner),
+    );
+}

@@ -1,0 +1,255 @@
+use crate::network_host::request_scope::callback_child_handle;
+mod init;
+
+use self::init::{
+    apply_request_init_overrides, request_initial_state, validate_request_body_is_usable,
+};
+use super::input::request_headers_guard_for_mode;
+use super::*;
+use crate::network_host::fetch_surface::{set_request_slot_bool, set_request_slot_value};
+use crate::web_api_interfaces;
+use crate::webidl;
+use moli_webapi_declare::WebApiObject;
+
+#[derive(WebApiObject)]
+#[webapi(interface = web_api_interfaces::Request)]
+struct RequestInstanceDeclaration<'scope> {
+    #[webapi(slot = REQUEST_METHOD_SLOT)]
+    method: String,
+    #[webapi(slot = REQUEST_URL_SLOT)]
+    url: String,
+    #[webapi(slot = REQUEST_HEADERS_SLOT)]
+    headers: v8::Local<'scope, v8::Object>,
+    #[webapi(slot = REQUEST_DESTINATION_SLOT, init = "")]
+    destination: (),
+    #[webapi(slot = REQUEST_REFERRER_SLOT)]
+    referrer: String,
+    #[webapi(slot = REQUEST_REFERRER_POLICY_SLOT)]
+    referrer_policy: String,
+    #[webapi(slot = REQUEST_MODE_SLOT)]
+    mode: String,
+    #[webapi(slot = REQUEST_CREDENTIALS_SLOT)]
+    credentials: String,
+    #[webapi(slot = REQUEST_CACHE_SLOT)]
+    cache: String,
+    #[webapi(slot = REQUEST_REDIRECT_SLOT)]
+    redirect: String,
+    #[webapi(slot = REQUEST_INTEGRITY_SLOT)]
+    integrity: String,
+    #[webapi(slot = REQUEST_KEEPALIVE_SLOT)]
+    keepalive: bool,
+    #[webapi(slot = REQUEST_PRIORITY_SLOT)]
+    priority: String,
+    #[webapi(slot = REQUEST_SIGNAL_SLOT)]
+    signal: v8::Local<'scope, v8::Value>,
+    #[webapi(slot = REQUEST_DUPLEX_SLOT)]
+    duplex: String,
+    #[webapi(slot = REQUEST_IS_HISTORY_NAVIGATION_SLOT, init = false)]
+    is_history_navigation: (),
+    #[webapi(slot = REQUEST_IS_RELOAD_NAVIGATION_SLOT, init = false)]
+    is_reload_navigation: (),
+    #[webapi(slot = REQUEST_BODY_SLOT)]
+    body: v8::Local<'scope, v8::Value>,
+    #[webapi(slot = REQUEST_BODY_USED_SLOT, init = false)]
+    body_used: (),
+}
+
+#[derive(webidl::WebIdlArgs)]
+#[webidl(prefix = "Request")]
+struct RequestConstructorArgs<'s> {
+    #[webidl(required, converter = "raw")]
+    input: super::input::RequestInfo<'s>,
+    #[webidl(dictionary)]
+    init: super::init::RequestInitMembers<'s>,
+}
+
+pub(crate) fn request_constructor_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    if !args.is_construct_call() {
+        throw_type_error(
+            scope,
+            "Failed to construct 'Request': Please use the 'new' operator.",
+        );
+        return;
+    }
+
+    let Some(parsed) = webidl::parse_args::<RequestConstructorArgs>(scope, &args) else {
+        return;
+    };
+    let obj = args.this();
+    let data = args.data();
+    let child_handle = callback_child_handle(scope, data);
+    let base_url = callback_base_url(scope, data);
+    let mut state = match request_initial_state(scope, parsed.input, child_handle, base_url) {
+        Ok(state) => state,
+        Err(error) => {
+            webidl::throw_error(scope, &error);
+            return;
+        }
+    };
+
+    if let Err(error) = apply_request_init_overrides(scope, parsed.init, &mut state) {
+        webidl::throw_error(scope, &error);
+        return;
+    }
+    if let Err(error) = validate_request_body_is_usable(scope, &state) {
+        webidl::throw_error(scope, &error);
+        return;
+    }
+
+    append_default_body_content_type(&mut state.headers, state.body_content_type.as_deref());
+    let headers_obj = build_headers_object_with_state(
+        scope,
+        &state.headers,
+        request_headers_guard_for_mode(&state.mode),
+        false,
+    );
+
+    let signal_source = state
+        .signal
+        .as_ref()
+        .map(|signal| v8::Local::new(scope, signal));
+    let signal = match new_abort_signal_for_request_with_source(scope, signal_source) {
+        Some(signal) => signal,
+        None if state.signal.is_some() => return,
+        None => v8::undefined(scope).into(),
+    };
+    let body_value = if let Some(stream) = state.body_stream.as_ref() {
+        let stream = v8::Local::new(scope, stream);
+        let stream = if state.inherited_body_stream {
+            let Some(proxy) = crate::context_bootstrap::proxy_fetch_body_stream(scope, stream)
+            else {
+                return;
+            };
+            proxy
+        } else {
+            stream
+        };
+        if let Some(source) = state.inherited_body_source {
+            let source = v8::Local::new(scope, source);
+            body_source::set_network_body_stream_source(scope, obj, source);
+        }
+        stream.into()
+    } else {
+        state
+            .body
+            .and_then(|source| source.into_body_stream(scope, obj))
+            .map(|stream| stream.into())
+            .unwrap_or_else(|| v8::null(scope).into())
+    };
+    RequestInstanceDeclaration::new(
+        state.method,
+        state.url_resolved,
+        headers_obj,
+        state.referrer,
+        state.referrer_policy,
+        state.mode,
+        state.credentials,
+        state.cache,
+        request_redirect_mode_label(state.redirect_mode).to_owned(),
+        state.integrity,
+        state.keepalive,
+        state.priority.as_ref().to_owned(),
+        signal,
+        state.duplex,
+        body_value,
+    )
+    .initialize(scope, obj)
+    .expect("Request instance declaration should initialize");
+    mark_request_object(scope, obj);
+
+    rv.set(obj.into());
+}
+
+use crate::network_host::fetch_surface::callback_base_url;
+
+/// Reify a stored native cache key without running author URL conversion or
+/// constructors. Internal URLs may carry credentials supplied by XHR.
+pub(crate) fn build_cached_request_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    url: &str,
+    method: &str,
+    headers: &[(String, String)],
+) -> Option<v8::Local<'s, v8::Object>> {
+    let headers = build_headers_object_with_state(
+        scope,
+        headers,
+        request_headers_guard_for_mode("cors"),
+        true,
+    );
+    let signal = new_abort_signal_for_request_with_source(scope, None)?;
+    RequestInstanceDeclaration::new(
+        method.to_owned(),
+        url.to_owned(),
+        headers,
+        "about:client".to_owned(),
+        String::new(),
+        "cors".to_owned(),
+        "same-origin".to_owned(),
+        "default".to_owned(),
+        "follow".to_owned(),
+        String::new(),
+        false,
+        "auto".to_owned(),
+        signal,
+        "half".to_owned(),
+        v8::null(scope).into(),
+    )
+    .bind(scope)
+    .ok()
+}
+
+/// Build an intercepted internal Request without invoking author constructors
+/// or RequestInit conversion, retaining its privileged header entries.
+pub(crate) fn build_service_worker_request_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    source: &crate::service_worker_runtime::ServiceWorkerFetchRequest,
+) -> Option<(v8::Local<'s, v8::Object>, v8::Local<'s, v8::Object>)> {
+    let mode: &'static str = source.request_mode.into();
+    let credentials: &'static str = source.credentials_mode.into();
+    let redirect: &'static str = source.redirect_mode.into();
+    let priority: &'static str = source.priority.map_or("auto", Into::into);
+    let headers = build_headers_object_with_state(
+        scope,
+        &source.headers,
+        request_headers_guard_for_mode(mode),
+        true,
+    );
+    let signal = new_abort_signal_for_request_with_source(scope, None)?;
+    let signal_object = v8::Local::<v8::Object>::try_from(signal).ok()?;
+    let request = RequestInstanceDeclaration::new(
+        source.method.clone(),
+        source.url.to_string(),
+        headers,
+        source.metadata.referrer.clone(),
+        source.metadata.referrer_policy.clone(),
+        mode.to_owned(),
+        credentials.to_owned(),
+        source.metadata.cache.clone(),
+        redirect.to_owned(),
+        source.metadata.integrity.clone(),
+        source.metadata.keepalive,
+        priority.to_owned(),
+        signal,
+        "half".to_owned(),
+        v8::null(scope).into(),
+    )
+    .bind(scope)
+    .ok()?;
+    let destination = v8::String::new(scope, source.destination.as_str())?;
+    set_request_slot_value(scope, request, REQUEST_DESTINATION_SLOT, destination.into());
+    set_request_slot_bool(
+        scope,
+        request,
+        REQUEST_IS_RELOAD_NAVIGATION_SLOT,
+        source.is_reload,
+    );
+    if let Some(bytes) = &source.body {
+        let body = PreparedBodySource::Bytes(bytes.clone()).into_body_stream(scope, request)?;
+        set_request_slot_value(scope, request, REQUEST_BODY_SLOT, body.into());
+    }
+    Some((request, signal_object))
+}

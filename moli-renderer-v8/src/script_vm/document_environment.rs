@@ -1,0 +1,509 @@
+use crate::content_security_policy::ContentSecurityPolicy;
+
+use super::*;
+
+pub(crate) struct ScriptVmCapturedDocumentEnvironment {
+    environment: Option<ScriptVmInitialDocumentEnvironment>,
+    isolate: RendererIsolateHandle,
+}
+
+impl ScriptVmInitialDocumentEnvironment {
+    pub(crate) fn origin(&self) -> &str {
+        &self.origin
+    }
+}
+
+impl ScriptVmCapturedDocumentEnvironment {
+    pub(crate) fn origin(&self) -> &str {
+        &self
+            .environment
+            .as_ref()
+            .expect("captured environment has not been consumed")
+            .origin
+    }
+
+    pub(super) fn new(
+        environment: ScriptVmInitialDocumentEnvironment,
+        isolate: RendererIsolateHandle,
+    ) -> Self {
+        Self {
+            environment: Some(environment),
+            isolate,
+        }
+    }
+
+    pub(crate) fn take(
+        mut self,
+        isolate_identity: usize,
+    ) -> Result<ScriptVmInitialDocumentEnvironment> {
+        anyhow::ensure!(
+            self.isolate.identity_key() == isolate_identity,
+            "inherited V8 security token belongs to another isolate"
+        );
+        Ok(self
+            .environment
+            .take()
+            .expect("captured environment is consumed once"))
+    }
+}
+
+impl Drop for ScriptVmCapturedDocumentEnvironment {
+    fn drop(&mut self) {
+        if let Some(environment) = self.environment.take() {
+            // Reuse the existing entered-isolate release queue, including when
+            // a navigation is cancelled while this isolate is in a pause loop.
+            self.isolate
+                .deferred_context_host_release_queue()
+                .defer_v8_handle_state(vec![Box::new(environment)]);
+        }
+    }
+}
+
+impl ScriptVmInitialDocumentEnvironment {
+    pub(crate) fn inherited_in_scope(
+        scope: &mut v8::PinScope<'_, '_>,
+        opener: v8::Local<'_, v8::Object>,
+        origin: String,
+        storage_key: moli_storage_key::MoliStorageKey,
+        base_url: url::Url,
+        policy_container: crate::document_runtime::DocumentPolicyContainer,
+    ) -> Result<Self> {
+        let context = opener
+            .get_creation_context(scope)
+            .ok_or_else(|| anyhow!("navigation initiator has no live creation context"))?;
+        let security_token = (!policy_container.sandbox.forces_opaque_origin)
+            .then(|| v8::Global::new(scope, context.get_security_token(scope)));
+        let document_domain_override = (!policy_container.sandbox.forces_opaque_origin)
+            .then(|| crate::util::context_host_ptr_from_context_slot(context))
+            .flatten()
+            .map(|host_ptr| {
+                let host = unsafe { &*host_ptr };
+                let child = host
+                    .window_execution_context_identity_for_access_check(context)
+                    .and_then(|identity| match identity.dispatch_scope() {
+                        crate::native_bridge::OwnerDispatchScope::Child(handle) => Some(handle),
+                        _ => None,
+                    });
+                host.inherited_document_domain(child)
+            })
+            .unwrap_or_default();
+        let opaque_origin = (!policy_container.sandbox.forces_opaque_origin)
+            .then(|| crate::util::context_host_ptr_from_context_slot(context))
+            .flatten()
+            .and_then(|host_ptr| {
+                let host = unsafe { &*host_ptr };
+                let dispatch = host
+                    .window_execution_context_identity_for_access_check(context)?
+                    .dispatch_scope();
+                host.window_message_source_security(dispatch)?
+                    .opaque_origin()
+            });
+        Ok(Self {
+            security_token,
+            opaque_origin,
+            document_domain_override,
+            origin,
+            policy_container,
+            fallback_base_url: Some(base_url),
+            storage_key: Some(storage_key),
+        })
+    }
+}
+
+impl ScriptVm {
+    pub(crate) fn set_extra_http_headers(&mut self, headers: &moli_fetch::RequestHeaders) {
+        self._context_host
+            .borrow_mut()
+            .set_extra_http_headers(headers);
+    }
+
+    pub(crate) fn set_main_navigation_policy_container(
+        &mut self,
+        policy: crate::document_runtime::DocumentPolicyContainer,
+    ) {
+        let was_opaque = self
+            .document_runtime
+            .document_sandbox_policy()
+            .forces_opaque_origin;
+        self.document_runtime
+            .set_main_navigation_policy_container(policy);
+        // A deferred Context reads the policy at bootstrap; update only an existing token.
+        let _ = self.with_current_main_world_scope(|scope, host_ptr| {
+            let key = unsafe { &*host_ptr }.main_default_world_security_token_key();
+            let context = scope.get_current_context();
+            if !crate::native_bridge::set_window_security_token(scope, context, key.as_deref()) {
+                tracing::warn!(
+                    "failed to refresh main Window security token; using unique context token"
+                );
+            }
+            let host = unsafe { &*host_ptr };
+            let is_opaque = host.document_sandbox_policy().forces_opaque_origin;
+            if was_opaque != is_opaque {
+                let origin = if is_opaque {
+                    "null".into()
+                } else {
+                    moli_url::origin_ascii_serialization(host.document_url())
+                };
+                crate::context_bootstrap::set_window_origin_runtime_state(
+                    scope,
+                    context.global(scope),
+                    &origin,
+                )?;
+            }
+            Ok(())
+        });
+    }
+
+    pub(crate) fn document_content_security_policies(&self) -> Vec<ContentSecurityPolicy> {
+        self._context_host
+            .borrow()
+            .document_content_security_policies()
+            .to_vec()
+    }
+
+    pub(crate) fn set_stored_document_start_scripts(&mut self, scripts: &[DocumentStartScript]) {
+        self._context_host
+            .borrow_mut()
+            .set_stored_document_start_scripts(scripts);
+    }
+
+    pub(crate) fn set_stored_runtime_bindings(
+        &mut self,
+        bindings: &[crate::protocol_types::RuntimeBindingRegistration],
+    ) {
+        self._context_host
+            .borrow_mut()
+            .set_stored_runtime_bindings(bindings);
+    }
+
+    #[cfg(feature = "devtools")]
+    pub(crate) fn set_inspector_session_runtime_bindings(
+        &mut self,
+        inspector_session_id: Option<&str>,
+        bindings: &[crate::protocol_types::RuntimeBindingRegistration],
+    ) {
+        self.page_inspector
+            .set_runtime_bindings_for_session(inspector_session_id, bindings);
+    }
+
+    #[cfg(feature = "devtools")]
+    pub(crate) fn inspector_session_runtime_bindings(
+        &self,
+        inspector_session_id: Option<&str>,
+    ) -> Vec<crate::protocol_types::RuntimeBindingRegistration> {
+        self.page_inspector
+            .runtime_bindings_for_session(inspector_session_id)
+    }
+
+    #[cfg(feature = "devtools")]
+    pub(crate) fn detach_runtime_inspector_session(
+        &mut self,
+        inspector_session_id: Option<&str>,
+    ) -> bool {
+        self._context_host
+            .borrow_mut()
+            .remove_dom_debugger_session(inspector_session_id);
+        let devtools_session = DevToolsSessionKey::from_wire_session_id(
+            inspector_session_id.filter(|session_id| !session_id.is_empty()),
+        );
+        let detached = self.page_inspector.detach_session(inspector_session_id);
+        self._context_host
+            .borrow_mut()
+            .native_bridge_mut()
+            .web_mcp
+            .disable_session(&devtools_session);
+        let retired_worlds = self.retire_isolated_worlds_for_devtools_session(&devtools_session);
+        detached || retired_worlds != 0
+    }
+
+    pub(crate) fn set_permission_overrides(
+        &mut self,
+        overrides: &[crate::protocol_types::PermissionOverrideRegistration],
+    ) {
+        self._context_host
+            .borrow_mut()
+            .set_permission_overrides(overrides);
+    }
+
+    pub(crate) fn set_emulated_media(
+        &mut self,
+        overrides: &crate::protocol_types::EmulatedMediaOverrides,
+    ) {
+        let text_scale_changed = {
+            let mut host = self._context_host.borrow_mut();
+            if host.emulated_media() == overrides {
+                return;
+            }
+            let changed =
+                host.emulated_media().os_text_scale_percent != overrides.os_text_scale_percent;
+            host.queue_environment_change();
+            host.set_emulated_media(overrides);
+            changed
+        };
+        self.sync_document_fonts_for_environment(text_scale_changed);
+    }
+
+    pub(crate) fn set_emulated_media_for_bootstrap(
+        &mut self,
+        overrides: &crate::protocol_types::EmulatedMediaOverrides,
+    ) {
+        self._context_host
+            .borrow_mut()
+            .set_emulated_media(overrides);
+    }
+
+    pub(crate) fn set_idle_override(
+        &mut self,
+        idle_override: Option<crate::protocol_types::EmulatedIdleOverride>,
+    ) {
+        self._context_host
+            .borrow_mut()
+            .set_idle_override(idle_override);
+    }
+
+    pub(crate) fn set_idle_override_and_sync_surface(
+        &mut self,
+        idle_override: Option<crate::protocol_types::EmulatedIdleOverride>,
+    ) -> Result<()> {
+        self.set_idle_override(idle_override);
+        self.with_current_main_world_scope(|scope, _| {
+            crate::context_bootstrap::apply_idle_override_to_current_context(scope, idle_override);
+            Ok(())
+        })
+        .map(|_| ())
+    }
+
+    pub(crate) fn stylesheet_preload_media_matches(&self, media: Option<&str>) -> bool {
+        let Some(media) = media.map(str::trim).filter(|media| !media.is_empty()) else {
+            return true;
+        };
+        let host = self._context_host.borrow();
+        host.media_query_matches_for_document(host.document_handle(), media)
+    }
+
+    pub(crate) fn fetch_subresource_interception_matches(
+        &self,
+        resource_type: crate::types::SubresourceResourceType,
+    ) -> bool {
+        self._context_host
+            .borrow()
+            .should_intercept_subresource(resource_type)
+    }
+
+    pub(crate) fn viewport_surface(&self) -> Option<crate::protocol_types::ViewportSurface> {
+        self._context_host.borrow().viewport_surface()
+    }
+
+    pub(crate) fn set_viewport_surface(
+        &mut self,
+        viewport_surface: Option<crate::protocol_types::ViewportSurface>,
+    ) -> Result<()> {
+        {
+            let mut host = self._context_host.borrow_mut();
+            if host.configured_viewport_surface() == viewport_surface {
+                return Ok(());
+            }
+            host.queue_viewport_change(viewport_surface);
+            host.set_viewport_surface(viewport_surface);
+        }
+        self.sync_document_fonts_for_environment(false);
+        Ok(())
+    }
+
+    /// Seeds the initial viewport before document-start scripts can materialize
+    /// Window surfaces or register media-query listeners.
+    pub(crate) fn set_viewport_surface_for_bootstrap(
+        &mut self,
+        viewport_surface: Option<crate::protocol_types::ViewportSurface>,
+    ) {
+        self._context_host
+            .borrow_mut()
+            .set_viewport_surface(viewport_surface);
+    }
+
+    pub(crate) fn set_document_activity(
+        &mut self,
+        activity: moli_page_types::DocumentActivity,
+    ) -> Result<()> {
+        let mut host = self._context_host.borrow_mut();
+        if host.document_activity() != activity {
+            host.queue_non_layout_environment_change();
+            host.set_document_activity(activity);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_document_activity_for_bootstrap(
+        &mut self,
+        activity: moli_page_types::DocumentActivity,
+    ) {
+        self._context_host
+            .borrow_mut()
+            .set_document_activity(activity);
+    }
+
+    pub(crate) fn set_layout_policy(&mut self, policy: moli_page_types::LayoutPolicy) {
+        self._context_host.borrow_mut().set_layout_policy(policy);
+    }
+
+    pub(crate) fn set_layout_configuration(
+        &mut self,
+        configuration: moli_page_types::LayoutConfiguration,
+    ) {
+        self.set_layout_policy(configuration.policy);
+        self._context_host
+            .borrow()
+            .set_realtime_max_fps(configuration.realtime_max_fps);
+    }
+
+    #[cfg(any(feature = "devtools", test))]
+    pub(crate) fn layout_policy(&self) -> moli_page_types::LayoutPolicy {
+        self._context_host.borrow().layout_policy()
+    }
+
+    pub(crate) fn set_scrollbars_hidden(&mut self, hidden: bool) -> bool {
+        self._context_host
+            .borrow_mut()
+            .set_scrollbars_hidden(hidden)
+    }
+
+    fn sync_document_fonts_for_environment(&mut self, text_scale_changed: bool) {
+        let context_host = self._context_host.clone();
+        let _ = self.with_current_main_world_scope(|scope, _| {
+            let host = context_host.borrow();
+            let mut documents = host.documents_with_adopted_style_sheets();
+            if text_scale_changed {
+                documents.push(host.document_handle());
+                documents.extend(
+                    host.child_browsing_context_handles_in_document_order()
+                        .into_iter()
+                        .filter_map(|frame| host.child_browsing_context_document_handle(frame)),
+                );
+                documents.sort_unstable_by_key(|document| document.index());
+                documents.dedup();
+            }
+            for document in documents {
+                crate::native_bridge::document::sync_document_fonts_for_handle(
+                    scope, &host, document,
+                );
+            }
+            Ok(())
+        });
+    }
+
+    pub(crate) fn set_network_offline(&mut self, offline: bool) {
+        self._context_host.borrow_mut().set_network_offline(offline);
+    }
+
+    pub(crate) fn set_navigator_overrides(
+        &mut self,
+        overrides: &moli_page_types::NavigatorOverrides,
+    ) {
+        self._context_host
+            .borrow_mut()
+            .set_navigator_overrides(overrides);
+    }
+
+    pub(crate) fn set_navigator_overrides_and_sync_surface(
+        &mut self,
+        overrides: &moli_page_types::NavigatorOverrides,
+    ) -> Result<()> {
+        let changed = self
+            ._context_host
+            .borrow_mut()
+            .set_navigator_overrides(overrides);
+        if changed {
+            self.with_current_main_world_scope(|scope, _| {
+                crate::context_bootstrap::notify_geolocation_override_changed(scope);
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_bypass_service_worker(&mut self, bypass: bool) {
+        self._context_host
+            .borrow_mut()
+            .set_bypass_service_worker(bypass);
+    }
+
+    pub(crate) fn set_cache_disabled(&mut self, disabled: bool) {
+        self._context_host.borrow_mut().set_cache_disabled(disabled);
+    }
+
+    pub(crate) fn set_blocked_url_patterns(&mut self, patterns: &[String]) {
+        self._context_host
+            .borrow_mut()
+            .set_blocked_url_patterns(patterns);
+    }
+
+    #[cfg(any(test, feature = "devtools"))]
+    pub(crate) fn set_fetch_subresource_interception(
+        &mut self,
+        classes: crate::types::SubresourceInterceptionClasses,
+    ) {
+        self._context_host
+            .borrow_mut()
+            .set_fetch_subresource_interception(classes);
+    }
+}
+
+impl ScriptVm {
+    pub(crate) fn capture_about_blank_reload_environment(
+        &mut self,
+        preserve_navigation_referrer: bool,
+    ) -> Result<ScriptVmInitialDocumentEnvironment> {
+        let capture = |host: &mut crate::native_bridge::PageScriptHost, security_token| {
+            let origin = host
+                .current_main_document_resource_loader()
+                .expect("a live Document has a resource authority")
+                .fetch_context()
+                .origin()
+                .to_owned();
+            let fallback_base_url = if preserve_navigation_referrer {
+                host.dom_host()
+                    .node(host.document_handle())
+                    .and_then(|node| node.as_document())
+                    .map(|document| document.fallback_base_url().clone())
+            } else {
+                Some(host.document_base_url_for_handle(host.document_handle()))
+            };
+            let mut policy_container = host.document_policy_container().clone();
+            let source = if preserve_navigation_referrer {
+                url::Url::parse(&policy_container.document_referrer).ok()
+            } else {
+                Some(host.document_url().clone())
+            };
+            policy_container.document_referrer = source
+                .as_ref()
+                .and_then(|source| {
+                    moli_fetch::referrer_value(
+                        source,
+                        host.document_url(),
+                        None,
+                        policy_container.referrer_policy.as_deref(),
+                    )
+                })
+                .unwrap_or_default();
+            ScriptVmInitialDocumentEnvironment {
+                security_token,
+                opaque_origin: host
+                    .window_message_source_security(crate::native_bridge::OwnerDispatchScope::Top)
+                    .and_then(|security| security.opaque_origin()),
+                document_domain_override: host.inherited_document_domain(None),
+                origin,
+                policy_container,
+                fallback_base_url,
+                storage_key: Some(host.top_web_storage_scope().storage_key().clone()),
+            }
+        };
+        let environment = self.with_current_main_world_scope(|scope, host_ptr| {
+            let token = scope.get_current_context().get_security_token(scope);
+            Ok(capture(
+                unsafe { &mut *host_ptr },
+                Some(v8::Global::new(scope, token)),
+            ))
+        })?;
+        Ok(environment.unwrap_or_else(|| capture(&mut self._context_host.borrow_mut(), None)))
+    }
+}

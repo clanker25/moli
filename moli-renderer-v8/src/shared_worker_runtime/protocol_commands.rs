@@ -1,0 +1,89 @@
+use super::host::RendererSharedWorkerHostState;
+use crate::runtime::WorkerInspectorError;
+use crate::worker::WorkerControlHandle;
+use anyhow::{Context as _, Result};
+use tokio::sync::oneshot;
+
+use super::host::RendererSharedWorkerHost;
+use crate::runtime::{RendererRuntimeInspectorMessage, RendererRuntimeInspectorResponseSender};
+
+impl RendererSharedWorkerHost {
+    fn running_worker_control(&self) -> Option<WorkerControlHandle> {
+        let state = self.state.lock();
+        match &*state {
+            RendererSharedWorkerHostState::Running {
+                handle: Some(handle),
+                ..
+            } => Some(handle.control_handle()),
+            RendererSharedWorkerHostState::Loading { .. }
+            | RendererSharedWorkerHostState::Running { handle: None, .. }
+            | RendererSharedWorkerHostState::Closed => None,
+        }
+    }
+
+    pub(super) fn attach_runtime_inspector_session(
+        &self,
+        inspector_session_id: Option<String>,
+    ) -> bool {
+        self.running_worker_control()
+            .is_some_and(|handle| handle.attach_runtime_inspector_session(inspector_session_id))
+    }
+
+    pub(super) async fn dispatch_runtime_protocol_message(
+        &self,
+        inspector_session_id: Option<String>,
+        raw_json: String,
+    ) -> Result<Vec<RendererRuntimeInspectorMessage>> {
+        self.dispatch_runtime_protocol_message_with_optional_deferred_response(
+            inspector_session_id,
+            raw_json,
+            None,
+        )
+        .await
+    }
+
+    pub(super) async fn dispatch_runtime_protocol_message_with_deferred_response(
+        &self,
+        inspector_session_id: Option<String>,
+        raw_json: String,
+        deferred_response: RendererRuntimeInspectorResponseSender,
+    ) -> Result<Vec<RendererRuntimeInspectorMessage>> {
+        self.dispatch_runtime_protocol_message_with_optional_deferred_response(
+            inspector_session_id,
+            raw_json,
+            Some(deferred_response),
+        )
+        .await
+    }
+
+    async fn dispatch_runtime_protocol_message_with_optional_deferred_response(
+        &self,
+        inspector_session_id: Option<String>,
+        raw_json: String,
+        deferred_response: Option<RendererRuntimeInspectorResponseSender>,
+    ) -> Result<Vec<RendererRuntimeInspectorMessage>> {
+        let Some(handle) = self.running_worker_control() else {
+            return Err(WorkerInspectorError::SharedUnavailable.into());
+        };
+        let (response_tx, response_rx) = oneshot::channel();
+        if !handle.dispatch_runtime_protocol_message(
+            inspector_session_id,
+            raw_json,
+            deferred_response,
+            response_tx,
+        ) {
+            return Err(WorkerInspectorError::SharedUnavailable.into());
+        }
+        response_rx
+            .await
+            .context(WorkerInspectorError::SharedUnavailable)?
+    }
+
+    pub(super) fn detach_runtime_inspector_session(
+        &self,
+        inspector_session_id: Option<String>,
+    ) -> Option<tokio::sync::oneshot::Receiver<anyhow::Result<()>>> {
+        self.running_worker_control()
+            .map(|handle| handle.detach_runtime_inspector_session(inspector_session_id))
+    }
+}

